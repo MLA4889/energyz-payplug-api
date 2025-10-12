@@ -1,5 +1,5 @@
 # app/main.py
-from fastapi import FastAPI, Request, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import JSONResponse
 from typing import Any, Tuple, Optional
 import json as _json
@@ -16,6 +16,7 @@ from .payments import create_payment, cents_from_str, _choose_api_key
 app = FastAPI(title="ENERGYZ PayPlug API")
 
 
+# --- Health ----
 @app.get("/")
 def root():
     return {"status": "ok", "brand": settings.BRAND_NAME}
@@ -24,13 +25,13 @@ def root():
 def health():
     return {"status": "ok", "service": "energyz-payplug-api"}
 
+
+# --- Debug (utile pour diagnostiquer) ---
 @app.get("/debug/check/{item_id}/{n}")
 def debug_check(item_id: int, n: int):
-    # quelles IDs l'API utilise ?
     formula_id = settings.FORMULA_COLUMN_IDS.get(str(n))
     link_col   = settings.LINK_COLUMN_IDS.get(str(n))
 
-    # valeurs lues chez Monday
     amount_display = get_formula_display_value(item_id, formula_id) if formula_id else ""
     iban_display   = get_formula_display_value(item_id, settings.IBAN_FORMULA_COLUMN_ID) if settings.IBAN_FORMULA_COLUMN_ID else ""
 
@@ -38,7 +39,6 @@ def debug_check(item_id: int, n: int):
     email   = (cols.get(settings.EMAIL_COLUMN_ID, {}) or {}).get("text") or ""
     address = (cols.get(settings.ADDRESS_COLUMN_ID, {}) or {}).get("text") or ""
 
-    # mapping PayPlug trouvé ?
     api_key = _choose_api_key(iban_display)
 
     return {
@@ -54,6 +54,7 @@ def debug_check(item_id: int, n: int):
     }
 
 
+# --- Utils Monday payloads ---
 def _parse_monday_webhook_body(body: dict[str, Any]) -> Tuple[int, str]:
     """Accepte payloads Monday: custom (pulseId) ou intégration (itemId)."""
     evt = body.get("event", {}) if isinstance(body, dict) else {}
@@ -92,12 +93,14 @@ def _challenge_response(body: dict[str, Any]) -> JSONResponse | None:
     return None
 
 
+# --- Endpoints métier ---
 @app.post("/pay/acompte/{n}")
 async def create_acompte_link(n: int, body: dict = Body(...)):
-    # Body est maintenant déclaré => Swagger affiche le champ à remplir
+    # Swagger peut maintenant éditer le body grâce à Body(...)
     if res := _challenge_response(body):
         return res
 
+    # Si le label est envoyé par Monday, on ne traite que “Générer acompte {n}”
     expected_label = f"Générer acompte {n}"
     label = _extract_status_label(body)
     if label and label != expected_label:
@@ -115,12 +118,12 @@ async def create_acompte_link(n: int, body: dict = Body(...)):
     formula_id = settings.FORMULA_COLUMN_IDS.get(str(n))
     if not formula_id:
         raise HTTPException(400, f"Formula column not configured for acompte {n}")
-    amount_euros = get_formula_display_value(item_id, formula_id)
+    amount_euros = get_formula_display_value(item_id, formula_id)  # lit display_value
     amount_cents = cents_from_str(amount_euros)
     if amount_cents <= 0:
         raise HTTPException(400, f"Invalid amount for acompte {n}: '{amount_euros}'")
 
-    # Sélection clé PayPlug selon IBAN (FORMULE)
+    # Sélection de la clé PayPlug via l’IBAN (FORMULE)
     if not settings.IBAN_FORMULA_COLUMN_ID:
         raise HTTPException(400, "IBAN_FORMULA_COLUMN_ID not configured")
     iban_display_value = get_formula_display_value(item_id, settings.IBAN_FORMULA_COLUMN_ID)
@@ -128,7 +131,7 @@ async def create_acompte_link(n: int, body: dict = Body(...)):
     if not api_key:
         raise HTTPException(400, f"Unknown IBAN key '{iban_display_value}' for PayPlug mapping")
 
-    # Créer paiement
+    # Création du paiement
     url = create_payment(
         api_key=api_key,
         amount_cents=amount_cents,
@@ -138,7 +141,7 @@ async def create_acompte_link(n: int, body: dict = Body(...)):
         metadata={"customer_id": item_id, "acompte": str(n)},
     )
 
-    # Écrire le lien dans la bonne colonne
+    # Écriture du lien dans la bonne colonne Link
     link_col = settings.LINK_COLUMN_IDS.get(str(n))
     if not link_col:
         raise HTTPException(400, f"Link column not configured for acompte {n}")
@@ -155,7 +158,6 @@ async def create_all_links(body: dict = Body(...)):
     for n in (1, 2, 3, 4):
         if str(n) in settings.LINK_COLUMN_IDS and str(n) in settings.FORMULA_COLUMN_IDS:
             try:
-                # réutilise la même charge utile
                 out[str(n)] = await create_acompte_link(n, body)
             except HTTPException as e:
                 out[str(n)] = {"status": "error", "detail": e.detail}
@@ -163,8 +165,7 @@ async def create_all_links(body: dict = Body(...)):
 
 
 @app.post("/pay/notify")
-async def payplug_notify(request: Request):
-    body = await request.json()
+async def payplug_notify(body: dict = Body(...)):
     if body.get("is_paid"):
         meta = body.get("metadata", {}) or {}
         try:
