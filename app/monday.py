@@ -95,14 +95,16 @@ def _raise_if_graphql_error(resp_json: Dict[str, Any]) -> None:
 def set_link_in_column(item_id: int, board_id: int, column_id: str, url: str, text: str = "Payer") -> None:
     """
     Écrit un lien dans une colonne Link.
-    IMPORTANT : column_values doit être une CHAÎNE JSON (pas un dict Python).
+    IMPORTANT :
+      - column_values doit être une CHAÎNE JSON.
+      - $itemId et $boardId doivent être typés ID! côté GraphQL et envoyés en str côté variables.
     Log la réponse pour débogage.
     """
     col_values = {column_id: {"url": url, "text": text}}
     col_values_str = json.dumps(col_values)
 
     mutation = """
-    mutation ($itemId: Int!, $boardId: Int!, $columnValues: JSON!) {
+    mutation ($itemId: ID!, $boardId: ID!, $columnValues: JSON!) {
       change_multiple_column_values(
         item_id: $itemId,
         board_id: $boardId,
@@ -112,8 +114,9 @@ def set_link_in_column(item_id: int, board_id: int, column_id: str, url: str, te
     payload = {
         "query": mutation,
         "variables": {
-            "itemId": item_id,
-            "boardId": board_id,
+            # envoyer en str pour respecter ID!
+            "itemId": str(item_id),
+            "boardId": str(board_id),
             "columnValues": col_values_str
         },
     }
@@ -122,14 +125,11 @@ def set_link_in_column(item_id: int, board_id: int, column_id: str, url: str, te
     try:
         r.raise_for_status()
     except Exception:
-        # Log brut en cas d'erreur HTTP
         print("❌ HTTP ERROR from Monday:", r.text)
         raise
 
     data = r.json()
-    # Log la réponse pour comprendre un éventuel 500 plus loin
     print("📬 Monday API response (link):", json.dumps(data, indent=2, ensure_ascii=False))
-
     _raise_if_graphql_error(data)
 
     try:
@@ -141,14 +141,15 @@ def set_link_in_column(item_id: int, board_id: int, column_id: str, url: str, te
 def set_status(item_id: int, board_id: int, status_column_id: str, label: str) -> None:
     """
     Met à jour une colonne Status avec un label donné.
-    IMPORTANT : column_values doit être une CHAÎNE JSON.
-    Log la réponse pour débogage.
+    IMPORTANT :
+      - column_values doit être une CHAÎNE JSON.
+      - $itemId et $boardId typés ID! et envoyés en str.
     """
     col_values = {status_column_id: {"label": label}}
     col_values_str = json.dumps(col_values)
 
     mutation = """
-    mutation ($itemId: Int!, $boardId: Int!, $columnValues: JSON!) {
+    mutation ($itemId: ID!, $boardId: ID!, $columnValues: JSON!) {
       change_multiple_column_values(
         item_id: $itemId,
         board_id: $boardId,
@@ -158,8 +159,8 @@ def set_status(item_id: int, board_id: int, status_column_id: str, label: str) -
     payload = {
         "query": mutation,
         "variables": {
-            "itemId": item_id,
-            "boardId": board_id,
+            "itemId": str(item_id),
+            "boardId": str(board_id),
             "columnValues": col_values_str
         },
     }
@@ -173,7 +174,6 @@ def set_status(item_id: int, board_id: int, status_column_id: str, label: str) -
 
     data = r.json()
     print("📬 Monday API response (status):", json.dumps(data, indent=2, ensure_ascii=False))
-
     _raise_if_graphql_error(data)
 
     try:
