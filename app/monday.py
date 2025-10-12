@@ -36,26 +36,27 @@ def get_item_columns(item_id: int, column_ids: list[str]) -> Dict[str, Any]:
     return out
 
 def get_formula_display_value(item_id: int, formula_column_id: str) -> str:
-    # lecture fiable du display_value des colonnes Formula
+    # lecture FIABLE du display_value d'une colonne Formula : cibler par ids + fragment FormulaValue
     query = """
-    query ($itemId: [ID!]) {
-      items (ids: $itemId) {
-        column_values {
-          id
-          display_value
+    query ($itemId: [ID!], $columnId: [String!]) {
+      items(ids: $itemId) {
+        column_values(ids: $columnId) {
+          ... on FormulaValue {
+            id
+            display_value
+          }
         }
       }
     }"""
-    data = {"query": query, "variables": {"itemId": [item_id]}}
+    data = {"query": query, "variables": {"itemId": [item_id], "columnId": [formula_column_id]}}
     r = requests.post(MONDAY_API_URL, json=data, headers=_headers())
     r.raise_for_status()
     items = r.json().get("data", {}).get("items", [])
     if not items:
         return ""
-    for cv in items[0].get("column_values", []):
-        if cv.get("id") == formula_column_id:
-            return (cv.get("display_value") or "")  # ex: "1500" ou "FR76 ..."
-    return ""
+    cvs = items[0].get("column_values", [])
+    return (cvs[0].get("display_value") if cvs else "") or ""
+
 
 def set_link_in_column(item_id: int, board_id: int, column_id: str, url: str, text: str = "Payer") -> None:
     mutation = """
