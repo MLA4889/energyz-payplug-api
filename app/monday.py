@@ -16,9 +16,12 @@ def _headers() -> Dict[str, str]:
     }
 
 
+# -----------------------------
+# READ HELPERS
+# -----------------------------
 def get_item_columns(item_id: int, column_ids: list[str]) -> Dict[str, Any]:
     """
-    Récupère les colonnes 'text/value/type' (utile pour Email/Adresse/etc.).
+    Récupère les colonnes 'text/value/type' (Email, Adresse, etc.)
     """
     query = """
     query ($itemId: [ID!]) {
@@ -51,9 +54,11 @@ def get_item_columns(item_id: int, column_ids: list[str]) -> Dict[str, Any]:
 def get_formula_display_value(item_id: int, formula_column_id: str) -> str:
     """
     Lecture FIABLE du display_value d'une colonne Formula :
-    - on cible la colonne par 'ids:'
-    - on caste avec le fragment '... on FormulaValue'
+      - on cible par ids:
+      - on caste avec ... on FormulaValue
     """
+    if not formula_column_id:
+        return ""
     query = """
     query ($itemId: [ID!], $columnId: [String!]) {
       items(ids: $itemId) {
@@ -75,10 +80,13 @@ def get_formula_display_value(item_id: int, formula_column_id: str) -> str:
     return (cvs[0].get("display_value") if cvs else "") or ""
 
 
+# -----------------------------
+# WRITE HELPERS
+# -----------------------------
 def _raise_if_graphql_error(resp_json: Dict[str, Any]) -> None:
     """
-    Monday peut renvoyer HTTP 200 avec 'errors': [...]
-    On remonte l'erreur pour la voir dans les logs/réponses.
+    Monday peut renvoyer HTTP 200 mais 'errors': [...]
+    On remonte clairement l'erreur.
     """
     if "errors" in resp_json and resp_json["errors"]:
         raise HTTPException(status_code=500, detail=f"Monday error: {resp_json['errors']}")
@@ -87,7 +95,8 @@ def _raise_if_graphql_error(resp_json: Dict[str, Any]) -> None:
 def set_link_in_column(item_id: int, board_id: int, column_id: str, url: str, text: str = "Payer") -> None:
     """
     Écrit un lien dans une colonne Link.
-    IMPORTANT : Monday attend column_values en CHAÎNE JSON, pas en objet Python.
+    IMPORTANT : column_values doit être une CHAÎNE JSON (pas un dict Python).
+    Log la réponse pour débogage.
     """
     col_values = {column_id: {"url": url, "text": text}}
     col_values_str = json.dumps(col_values)
@@ -108,12 +117,21 @@ def set_link_in_column(item_id: int, board_id: int, column_id: str, url: str, te
             "columnValues": col_values_str
         },
     }
+
     r = requests.post(MONDAY_API_URL, json=payload, headers=_headers())
-    r.raise_for_status()
+    try:
+        r.raise_for_status()
+    except Exception:
+        # Log brut en cas d'erreur HTTP
+        print("❌ HTTP ERROR from Monday:", r.text)
+        raise
+
     data = r.json()
+    # Log la réponse pour comprendre un éventuel 500 plus loin
+    print("📬 Monday API response (link):", json.dumps(data, indent=2, ensure_ascii=False))
+
     _raise_if_graphql_error(data)
 
-    # Optionnel : on s'assure qu'un id est bien renvoyé
     try:
         _ = data["data"]["change_multiple_column_values"]["id"]
     except Exception:
@@ -123,7 +141,8 @@ def set_link_in_column(item_id: int, board_id: int, column_id: str, url: str, te
 def set_status(item_id: int, board_id: int, status_column_id: str, label: str) -> None:
     """
     Met à jour une colonne Status avec un label donné.
-    On passe aussi column_values en chaîne JSON.
+    IMPORTANT : column_values doit être une CHAÎNE JSON.
+    Log la réponse pour débogage.
     """
     col_values = {status_column_id: {"label": label}}
     col_values_str = json.dumps(col_values)
@@ -144,9 +163,17 @@ def set_status(item_id: int, board_id: int, status_column_id: str, label: str) -
             "columnValues": col_values_str
         },
     }
+
     r = requests.post(MONDAY_API_URL, json=payload, headers=_headers())
-    r.raise_for_status()
+    try:
+        r.raise_for_status()
+    except Exception:
+        print("❌ HTTP ERROR from Monday:", r.text)
+        raise
+
     data = r.json()
+    print("📬 Monday API response (status):", json.dumps(data, indent=2, ensure_ascii=False))
+
     _raise_if_graphql_error(data)
 
     try:
