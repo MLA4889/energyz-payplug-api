@@ -24,6 +24,35 @@ def root():
 def health():
     return {"status": "ok", "service": "energyz-payplug-api"}
 
+@app.get("/debug/check/{item_id}/{n}")
+def debug_check(item_id: int, n: int):
+    # quelles IDs l'API utilise ?
+    formula_id = settings.FORMULA_COLUMN_IDS.get(str(n))
+    link_col   = settings.LINK_COLUMN_IDS.get(str(n))
+
+    # valeurs lues chez Monday
+    amount_display = get_formula_display_value(item_id, formula_id) if formula_id else ""
+    iban_display   = get_formula_display_value(item_id, settings.IBAN_FORMULA_COLUMN_ID) if settings.IBAN_FORMULA_COLUMN_ID else ""
+
+    cols = get_item_columns(item_id, [c for c in [settings.EMAIL_COLUMN_ID, settings.ADDRESS_COLUMN_ID] if c])
+    email   = (cols.get(settings.EMAIL_COLUMN_ID, {}) or {}).get("text") or ""
+    address = (cols.get(settings.ADDRESS_COLUMN_ID, {}) or {}).get("text") or ""
+
+    # mapping PayPlug trouvé ?
+    api_key = _choose_api_key(iban_display)
+
+    return {
+        "item_id": item_id,
+        "n": n,
+        "formula_id_used": formula_id,
+        "amount_display": amount_display,
+        "iban_display": iban_display,
+        "email": email,
+        "address": address,
+        "link_col_used": link_col,
+        "api_key_found": bool(api_key),
+    }
+
 
 def _parse_monday_webhook_body(body: dict[str, Any]) -> Tuple[int, str]:
     """Accepte payloads Monday: custom (pulseId) ou intégration (itemId)."""
