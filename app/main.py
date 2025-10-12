@@ -73,6 +73,10 @@ def _challenge_response(body: dict[str, Any]) -> JSONResponse | None:
 def root():
     return {"status": "ok", "brand": settings.BRAND_NAME}
 
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "energyz-payplug-api"}
+
 
 @app.post("/pay/acompte/{n}")
 async def create_acompte_link(n: int, request: Request):
