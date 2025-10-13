@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Body, Request
 from fastapi.responses import JSONResponse
-from typing import Any, Tuple, Optional
+from typing import Any
 import json as _json
 
 from .config import settings
@@ -24,7 +24,7 @@ def health():
     return {"status": "ok", "service": "energyz-payplug-api"}
 
 
-# --- Debug (utile pour diagnostiquer) ---
+# --- Debug ---
 @app.get("/debug/check/{item_id}/{n}")
 def debug_check(item_id: int, n: int):
     formula_id = settings.FORMULA_COLUMN_IDS.get(str(n))
@@ -52,14 +52,13 @@ def debug_check(item_id: int, n: int):
     }
 
 
-# --- Endpoints métier ---
+# --- Endpoint principal ---
 @app.api_route("/pay/acompte/{n}", methods=["POST", "GET"])
 async def create_acompte_link(n: int, request: Request):
     """
     Endpoint principal pour générer un lien PayPlug.
     Accepte POST (webhook réel) et GET (test Monday).
     """
-    # 📡 Log brut pour déboguer Monday
     raw_body = await request.body()
     print("📩 Webhook reçu depuis Monday (RAW):", raw_body.decode("utf-8", errors="ignore"))
 
@@ -68,25 +67,32 @@ async def create_acompte_link(n: int, request: Request):
     except Exception:
         body = {}
 
-    # ✅ Si Monday teste le webhook avec un "challenge"
+    # ✅ Test de connexion
     if "challenge" in body:
         return {"challenge": body["challenge"]}
 
-    # ✅ Si Monday fait juste un test vide
     if not body:
         return {"status": "ok", "message": "Webhook test accepted by Monday"}
 
-    # --- Gestion des deux formats possibles (event ou payload) ---
+    # --- Lecture de l'événement ---
     evt = body.get("event") or body.get("payload") or {}
     label = None
 
-    # --- Extraction du label ---
+    # --- Extraction du label (gère tous les formats Monday) ---
     try:
         val = evt.get("value")
         if isinstance(val, str):
-            val = _json.loads(val)
+            # Ancien format : value est une chaîne JSON
+            try:
+                val = _json.loads(val)
+            except Exception:
+                val = {}
         if isinstance(val, dict):
-            label = val.get("label")
+            # ✅ Nouveau format : value.label.text
+            if isinstance(val.get("label"), dict):
+                label = val["label"].get("text")
+            else:
+                label = val.get("label")
     except Exception:
         pass
 
@@ -144,7 +150,7 @@ async def create_acompte_link(n: int, request: Request):
     return {"status": "ok", "acompte": n, "payment_url": url}
 
 
-# --- Endpoint pour créer plusieurs liens à la fois ---
+# --- Endpoint pour créer plusieurs liens ---
 @app.post("/pay/all")
 async def create_all_links(request: Request):
     try:
@@ -180,10 +186,6 @@ async def payplug_notify(body: dict = Body(...)):
 # --- Test direct Render → Monday ---
 @app.get("/debug/test_write/{item_id}")
 def debug_test_write(item_id: int):
-    """
-    Teste l'écriture d'un lien factice dans la colonne Lien Acompte 1 sur Monday.
-    Utile pour valider que la mutation GraphQL fonctionne depuis Render.
-    """
     try:
         link_col = settings.LINK_COLUMN_IDS.get("1")
         if not link_col:
