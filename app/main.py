@@ -87,8 +87,87 @@ def _challenge_response(body: dict[str, Any]) -> JSONResponse | None:
     return None
 
 # --- Endpoints métier ---
-@app.post("/pay/acompte/{n}")
-async def create_acompte_link(n: int, body: dict = Body(...)):
+from fastapi import Request
+
+@app.api_route("/pay/acompte/{n}", methods=["POST", "GET"])
+async def create_acompte_link(n: int, request: Request):
+    """
+    Endpoint principal pour générer un lien PayPlug.
+    Accepte POST (webhook réel) et GET (test Monday).
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    # ✅ Si Monday teste le webhook avec un "challenge"
+    if "challenge" in body:
+        return {"challenge": body["challenge"]}
+
+    # ✅ Si Monday fait juste un test vide
+    if not body:
+        return {"status": "ok", "message": "Webhook test accepted by Monday"}
+
+    # --- Reste de ton code inchangé ensuite ---
+    from fastapi import HTTPException
+    from .monday import get_item_columns, get_formula_display_value, set_link_in_column, set_status
+    from .payments import create_payment, cents_from_str, _choose_api_key
+    from .config import settings
+    import json as _json
+
+    expected_label = f"Générer acompte {n}"
+    evt = body.get("event", {}) if isinstance(body, dict) else {}
+    label = None
+    try:
+        val = evt.get("value")
+        if isinstance(val, str):
+            val = _json.loads(val)
+        if isinstance(val, dict):
+            label = val.get("label")
+    except Exception:
+        pass
+
+    if label and label != expected_label:
+        return {"status": "ignored", "reason": f"label={label} != {expected_label}"}
+
+    item_id = int(evt.get("itemId", 0))
+    if not item_id:
+        raise HTTPException(400, "Missing itemId")
+
+    column_ids = [settings.EMAIL_COLUMN_ID, settings.ADDRESS_COLUMN_ID]
+    cols = get_item_columns(item_id, [c for c in column_ids if c])
+    email = (cols.get(settings.EMAIL_COLUMN_ID, {}) or {}).get("text") or ""
+    address = (cols.get(settings.ADDRESS_COLUMN_ID, {}) or {}).get("text") or ""
+
+    formula_id = settings.FORMULA_COLUMN_IDS.get(str(n))
+    if not formula_id:
+        raise HTTPException(400, f"Formula column not configured for acompte {n}")
+    amount_euros = get_formula_display_value(item_id, formula_id)
+    amount_cents = cents_from_str(amount_euros)
+    if amount_cents <= 0:
+        raise HTTPException(400, f"Invalid amount for acompte {n}: '{amount_euros}'")
+
+    iban_display_value = get_formula_display_value(item_id, settings.IBAN_FORMULA_COLUMN_ID)
+    api_key = _choose_api_key(iban_display_value)
+    if not api_key:
+        raise HTTPException(400, f"Unknown IBAN key '{iban_display_value}' for PayPlug mapping")
+
+    url = create_payment(
+        api_key=api_key,
+        amount_cents=amount_cents,
+        email=email,
+        address=address,
+        customer_name="Client",
+        metadata={"customer_id": item_id, "acompte": str(n)},
+    )
+
+    link_col = settings.LINK_COLUMN_IDS.get(str(n))
+    if not link_col:
+        raise HTTPException(400, f"Link column not configured for acompte {n}")
+    set_link_in_column(item_id, settings.MONDAY_BOARD_ID, link_col, url, text="Payer")
+
+    return {"status": "ok", "acompte": n, "payment_url": url}
+
     if res := _challenge_response(body):
         return res
 
