@@ -14,10 +14,12 @@ from .payments import create_payment, cents_from_str, _choose_api_key
 
 app = FastAPI(title="ENERGYZ PayPlug API")
 
+
 # --- Health checks ---
 @app.get("/")
 def root():
     return {"status": "ok", "brand": settings.BRAND_NAME}
+
 
 @app.get("/health")
 def health():
@@ -246,3 +248,16 @@ async def create_quote_from_monday(payload: QuoteRequest):
     except Exception as e:
         print(f"❌ Erreur Evoliz : {e}")
         raise HTTPException(500, f"Erreur lors de la création du devis : {e}")
+
+
+# --- Test de connexion API Evoliz ---
+@app.get("/debug/evoliz/login")
+def debug_evoliz_login():
+    """
+    Teste la connexion à l'API Evoliz (renvoie un token si OK)
+    """
+    try:
+        token = evoliz.get_access_token()
+        return {"status": "ok", "token_preview": token[:10] + "..."}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
