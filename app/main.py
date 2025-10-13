@@ -208,26 +208,76 @@ def debug_test_write(item_id: int):
     except Exception as e:
         raise HTTPException(500, detail=str(e))
         
-from fastapi import Request
+# --- Test direct Render → Monday ---
+@app.get("/debug/test_write/{item_id}")
+def debug_test_write(item_id: int):
+    try:
+        link_col = settings.LINK_COLUMN_IDS.get("1")
+        if not link_col:
+            raise HTTPException(400, "Colonne de lien pour acompte 1 non configurée")
+
+        test_url = "https://example.com/test"
+        set_link_in_column(
+            item_id=item_id,
+            board_id=settings.MONDAY_BOARD_ID,
+            column_id=link_col,
+            url=test_url,
+            text="Lien de test ✅",
+        )
+        return {
+            "status": "ok",
+            "message": f"Lien écrit dans {link_col}",
+            "url": test_url,
+            "item_id": item_id,
+        }
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+
+
+# --- Nouvel endpoint : Création de devis Evoliz ---
+from pydantic import BaseModel
 from . import evoliz
 
-@app.post("/quote/create")
-async def create_quote_from_monday(request: Request):
-    data = await request.json()
 
-    client_info = {
-        "name": data.get("client_name", "Client Inconnu"),
-        "address": data.get("address", ""),
-        "postcode": data.get("postcode", ""),
-        "city": data.get("city", "")
+class QuoteRequest(BaseModel):
+    client_name: str
+    address: str
+    postcode: str
+    city: str
+    description: str
+    amount_ht: float
+
+
+@app.post("/quote/create", summary="Create Quote From Monday")
+async def create_quote_from_monday(payload: QuoteRequest):
+    """
+    Reçoit un JSON depuis Monday ou Swagger pour créer un devis sur Evoliz.
+    Exemple :
+    {
+        "client_name": "Jean Dupont",
+        "address": "12 rue de Paris",
+        "postcode": "75000",
+        "city": "Paris",
+        "description": "Installation panneau solaire",
+        "amount_ht": 1234.56
     }
-    quote_info = {
-        "description": data.get("description", "Devis automatique"),
-        "amount_ht": data.get("amount_ht", 100.0)
-    }
+    """
+    try:
+        client_info = {
+            "name": payload.client_name,
+            "address": payload.address,
+            "postcode": payload.postcode,
+            "city": payload.city,
+        }
+        quote_info = {
+            "description": payload.description,
+            "amount_ht": payload.amount_ht,
+        }
 
-    token = evoliz.get_access_token()
-    client_id = evoliz.create_client_if_needed(token, client_info)
-    quote = evoliz.create_quote(token, client_id, quote_info)
+        token = evoliz.get_access_token()
+        client_id = evoliz.create_client_if_needed(token, client_info)
+        quote = evoliz.create_quote(token, client_id, quote_info)
 
-    return {"status": "ok", "quote_id": quote.get("quoteid")}
+        return {"status": "ok", "quote_id": quote.get("quoteid")}
+    except Exception as e:
+        raise HTTPException(500, f"Erreur lors de la création du devis : {e}")
