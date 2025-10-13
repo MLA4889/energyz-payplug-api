@@ -207,3 +207,27 @@ def debug_test_write(item_id: int):
         }
     except Exception as e:
         raise HTTPException(500, detail=str(e))
+        
+from fastapi import Request
+from . import evoliz
+
+@app.post("/quote/create")
+async def create_quote_from_monday(request: Request):
+    data = await request.json()
+
+    client_info = {
+        "name": data.get("client_name", "Client Inconnu"),
+        "address": data.get("address", ""),
+        "postcode": data.get("postcode", ""),
+        "city": data.get("city", "")
+    }
+    quote_info = {
+        "description": data.get("description", "Devis automatique"),
+        "amount_ht": data.get("amount_ht", 100.0)
+    }
+
+    token = evoliz.get_access_token()
+    client_id = evoliz.create_client_if_needed(token, client_info)
+    quote = evoliz.create_quote(token, client_id, quote_info)
+
+    return {"status": "ok", "quote_id": quote.get("quoteid")}
