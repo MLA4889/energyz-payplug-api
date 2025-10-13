@@ -1,37 +1,58 @@
 from typing import Optional
 import payplug
+import json
 from .config import settings
 
 
 # ----------------------------------------------------------
-# 🧩 Sélection automatique de la clé PayPlug selon l’IBAN
+# 🧠 Sélection automatique de la clé PayPlug selon IBAN et mode
 # ----------------------------------------------------------
 def _choose_api_key(iban_display_value: str) -> Optional[str]:
     """
-    Sélectionne la clé PayPlug (live ou test) en fonction de l’IBAN
-    à partir des variables Render PAYPLUG_KEYS_LIVE_JSON et PAYPLUG_KEYS_TEST_JSON.
+    Sélectionne la clé PayPlug (LIVE ou TEST) en fonction de l'IBAN et du mode.
+    - Nettoie les espaces et majuscules.
+    - Cherche uniquement dans le dictionnaire du mode actuel.
     """
     if not iban_display_value:
         print("⚠️ Aucun IBAN fourni.")
         return None
 
-    iban = iban_display_value.strip().replace(" ", "").upper()
+    iban_clean = iban_display_value.strip().replace(" ", "").upper()
 
-    # 🔍 Recherche dans les clés LIVE
-    live_keys = settings.PAYPLUG_KEYS_LIVE
-    for k, v in live_keys.items():
-        if k.replace(" ", "").upper() == iban:
-            print(f"✅ IBAN reconnu dans LIVE : {iban}")
-            return v
+    # Lecture sécurisée des variables Render
+    try:
+        live_dict = settings.PAYPLUG_KEYS_LIVE
+        test_dict = settings.PAYPLUG_KEYS_TEST
+    except Exception as e:
+        print("🚨 Erreur de lecture des clés PayPlug:", e)
+        return None
 
-    # 🔍 Recherche dans les clés TEST
-    test_keys = settings.PAYPLUG_KEYS_TEST
-    for k, v in test_keys.items():
-        if k.replace(" ", "").upper() == iban:
-            print(f"✅ IBAN reconnu dans TEST : {iban}")
-            return v
+    # Affichage du mode actuel
+    print(f"🧩 Mode PayPlug actif : {settings.PAYPLUG_MODE}")
 
-    print(f"🚫 Aucun mapping trouvé pour IBAN : {iban_display_value}")
+    # --- Si on est en mode LIVE ---
+    if settings.PAYPLUG_MODE.lower() == "live":
+        for key, value in live_dict.items():
+            if key.replace(" ", "").upper() == iban_clean:
+                print(f"✅ IBAN reconnu (LIVE) : {iban_clean}")
+                return value
+        print(f"⚠️ IBAN non trouvé dans LIVE : {iban_clean}")
+
+    # --- Si on est en mode TEST ---
+    elif settings.PAYPLUG_MODE.lower() == "test":
+        for key, value in test_dict.items():
+            if key.replace(" ", "").upper() == iban_clean:
+                print(f"✅ IBAN reconnu (TEST) : {iban_clean}")
+                return value
+        print(f"⚠️ IBAN non trouvé dans TEST : {iban_clean}")
+
+    # --- Fallback : on regarde les deux (sécurité) ---
+    for key, value in {**live_dict, **test_dict}.items():
+        if key.replace(" ", "").upper() == iban_clean:
+            print(f"✅ IBAN reconnu (Fallback) : {iban_clean}")
+            return value
+
+    print(f"🚫 Aucun mapping trouvé pour IBAN : {iban_clean}")
     return None
 
 
@@ -47,10 +68,10 @@ def create_payment(
     metadata: dict,
 ) -> str:
     """
-    Crée un paiement PayPlug et retourne le lien de paiement.
+    Crée un paiement PayPlug et retourne le lien.
     """
     if not api_key:
-        raise ValueError("Aucune clé PayPlug valide fournie pour ce paiement.")
+        raise ValueError("❌ Clé API PayPlug absente, impossible de créer le paiement.")
 
     payplug.set_secret_key(api_key)
 
@@ -82,7 +103,7 @@ def create_payment(
 # ----------------------------------------------------------
 def cents_from_str(euro_str: str) -> int:
     """
-    Convertit une chaîne d’euros ('1 000,50') en centimes (100050).
+    Convertit un montant en euros ('1 000,50') en centimes (100050).
     """
     if not euro_str:
         return 0
