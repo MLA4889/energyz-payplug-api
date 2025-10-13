@@ -14,12 +14,10 @@ from .payments import create_payment, cents_from_str, _choose_api_key
 
 app = FastAPI(title="ENERGYZ PayPlug API")
 
-
 # --- Health ----
 @app.get("/")
 def root():
     return {"status": "ok", "brand": settings.BRAND_NAME}
-
 
 @app.get("/health")
 def health():
@@ -61,6 +59,10 @@ async def create_acompte_link(n: int, request: Request):
     Endpoint principal pour générer un lien PayPlug.
     Accepte POST (webhook réel) et GET (test Monday).
     """
+    # 📡 Log brut pour déboguer Monday
+    raw_body = await request.body()
+    print("📩 Webhook reçu depuis Monday (RAW):", raw_body.decode("utf-8", errors="ignore"))
+
     try:
         body = await request.json()
     except Exception:
@@ -70,13 +72,15 @@ async def create_acompte_link(n: int, request: Request):
     if "challenge" in body:
         return {"challenge": body["challenge"]}
 
-    # ✅ Si Monday fait juste un test de connexion (GET ou POST vide)
+    # ✅ Si Monday fait juste un test vide
     if not body:
         return {"status": "ok", "message": "Webhook test accepted by Monday"}
 
-    # --- Lecture du statut envoyé ---
-    evt = body.get("event", {}) if isinstance(body, dict) else {}
+    # --- Gestion des deux formats possibles (event ou payload) ---
+    evt = body.get("event") or body.get("payload") or {}
     label = None
+
+    # --- Extraction du label ---
     try:
         val = evt.get("value")
         if isinstance(val, str):
@@ -90,18 +94,21 @@ async def create_acompte_link(n: int, request: Request):
     if label and label != expected_label:
         return {"status": "ignored", "reason": f"label={label} != {expected_label}"}
 
-    # --- Lecture des infos item ---
-    item_id = int(evt.get("itemId", 0))
-    item_name = evt.get("pulseName", "Client")
+    # --- Identification de l'item ---
+    item_id = evt.get("itemId") or evt.get("pulseId")
     if not item_id:
-        raise HTTPException(400, "Missing itemId")
+        raise HTTPException(400, "Missing itemId or pulseId in Monday payload")
+    item_id = int(item_id)
 
+    item_name = evt.get("pulseName") or "Client"
+
+    # --- Lecture des infos complémentaires ---
     column_ids = [cid for cid in [settings.EMAIL_COLUMN_ID, settings.ADDRESS_COLUMN_ID] if cid]
     cols = get_item_columns(item_id, column_ids) if column_ids else {}
     email = (cols.get(settings.EMAIL_COLUMN_ID, {}) or {}).get("text") or ""
     address = (cols.get(settings.ADDRESS_COLUMN_ID, {}) or {}).get("text") or ""
 
-    # --- Montant et IBAN ---
+    # --- Montant ---
     formula_id = settings.FORMULA_COLUMN_IDS.get(str(n))
     if not formula_id:
         raise HTTPException(400, f"Formula column not configured for acompte {n}")
@@ -110,6 +117,7 @@ async def create_acompte_link(n: int, request: Request):
     if amount_cents <= 0:
         raise HTTPException(400, f"Invalid amount for acompte {n}: '{amount_euros}'")
 
+    # --- IBAN & clé API ---
     iban_display_value = get_formula_display_value(item_id, settings.IBAN_FORMULA_COLUMN_ID)
     api_key = _choose_api_key(iban_display_value)
     if not api_key:
@@ -129,19 +137,25 @@ async def create_acompte_link(n: int, request: Request):
     link_col = settings.LINK_COLUMN_IDS.get(str(n))
     if not link_col:
         raise HTTPException(400, f"Link column not configured for acompte {n}")
+
     set_link_in_column(item_id, settings.MONDAY_BOARD_ID, link_col, url, text="Payer")
 
+    print(f"✅ Lien PayPlug écrit pour item {item_id} ({expected_label}) → {url}")
     return {"status": "ok", "acompte": n, "payment_url": url}
 
 
 # --- Endpoint pour créer plusieurs liens à la fois ---
 @app.post("/pay/all")
-async def create_all_links(body: dict = Body(...)):
+async def create_all_links(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
     out: dict[str, Any] = {}
     for n in (1, 2, 3, 4):
         if str(n) in settings.LINK_COLUMN_IDS and str(n) in settings.FORMULA_COLUMN_IDS:
             try:
-                out[str(n)] = await create_acompte_link(n, Request)
+                out[str(n)] = await create_acompte_link(n, request)
             except HTTPException as e:
                 out[str(n)] = {"status": "error", "detail": e.detail}
     return out
