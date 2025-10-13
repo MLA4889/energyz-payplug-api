@@ -2,11 +2,13 @@ import json
 import os
 from pydantic import BaseModel
 
+
 def _loads_env_json(key: str, default: dict | None = None) -> dict:
     raw = os.getenv(key, "")
     if not raw:
         return default or {}
     return json.loads(raw)
+
 
 class Settings(BaseModel):
     MONDAY_API_KEY: str = os.getenv("MONDAY_API_KEY", "")
@@ -27,5 +29,12 @@ class Settings(BaseModel):
 
     PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
     BRAND_NAME: str = os.getenv("BRAND_NAME", "ENERGYZ")
+
+    # --- Variables Evoliz ---
+    EVOLIZ_PUBLIC_KEY: str = os.getenv("EVOLIZ_PUBLIC_KEY", "")
+    EVOLIZ_SECRET_KEY: str = os.getenv("EVOLIZ_SECRET_KEY", "")
+    EVOLIZ_COMPANY_ID: str = os.getenv("EVOLIZ_COMPANY_ID", "")
+    EVOLIZ_BASE_URL: str = os.getenv("EVOLIZ_BASE_URL", "")
+
 
 settings = Settings()
