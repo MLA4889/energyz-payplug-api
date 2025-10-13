@@ -1,96 +1,95 @@
-from typing import Optional
-import payplug
+import os
+import requests
 from .config import settings
 
+# --- Configuration API PayPlug ---
+PAYPLUG_API_URL = "https://api.payplug.com/v1/payments"
 
-# ----------------------------------------------------------
-# 🧩 ROUTAGE AUTOMATIQUE DES CLÉS PAYPLUG SELON L’IBAN
-# ----------------------------------------------------------
-def _choose_api_key(iban_display_value: str) -> Optional[str]:
+
+def _choose_api_key(iban_display_value: str) -> str | None:
     """
-    Sélectionne la clé PayPlug (test ou live) en fonction de l'IBAN détecté.
-    Retourne la clé API correspondante ou None si non trouvée.
+    Retourne la clé API PayPlug correspondant à l’IBAN détecté.
+    Permet d’utiliser plusieurs comptes PayPlug selon le compte bancaire (IBAN).
     """
     if not iban_display_value:
-        return None
+        print("⚠️ Aucun IBAN détecté, retour à la clé par défaut (TEST).")
+        return settings.PAYPLUG_API_KEYS.get("TEST")
 
-    iban = iban_display_value.replace(" ", "").upper()
+    iban_clean = iban_display_value.replace(" ", "").upper()
 
-    # 🟩 LIVE : Compte 1
-    if iban.startswith("FR7616958000013056705696366"):  # IBAN Energyz MAR
-        print("✅ IBAN reconnu (Energyz MAR) → utilisation clé LIVE principale")
-        return "sk_live_3Z0k3650qIaxaIB3V2Qdgd"
+    # --- Mapping IBAN → clé API ---
+    mapping = {
+        # IBAN Energyz MAR → Compte LIVE principal
+        "FR761695800001005711982492": settings.PAYPLUG_API_KEYS.get("LIVE_ENERGYZ_MAR"),
 
-    # 🟦 TEST : Compte 2
-    elif iban.startswith("FR7616958000010005711982492"):  # IBAN Energyz FR
-        print("✅ IBAN reconnu (Energyz FR) → utilisation clé TEST")
-        return "sk_test_3aV1MigpgyJDhuZ6hFn4yg"
+        # IBAN Energyz FR → Compte TEST ou second compte
+        "FR7616958000013056705696366": settings.PAYPLUG_API_KEYS.get("TEST_ENERGYZ_FR"),
+    }
 
-    # 🟨 Si besoin, ajoute d'autres IBAN ici :
-    # elif iban.startswith("FR76XXXXXXXXXXXX"):
-    #     return "sk_live_XXXX..."
+    for iban_prefix, key in mapping.items():
+        if iban_clean.startswith(iban_prefix[:12]):  # match sur début IBAN
+            print(f"✅ IBAN reconnu ({iban_display_value}) → utilisation clé correspondante.")
+            return key
 
-    # 🚫 IBAN inconnu
-    print(f"⚠️ Aucun mapping trouvé pour IBAN : {iban_display_value}")
-    return None
+    print(f"⚠️ IBAN inconnu ({iban_display_value}) → fallback TEST.")
+    return settings.PAYPLUG_API_KEYS.get("TEST")
 
 
-# ----------------------------------------------------------
-# 💳 CRÉATION D’UN PAIEMENT PAYPLUG
-# ----------------------------------------------------------
+def cents_from_str(amount_str: str) -> int:
+    """
+    Convertit '1000' ou '1 000,50 €' en centimes (int).
+    """
+    if not amount_str:
+        return 0
+    clean = (
+        amount_str.replace("€", "")
+        .replace(",", ".")
+        .replace(" ", "")
+        .strip()
+    )
+    try:
+        return int(float(clean) * 100)
+    except Exception:
+        return 0
+
+
 def create_payment(
     api_key: str,
     amount_cents: int,
-    email: str,
-    address: str,
-    customer_name: str,
-    metadata: dict,
+    email: str = "",
+    address: str = "",
+    customer_name: str = "",
+    metadata: dict = None,
 ) -> str:
     """
-    Crée un paiement PayPlug avec les infos du client et retourne l’URL du lien de paiement.
+    Crée un paiement PayPlug et retourne l’URL du lien de paiement.
     """
     if not api_key:
-        raise ValueError("API key PayPlug manquante pour ce paiement.")
+        raise ValueError("❌ Clé API PayPlug manquante.")
 
-    # Configuration de la clé PayPlug
-    payplug.set_secret_key(api_key)
-
-    # Création du paiement
-    payment = payplug.Payment.create(
-        amount=amount_cents,
-        currency="EUR",
-        save_card=False,
-        customer={
-            "email": email or "client@inconnu.fr",
-            "address1": address or "",
+    payload = {
+        "amount": amount_cents,
+        "currency": "EUR",
+        "customer": {
+            "email": email or "client@test.com",
             "first_name": customer_name or "Client",
-            "last_name": customer_name or "",
+            "address1": address or "Adresse inconnue",
         },
-        hosted_payment={
-            "sent_by": "OTHER",
-            "return_url": "https://monday.com",
-            "cancel_url": "https://monday.com",
-        },
-        notification_url=f"{settings.PUBLIC_BASE_URL}/pay/notify",
-        metadata=metadata,
-    )
+        "metadata": metadata or {},
+        "hosted_payment": {"return_url": "https://www.energyz.fr"},
+    }
 
-    print(f"💰 Paiement créé pour {customer_name} → {payment.hosted_payment.payment_url}")
-    return payment.hosted_payment.payment_url
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
 
+    print(f"💳 Création du paiement PayPlug → montant={amount_cents} cts / client={customer_name}")
 
-# ----------------------------------------------------------
-# 💶 Conversion montant (string → cents)
-# ----------------------------------------------------------
-def cents_from_str(euro_str: str) -> int:
-    """
-    Convertit un montant en euros (string) en centimes (int).
-    Exemple : "1 000,50" → 100050
-    """
-    if not euro_str:
-        return 0
-    euro_str = euro_str.replace(" ", "").replace(",", ".")
-    try:
-        return int(round(float(euro_str) * 100))
-    except Exception:
-        return 0
+    r = requests.post(PAYPLUG_API_URL, json=payload, headers=headers)
+    r.raise_for_status()
+    data = r.json()
+
+    url = data.get("hosted_payment", {}).get("payment_url")
+    print(f"✅ Paiement créé → {url}")
+    return url
