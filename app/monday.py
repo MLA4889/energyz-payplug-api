@@ -13,14 +13,12 @@ def _headers() -> Dict[str, str]:
     }
 
 def _post(query: str, variables: Dict[str, Any], tag: str) -> Dict[str, Any]:
-    """Poste une requête GraphQL sur Monday et lève une erreur si 'errors' présent."""
+    """Post GraphQL to Monday and raise on errors (Monday returns 200 even on errors)."""
     r = requests.post(MONDAY_API_URL, json={"query": query, "variables": variables}, headers=_headers())
     r.raise_for_status()
     data = r.json()
     if data.get("errors"):
-        # Log verbeux pour diagnostiquer facilement dans Render
         print(f"🧭 Monday API response ({tag}): {data}")
-        # Lève une exception lisible (remontera 500 côté FastAPI, visible dans les logs)
         raise RuntimeError(data["errors"][0].get("message", "Unknown Monday error"))
     return data.get("data", {})
 
@@ -28,12 +26,7 @@ def get_item_columns(item_id: int, column_ids: list[str]) -> Dict[str, Any]:
     query = """
     query ($itemId: [ID!]) {
       items (ids: $itemId) {
-        column_values {
-          id
-          text
-          value
-          type
-        }
+        column_values { id text value type }
       }
     }"""
     data = _post(query, {"itemId": [item_id]}, tag="get_item_columns")
@@ -47,15 +40,11 @@ def get_item_columns(item_id: int, column_ids: list[str]) -> Dict[str, Any]:
     return out
 
 def get_formula_display_value(item_id: int, formula_column_id: str) -> str:
-    # lecture fiable du display_value d'une colonne Formula, ciblée par id
     query = """
     query ($itemId: [ID!], $columnId: [String!]) {
       items (ids: $itemId) {
         column_values(ids: $columnId) {
-          ... on FormulaValue {
-            id
-            display_value
-          }
+          ... on FormulaValue { id display_value }
         }
       }
     }"""
@@ -67,18 +56,18 @@ def get_formula_display_value(item_id: int, formula_column_id: str) -> str:
     return (cvs[0].get("display_value") if cvs else "") or ""
 
 def set_link_in_column(item_id: int, board_id: int, column_id: str, url: str, text: str = "Payer") -> None:
-    # IMPORTANT: Monday attend une *chaîne* JSON dans column_values, pas un dict Python
+    # IMPORTANT : Monday veut une CHAÎNE JSON pour column_values
     col_values = {column_id: {"url": url, "text": text}}
     mutation = """
     mutation ($itemId: ID!, $boardId: ID!, $columnValues: JSON!) {
       change_multiple_column_values(item_id: $itemId, board_id: $boardId, column_values: $columnValues) { id }
     }"""
-    variables = {
+    vars = {
         "itemId": item_id,
         "boardId": board_id,
-        "columnValues": _json.dumps(col_values)  # <-- stringify obligatoire
+        "columnValues": _json.dumps(col_values),
     }
-    _post(mutation, variables, tag="set_link_in_column")
+    _post(mutation, vars, tag="set_link_in_column")
 
 def set_status(item_id: int, board_id: int, status_column_id: str, label: str) -> None:
     col_values = {status_column_id: {"label": label}}
@@ -86,9 +75,9 @@ def set_status(item_id: int, board_id: int, status_column_id: str, label: str) -
     mutation ($itemId: ID!, $boardId: ID!, $columnValues: JSON!) {
       change_multiple_column_values(item_id: $itemId, board_id: $boardId, column_values: $columnValues) { id }
     }"""
-    variables = {
+    vars = {
         "itemId": item_id,
         "boardId": board_id,
-        "columnValues": _json.dumps(col_values)  # <-- stringify obligatoire
+        "columnValues": _json.dumps(col_values),
     }
-    _post(mutation, variables, tag="set_status")
+    _post(mutation, vars, tag="set_status")
