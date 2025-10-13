@@ -82,13 +82,11 @@ async def create_acompte_link(n: int, request: Request):
     try:
         val = evt.get("value")
         if isinstance(val, str):
-            # Ancien format : value est une chaîne JSON
             try:
                 val = _json.loads(val)
             except Exception:
                 val = {}
         if isinstance(val, dict):
-            # ✅ Nouveau format : value.label.text
             if isinstance(val.get("label"), dict):
                 label = val["label"].get("text")
             else:
@@ -207,31 +205,6 @@ def debug_test_write(item_id: int):
         }
     except Exception as e:
         raise HTTPException(500, detail=str(e))
-        
-# --- Test direct Render → Monday ---
-@app.get("/debug/test_write/{item_id}")
-def debug_test_write(item_id: int):
-    try:
-        link_col = settings.LINK_COLUMN_IDS.get("1")
-        if not link_col:
-            raise HTTPException(400, "Colonne de lien pour acompte 1 non configurée")
-
-        test_url = "https://example.com/test"
-        set_link_in_column(
-            item_id=item_id,
-            board_id=settings.MONDAY_BOARD_ID,
-            column_id=link_col,
-            url=test_url,
-            text="Lien de test ✅",
-        )
-        return {
-            "status": "ok",
-            "message": f"Lien écrit dans {link_col}",
-            "url": test_url,
-            "item_id": item_id,
-        }
-    except Exception as e:
-        raise HTTPException(500, detail=str(e))
 
 
 # --- Nouvel endpoint : Création de devis Evoliz ---
@@ -252,15 +225,6 @@ class QuoteRequest(BaseModel):
 async def create_quote_from_monday(payload: QuoteRequest):
     """
     Reçoit un JSON depuis Monday ou Swagger pour créer un devis sur Evoliz.
-    Exemple :
-    {
-        "client_name": "Jean Dupont",
-        "address": "12 rue de Paris",
-        "postcode": "75000",
-        "city": "Paris",
-        "description": "Installation panneau solaire",
-        "amount_ht": 1234.56
-    }
     """
     try:
         client_info = {
