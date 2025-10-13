@@ -5,8 +5,7 @@ from .config import settings
 
 MONDAY_API_URL = "https://api.monday.com/v2"
 
-
-# --- Base HTTP ---
+# --- Utilitaires ---
 def _headers() -> Dict[str, str]:
     return {
         "Authorization": settings.MONDAY_API_KEY,
@@ -14,15 +13,15 @@ def _headers() -> Dict[str, str]:
     }
 
 
-def _post(query: str, variables: Dict[str, Any], tag: str) -> Dict[str, Any]:
-    r = requests.post(MONDAY_API_URL, json={"query": query, "variables": variables}, headers=_headers())
-    r.raise_for_status()
+def _post(query: str, variables: Dict[str, Any] | None, tag: str) -> Dict[str, Any]:
+    r = requests.post(MONDAY_API_URL, json={"query": query, "variables": variables or {}}, headers=_headers())
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
     data = r.json()
     if data.get("errors"):
         print(f"🧭 Monday API error ({tag}): {data}")
         raise RuntimeError(data["errors"][0].get("message", "Unknown Monday error"))
     return data.get("data", {})
-
 
 # --- Lecture ---
 def get_item_columns(item_id: int, column_ids: list[str]) -> Dict[str, Any]:
@@ -60,52 +59,49 @@ def get_formula_display_value(item_id: int, formula_column_id: str) -> str:
     return (cvs[0].get("display_value") if cvs else "") or ""
 
 
-# --- Écriture du lien ---
+# --- Écriture (Lien PayPlug ou test) ---
 def set_link_in_column(item_id: int, board_id: int, column_id: str, url: str, text: str = "Payer") -> None:
-    """Écrit un lien cliquable dans une colonne Link (format correct Monday)"""
-    column_values = _json.dumps({column_id: {"url": url, "text": text}})
-
-    # ⚠️ Monday n’aime pas JSON dans les variables — on injecte directement
+    """Écrit un lien dans Monday — version corrigée avec triple quotes"""
+    column_values = _json.dumps({column_id: {"url": url, "text": text}}, ensure_ascii=False)
     query = f"""
     mutation {{
       change_multiple_column_values(
         item_id: {item_id},
         board_id: {board_id},
-        column_values: {column_values}
+        column_values: \"\"\"{column_values}\"\"\"
       ) {{
         id
       }}
     }}
     """
-
     r = requests.post(MONDAY_API_URL, json={"query": query}, headers=_headers())
-    r.raise_for_status()
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
     data = r.json()
     if data.get("errors"):
-        print(f"🧭 Monday API error (set_link_in_column): {data}")
+        print("🧭 Monday API error (set_link_in_column):", data)
         raise RuntimeError(data["errors"][0].get("message", "Unknown Monday error"))
 
 
-# --- Écriture du statut ---
+# --- Écriture (Statut Payé acompte) ---
 def set_status(item_id: int, board_id: int, status_column_id: str, label: str) -> None:
-    """Change un statut dans une colonne de type status"""
-    column_values = _json.dumps({status_column_id: {"label": label}})
-
+    """Change un statut dans Monday — version corrigée"""
+    column_values = _json.dumps({status_column_id: {"label": label}}, ensure_ascii=False)
     query = f"""
     mutation {{
       change_multiple_column_values(
         item_id: {item_id},
         board_id: {board_id},
-        column_values: {column_values}
+        column_values: \"\"\"{column_values}\"\"\"
       ) {{
         id
       }}
     }}
     """
-
     r = requests.post(MONDAY_API_URL, json={"query": query}, headers=_headers())
-    r.raise_for_status()
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
     data = r.json()
     if data.get("errors"):
-        print(f"🧭 Monday API error (set_status): {data}")
+        print("🧭 Monday API error (set_status):", data)
         raise RuntimeError(data["errors"][0].get("message", "Unknown Monday error"))
