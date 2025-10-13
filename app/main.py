@@ -1,90 +1,248 @@
-import requests
+from fastapi import FastAPI, HTTPException, Body, Request
+from fastapi.responses import JSONResponse
+from typing import Any
+import json as _json
+
 from .config import settings
+from .monday import (
+    get_item_columns,
+    get_formula_display_value,
+    set_link_in_column,
+    set_status,
+)
+from .payments import create_payment, cents_from_str, _choose_api_key
+
+app = FastAPI(title="ENERGYZ PayPlug API")
+
+# --- Health checks ---
+@app.get("/")
+def root():
+    return {"status": "ok", "brand": settings.BRAND_NAME}
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "energyz-payplug-api"}
 
 
-def get_access_token():
-    payload = {
-        "public_key": settings.EVOLIZ_PUBLIC_KEY,
-        "secret_key": settings.EVOLIZ_SECRET_KEY
+# --- Debug: Check Monday Data ---
+@app.get("/debug/check/{item_id}/{n}")
+def debug_check(item_id: int, n: int):
+    print(f"🔍 Debug check lancé pour item {item_id}, acompte {n}")
+
+    formula_id = settings.FORMULA_COLUMN_IDS.get(str(n))
+    link_col = settings.LINK_COLUMN_IDS.get(str(n))
+
+    amount_display = get_formula_display_value(item_id, formula_id) if formula_id else ""
+    iban_display = get_formula_display_value(item_id, settings.IBAN_FORMULA_COLUMN_ID) if settings.IBAN_FORMULA_COLUMN_ID else ""
+
+    cols = get_item_columns(item_id, [c for c in [settings.EMAIL_COLUMN_ID, settings.ADDRESS_COLUMN_ID] if c])
+    email = (cols.get(settings.EMAIL_COLUMN_ID, {}) or {}).get("text") or ""
+    address = (cols.get(settings.ADDRESS_COLUMN_ID, {}) or {}).get("text") or ""
+
+    api_key = _choose_api_key(iban_display)
+
+    return {
+        "item_id": item_id,
+        "n": n,
+        "formula_id_used": formula_id,
+        "amount_display": amount_display,
+        "iban_display": iban_display,
+        "email": email,
+        "address": address,
+        "link_col_used": link_col,
+        "api_key_found": bool(api_key),
     }
 
-    # L'auth de l'API Evoliz passe par /v1/login (et non /api/login)
-    url = f"{settings.EVOLIZ_BASE_URL}/v1/login"
-    print(f"🔑 Auth vers Evoliz : {url}")
-    r = requests.post(url, json=payload)
-    r.raise_for_status()
-    token = r.json().get("access_token")
-    if not token:
-        raise ValueError("Aucun token reçu depuis Evoliz")
-    print("✅ Token Evoliz reçu avec succès")
-    return token
+
+# --- Endpoint principal : Générer lien PayPlug ---
+@app.api_route("/pay/acompte/{n}", methods=["POST", "GET"])
+async def create_acompte_link(n: int, request: Request):
+    """
+    Crée un lien PayPlug pour l'acompte spécifié.
+    Géré via webhook Monday (POST) ou test manuel (GET).
+    """
+    raw_body = await request.body()
+    print(f"📩 Webhook reçu depuis Monday (RAW): {raw_body.decode('utf-8', errors='ignore')}")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    # --- Challenge pour vérification ---
+    if "challenge" in body:
+        return {"challenge": body["challenge"]}
+
+    if not body:
+        return {"status": "ok", "message": "Webhook test accepté"}
+
+    # --- Lecture événement Monday ---
+    evt = body.get("event") or body.get("payload") or {}
+    label = None
+
+    try:
+        val = evt.get("value")
+        if isinstance(val, str):
+            try:
+                val = _json.loads(val)
+            except Exception:
+                val = {}
+        if isinstance(val, dict):
+            if isinstance(val.get("label"), dict):
+                label = val["label"].get("text")
+            else:
+                label = val.get("label")
+    except Exception:
+        pass
+
+    expected_label = f"Générer acompte {n}"
+    if label and label != expected_label:
+        print(f"⚠️ Label ignoré : {label} (attendu : {expected_label})")
+        return {"status": "ignored", "reason": f"label={label} != {expected_label}"}
+
+    # --- Item ---
+    item_id = evt.get("itemId") or evt.get("pulseId")
+    if not item_id:
+        raise HTTPException(400, "itemId ou pulseId manquant dans le payload Monday")
+    item_id = int(item_id)
+    item_name = evt.get("pulseName") or "Client"
+
+    # --- Lecture infos client ---
+    column_ids = [cid for cid in [settings.EMAIL_COLUMN_ID, settings.ADDRESS_COLUMN_ID] if cid]
+    cols = get_item_columns(item_id, column_ids) if column_ids else {}
+    email = (cols.get(settings.EMAIL_COLUMN_ID, {}) or {}).get("text") or ""
+    address = (cols.get(settings.ADDRESS_COLUMN_ID, {}) or {}).get("text") or ""
+
+    # --- Montant ---
+    formula_id = settings.FORMULA_COLUMN_IDS.get(str(n))
+    if not formula_id:
+        raise HTTPException(400, f"Aucune colonne formule configurée pour acompte {n}")
+
+    amount_euros = get_formula_display_value(item_id, formula_id)
+    amount_cents = cents_from_str(amount_euros)
+    if amount_cents <= 0:
+        raise HTTPException(400, f"Montant invalide pour acompte {n}: '{amount_euros}'")
+
+    # --- Choix clé API PayPlug ---
+    iban_display_value = get_formula_display_value(item_id, settings.IBAN_FORMULA_COLUMN_ID)
+    api_key = _choose_api_key(iban_display_value)
+    if not api_key:
+        raise HTTPException(400, f"IBAN non reconnu : '{iban_display_value}'")
+
+    # --- Création paiement PayPlug ---
+    url = create_payment(
+        api_key=api_key,
+        amount_cents=amount_cents,
+        email=email,
+        address=address,
+        customer_name=item_name,
+        metadata={"customer_id": item_id, "acompte": str(n)},
+    )
+
+    # --- Écriture du lien dans Monday ---
+    link_col = settings.LINK_COLUMN_IDS.get(str(n))
+    if not link_col:
+        raise HTTPException(400, f"Aucune colonne lien configurée pour acompte {n}")
+
+    set_link_in_column(item_id, settings.MONDAY_BOARD_ID, link_col, url, text="Payer")
+    print(f"✅ Lien PayPlug écrit sur Monday : {url}")
+
+    return {"status": "ok", "acompte": n, "payment_url": url}
 
 
-def create_client_if_needed(token, client_data):
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-        "Content-Type": "application/json"
-    }
-    search = client_data["name"]
-    print(f"👤 Recherche du client '{search}' dans Evoliz...")
+# --- Créer plusieurs liens ---
+@app.post("/pay/all")
+async def create_all_links(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    out: dict[str, Any] = {}
+    for n in (1, 2, 3, 4):
+        if str(n) in settings.LINK_COLUMN_IDS and str(n) in settings.FORMULA_COLUMN_IDS:
+            try:
+                out[str(n)] = await create_acompte_link(n, request)
+            except HTTPException as e:
+                out[str(n)] = {"status": "error", "detail": e.detail}
+    return out
 
-    # ✅ URL correcte
-    url = f"{settings.EVOLIZ_BASE_URL}/v1/{settings.EVOLIZ_COMPANY_ID}/clients"
-    print(f"GET {url}")
 
-    r = requests.get(url, headers=headers, params={"search": search})
-    r.raise_for_status()
-    existing = r.json().get("data", [])
+# --- Notification PayPlug ---
+@app.post("/pay/notify")
+async def payplug_notify(body: dict = Body(...)):
+    if body.get("is_paid"):
+        meta = body.get("metadata", {}) or {}
+        try:
+            item_id = int(meta.get("customer_id"))
+        except Exception:
+            return {"status": "ignored"}
+        acompte = str(meta.get("acompte") or "")
+        label = settings.STATUS_AFTER_PAY.get(acompte)
+        if label:
+            set_status(item_id, settings.MONDAY_BOARD_ID, settings.STATUS_COLUMN_ID, label)
+    return {"status": "processed"}
 
-    if existing:
-        print(f"✅ Client existant trouvé : {existing[0]['clientid']}")
-        return existing[0]["clientid"]
 
-    # Sinon, création du client
-    payload = {
-        "name": client_data["name"],
-        "type": "Professionnel",
-        "address": {
-            "addr": client_data.get("address", ""),
-            "postcode": client_data.get("postcode", ""),
-            "town": client_data.get("city", ""),
-            "iso2": "FR"
+# --- Test d’écriture dans Monday ---
+@app.get("/debug/test_write/{item_id}")
+def debug_test_write(item_id: int):
+    try:
+        link_col = settings.LINK_COLUMN_IDS.get("1")
+        if not link_col:
+            raise HTTPException(400, "Colonne lien acompte 1 non configurée")
+
+        test_url = "https://example.com/test"
+        set_link_in_column(
+            item_id=item_id,
+            board_id=settings.MONDAY_BOARD_ID,
+            column_id=link_col,
+            url=test_url,
+            text="Lien de test ✅",
+        )
+        return {"status": "ok", "url": test_url, "item_id": item_id}
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+
+
+# --- Création de devis Evoliz ---
+from pydantic import BaseModel
+from . import evoliz
+
+
+class QuoteRequest(BaseModel):
+    client_name: str
+    address: str
+    postcode: str
+    city: str
+    description: str
+    amount_ht: float
+
+
+@app.post("/quote/create", summary="Create Quote From Monday")
+async def create_quote_from_monday(payload: QuoteRequest):
+    """
+    Crée un devis Evoliz à partir d'une requête JSON (via Monday ou Swagger).
+    """
+    try:
+        print(f"🧾 Création de devis Evoliz pour client : {payload.client_name}")
+
+        client_info = {
+            "name": payload.client_name,
+            "address": payload.address,
+            "postcode": payload.postcode,
+            "city": payload.city,
         }
-    }
+        quote_info = {
+            "description": payload.description,
+            "amount_ht": payload.amount_ht,
+        }
 
-    print(f"🧾 Création d’un nouveau client : {payload}")
-    r = requests.post(url, headers=headers, json=payload)
-    r.raise_for_status()
-    client = r.json()
-    print("✅ Nouveau client créé :", client)
-    return client.get("clientid")
+        token = evoliz.get_access_token()
+        client_id = evoliz.create_client_if_needed(token, client_info)
+        quote = evoliz.create_quote(token, client_id, quote_info)
 
-
-def create_quote(token, client_id, quote_data):
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-        "Content-Type": "application/json"
-    }
-
-    payload = {
-        "clientid": client_id,
-        "lines": [
-            {
-                "designation": quote_data["description"],
-                "unit_price": quote_data["amount_ht"],
-                "quantity": 1
-            }
-        ],
-        "currency": "EUR"
-    }
-
-    # ✅ URL correcte
-    url = f"{settings.EVOLIZ_BASE_URL}/v1/{settings.EVOLIZ_COMPANY_ID}/quotes"
-    print(f"🧾 Création du devis sur {url}")
-    r = requests.post(url, headers=headers, json=payload)
-    r.raise_for_status()
-    quote = r.json()
-    print("✅ Devis créé :", quote)
-    return quote
+        print(f"✅ Devis créé avec succès : {quote}")
+        return {"status": "ok", "quote_id": quote.get("quoteid")}
+    except Exception as e:
+        print(f"❌ Erreur Evoliz : {e}")
+        raise HTTPException(500, f"Erreur lors de la création du devis : {e}")
