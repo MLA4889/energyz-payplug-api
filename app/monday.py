@@ -1,6 +1,5 @@
-# app/monday.py
-import json as _json
 import requests
+import json as _json
 from typing import Any, Dict
 from .config import settings
 
@@ -13,7 +12,6 @@ def _headers() -> Dict[str, str]:
     }
 
 def _post(query: str, variables: Dict[str, Any], tag: str) -> Dict[str, Any]:
-    """Post GraphQL to Monday and raise on errors (Monday returns 200 even on errors)."""
     r = requests.post(MONDAY_API_URL, json={"query": query, "variables": variables}, headers=_headers())
     r.raise_for_status()
     data = r.json()
@@ -56,7 +54,6 @@ def get_formula_display_value(item_id: int, formula_column_id: str) -> str:
     return (cvs[0].get("display_value") if cvs else "") or ""
 
 def set_link_in_column(item_id: int, board_id: int, column_id: str, url: str, text: str = "Payer") -> None:
-    # IMPORTANT : Monday veut une CHAÎNE JSON pour column_values
     col_values = {column_id: {"url": url, "text": text}}
     mutation = """
     mutation ($itemId: ID!, $boardId: ID!, $columnValues: JSON!) {
@@ -65,7 +62,7 @@ def set_link_in_column(item_id: int, board_id: int, column_id: str, url: str, te
     vars = {
         "itemId": item_id,
         "boardId": board_id,
-        "columnValues": _json.dumps(col_values),
+        "columnValues": col_values,  # ✅ correction ici
     }
     _post(mutation, vars, tag="set_link_in_column")
 
@@ -78,6 +75,6 @@ def set_status(item_id: int, board_id: int, status_column_id: str, label: str) -
     vars = {
         "itemId": item_id,
         "boardId": board_id,
-        "columnValues": _json.dumps(col_values),
+        "columnValues": col_values,  # ✅ idem ici
     }
     _post(mutation, vars, tag="set_status")
