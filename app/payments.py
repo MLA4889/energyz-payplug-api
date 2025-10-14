@@ -1,114 +1,35 @@
 from typing import Optional
 import payplug
-import json
 from .config import settings
 
-
-# ----------------------------------------------------------
-# 🧠 Sélection automatique de la clé PayPlug selon IBAN et mode
-# ----------------------------------------------------------
 def _choose_api_key(iban_display_value: str) -> Optional[str]:
-    """
-    Sélectionne la clé PayPlug (LIVE ou TEST) en fonction de l'IBAN et du mode.
-    - Nettoie les espaces et majuscules.
-    - Cherche uniquement dans le dictionnaire du mode actuel.
-    """
+    keymap = settings.PAYPLUG_KEYS_LIVE if settings.PAYPLUG_MODE == "live" else settings.PAYPLUG_KEYS_TEST
     if not iban_display_value:
-        print("⚠️ Aucun IBAN fourni.")
-        return None
+        return keymap.get("AUTRE_IBAN")
+    k = " ".join(iban_display_value.split())
+    return keymap.get(k) or keymap.get("AUTRE_IBAN")
 
-    iban_clean = iban_display_value.strip().replace(" ", "").upper()
-
-    # Lecture sécurisée des variables Render
-    try:
-        live_dict = settings.PAYPLUG_KEYS_LIVE
-        test_dict = settings.PAYPLUG_KEYS_TEST
-    except Exception as e:
-        print("🚨 Erreur de lecture des clés PayPlug:", e)
-        return None
-
-    # Affichage du mode actuel
-    print(f"🧩 Mode PayPlug actif : {settings.PAYPLUG_MODE}")
-
-    # --- Si on est en mode LIVE ---
-    if settings.PAYPLUG_MODE.lower() == "live":
-        for key, value in live_dict.items():
-            if key.replace(" ", "").upper() == iban_clean:
-                print(f"✅ IBAN reconnu (LIVE) : {iban_clean}")
-                return value
-        print(f"⚠️ IBAN non trouvé dans LIVE : {iban_clean}")
-
-    # --- Si on est en mode TEST ---
-    elif settings.PAYPLUG_MODE.lower() == "test":
-        for key, value in test_dict.items():
-            if key.replace(" ", "").upper() == iban_clean:
-                print(f"✅ IBAN reconnu (TEST) : {iban_clean}")
-                return value
-        print(f"⚠️ IBAN non trouvé dans TEST : {iban_clean}")
-
-    # --- Fallback : on regarde les deux (sécurité) ---
-    for key, value in {**live_dict, **test_dict}.items():
-        if key.replace(" ", "").upper() == iban_clean:
-            print(f"✅ IBAN reconnu (Fallback) : {iban_clean}")
-            return value
-
-    print(f"🚫 Aucun mapping trouvé pour IBAN : {iban_clean}")
-    return None
-
-
-# ----------------------------------------------------------
-# 💳 Création d’un paiement PayPlug
-# ----------------------------------------------------------
-def create_payment(
-    api_key: str,
-    amount_cents: int,
-    email: str,
-    address: str,
-    customer_name: str,
-    metadata: dict,
-) -> str:
-    """
-    Crée un paiement PayPlug et retourne le lien.
-    """
-    if not api_key:
-        raise ValueError("❌ Clé API PayPlug absente, impossible de créer le paiement.")
-
-    payplug.set_secret_key(api_key)
-
-    payment = payplug.Payment.create(
-        amount=amount_cents,
-        currency="EUR",
-        save_card=False,
-        customer={
-            "email": email or "client@inconnu.fr",
-            "address1": address or "",
-            "first_name": customer_name or "Client",
-            "last_name": customer_name or "",
-        },
-        hosted_payment={
-            "sent_by": "OTHER",
-            "return_url": "https://monday.com",
-            "cancel_url": "https://monday.com",
-        },
-        notification_url=f"{settings.PUBLIC_BASE_URL}/pay/notify",
-        metadata=metadata,
-    )
-
-    print(f"💰 Paiement créé pour {customer_name} → {payment.hosted_payment.payment_url}")
-    return payment.hosted_payment.payment_url
-
-
-# ----------------------------------------------------------
-# 💶 Conversion d’euros → centimes
-# ----------------------------------------------------------
-def cents_from_str(euro_str: str) -> int:
-    """
-    Convertit un montant en euros ('1 000,50') en centimes (100050).
-    """
-    if not euro_str:
+def cents_from_str(s: str | None) -> int:
+    if not s:
         return 0
-    euro_str = euro_str.replace(" ", "").replace(",", ".")
+    s = s.replace("€", "").replace(" ", "").replace(",", ".")
     try:
-        return int(round(float(euro_str) * 100))
+        return int(round(float(s) * 100))
     except Exception:
         return 0
+
+def create_payment(amount_cents: int, description: str, return_url: str, iban_display_value: str) -> dict:
+    api_key = _choose_api_key(iban_display_value)
+    if not api_key:
+        raise RuntimeError("Aucune clé PayPlug correspondante à l'IBAN sélectionné.")
+    payplug.configure(api_key)
+    payment = payplug.Payment.create(
+        amount=amount_cents,
+        currency='EUR',
+        hosted_payment={'return_url': return_url},
+        notification_url=None,
+        save_card=False,
+        metadata={"brand": settings.BRAND_NAME, "iban": iban_display_value, "mode": settings.PAYPLUG_MODE},
+        description=(description or "Acompte")[:255],
+    )
+    return {"id": payment.id, "url": payment.hosted_payment.payment_url, "status": payment.status}
