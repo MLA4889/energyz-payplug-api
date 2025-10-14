@@ -17,7 +17,6 @@ def _auth_headers(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 def create_client_if_needed(token, client_data: dict):
-    # cherche par nom
     r = requests.get(
         f"{settings.EVOLIZ_BASE_URL}/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/clients",
         headers=_auth_headers(token),
@@ -39,7 +38,6 @@ def create_client_if_needed(token, client_data: dict):
             "iso2": "FR",
         }
     }
-    # pro intracom ?
     if client_data.get("client_type") == "Professionnel" and client_data.get("vat_number"):
         payload["vat_number"] = client_data["vat_number"]
 
@@ -57,7 +55,7 @@ def create_quote(token, client_id, quote_data: dict):
     quote_data attend:
       - description (str)
       - amount_ht (float)
-      - vat_rate (float)  # ex: 20.0 ou 5.5
+      - vat_rate (float)  # ex: 20.0, 5.5, 0
     """
     vat_rate = float(quote_data.get("vat_rate", settings.DEFAULT_VAT_RATE))
 
@@ -68,11 +66,11 @@ def create_quote(token, client_id, quote_data: dict):
                 "designation": quote_data["description"],
                 "unit_price": quote_data["amount_ht"],
                 "quantity": 1,
-                "vat": vat_rate,              # <--- TAUX DE TVA
+                "vat_rate": vat_rate,        # <--- ICI
             }
         ],
         "currency": "EUR",
-        "prices_include_vat": False        # HT -> TVA ajoutée
+        "prices_include_vat": False        # on envoie du HT, Evoliz calcule TVA + TTC
     }
     r = requests.post(
         f"{settings.EVOLIZ_BASE_URL}/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes",
@@ -80,5 +78,6 @@ def create_quote(token, client_id, quote_data: dict):
         json=payload,
         timeout=30,
     )
-    r.raise_for_status()
+    if r.status_code >= 400:
+        raise RuntimeError(f"Evoliz error {r.status_code}: {r.text}")
     return r.json()
