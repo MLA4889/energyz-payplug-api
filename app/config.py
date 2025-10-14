@@ -30,7 +30,7 @@ class Settings(BaseModel):
     QUOTE_AMOUNT_FORMULA_ID: str = os.getenv("QUOTE_AMOUNT_FORMULA_ID", "")
     QUOTE_LINK_COLUMN_ID: str = os.getenv("QUOTE_LINK_COLUMN_ID", "")
 
-    # ✅ Une seule colonne Files pour tout
+    # ✅ Une seule colonne Files (doc centralisée)
     DOC_FILES_COLUMN_ID: str = os.getenv("DOC_FILES_COLUMN_ID", "")
     # Backward compat (laisser vides si tu centralises tout)
     QUOTE_FILES_COLUMN_ID: str = os.getenv("QUOTE_FILES_COLUMN_ID", "")
@@ -74,6 +74,10 @@ class Settings(BaseModel):
     EVOLIZ_SECRET_KEY: str = os.getenv("EVOLIZ_SECRET_KEY", "")
     EVOLIZ_COMPANY_ID: str = os.getenv("EVOLIZ_COMPANY_ID", "")
     EVOLIZ_BASE_URL: str = os.getenv("EVOLIZ_BASE_URL", "https://api.evoliz.com").rstrip("/")
+
+    # ===== Fallback IBAN basé sur le status (NOUVEAU) =====
+    BUSINESS_STATUS_COLUMN_ID: str = os.getenv("BUSINESS_STATUS_COLUMN_ID", "")
+    IBAN_BY_STATUS: dict = _loads_env_json("IBAN_BY_STATUS_JSON", {})
 
 
 settings = Settings()
