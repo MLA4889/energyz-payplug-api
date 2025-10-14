@@ -21,7 +21,7 @@ def _auth_headers(token: str) -> dict:
 
 
 def create_client_if_needed(token, client_data: dict):
-    # Recherche client par nom
+    # Recherche par nom
     r = requests.get(
         f"{settings.EVOLIZ_BASE_URL}/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/clients",
         headers=_auth_headers(token),
@@ -43,6 +43,7 @@ def create_client_if_needed(token, client_data: dict):
             "iso2": "FR",
         }
     }
+    # Pro intracom ?
     if client_data.get("client_type") == "Professionnel" and client_data.get("vat_number"):
         payload["vat_number"] = client_data["vat_number"]
 
@@ -64,20 +65,20 @@ def _payload_lines(quote_data: dict) -> dict:
                 "designation": quote_data["description"],
                 "unit_price": quote_data["amount_ht"],
                 "quantity": 1,
-                "vat_rate": vat_rate,          # <- taux de TVA
+                "vat_rate": vat_rate,   # le taux apparaît sur la ligne dans le PDF
             }
         ],
         "currency": "EUR",
-        "prices_include_vat": False
+        "prices_include_vat": False  # prix envoyés HT -> Evoliz calcule TVA + TTC
     }
 
 
 def _payload_items_legacy(quote_data: dict) -> dict:
-    """Repli si l'API réclame items/documentdate/term.paytermid."""
+    """Fallback si l'API réclame items/documentdate/term.paytermid."""
     vat_rate = float(quote_data.get("vat_rate", settings.DEFAULT_VAT_RATE))
     return {
         "documentdate": date.today().isoformat(),
-        "term": {"paytermid": 1},              # 1 = à réception (classique)
+        "term": {"paytermid": 1},  # en général : à réception
         "items": [
             {
                 "designation": quote_data["description"],
@@ -93,8 +94,8 @@ def _payload_items_legacy(quote_data: dict) -> dict:
 
 def create_quote(token, client_id, quote_data: dict):
     """
-    Crée un devis Evoliz avec TVA. Préférence pour schéma 'lines'.
-    En cas d'erreur attendue, retente en schéma 'items'.
+    Essaie d'abord le schéma 'lines' (API v1).
+    Si 400 avec message 'items/documentdate/term.paytermid', retente en legacy.
     """
     url = f"{settings.EVOLIZ_BASE_URL}/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes"
     base = {"clientid": client_id}
@@ -105,11 +106,12 @@ def create_quote(token, client_id, quote_data: dict):
     if r.status_code < 400:
         return r.json()
 
-    # 2) si message indique le schéma legacy -> on retente
+    # 2) si erreur et message typique → repli 'items'
     try:
         err = r.json()
     except Exception:
         err = {"raw": r.text}
+
     msg = str(err)
     needs_legacy = ("items" in msg) or ("documentdate" in msg) or ("term.paytermid" in msg)
 
@@ -120,5 +122,5 @@ def create_quote(token, client_id, quote_data: dict):
             return r2.json()
         raise RuntimeError(f"Evoliz legacy error {r2.status_code}: {r2.text}")
 
-    # sinon, on propage l'erreur
+    # autre erreur
     raise RuntimeError(f"Evoliz error {r.status_code}: {r.text}")
