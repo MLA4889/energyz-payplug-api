@@ -1,3 +1,4 @@
+# app/monday.py
 import json
 import mimetypes
 import re
@@ -23,16 +24,23 @@ def _gql(query: str, variables: dict | None = None) -> dict:
     return data["data"]
 
 def get_item_columns(item_id: int) -> Dict[str, Any]:
+    # ✔️ 1) type ID au lieu de Int
+    # ✔️ 2) ne plus demander additional_info
     q = """
-    query($item_id: [Int]) {
-      items(ids: $item_id) {
+    query($item_id: ID!) {
+      items(ids: [$item_id]) {
         id
         name
-        column_values { id text value type additional_info }
+        column_values {
+          id
+          text
+          value
+          type
+        }
       }
     }
     """
-    data = _gql(q, {"item_id": item_id})
+    data = _gql(q, {"item_id": str(item_id)})  # on passe l'ID en string pour être 100% compliant
     items = data.get("items") or []
     if not items:
         raise RuntimeError(f"Item {item_id} introuvable.")
@@ -48,20 +56,20 @@ def get_formula_display_value(columns: Dict[str, Any], formula_col_id: str) -> O
 
 def set_status(item_id: int, status_column_id: str, label: str) -> None:
     q = """
-    mutation($item_id: Int!, $column_id: String!, $label: String!) {
+    mutation($item_id: ID!, $column_id: String!, $label: String!) {
       change_simple_column_value(item_id: $item_id, column_id: $column_id, value: $label) { id }
     }
     """
-    _gql(q, {"item_id": item_id, "column_id": status_column_id, "label": label})
+    _gql(q, {"item_id": str(item_id), "column_id": status_column_id, "label": label})
 
 def set_link_in_column(item_id: int, column_id: str, url: str, text: str = "Ouvrir") -> None:
     value = json.dumps({"url": url, "text": text})
     q = """
-    mutation($item_id:Int!, $column_id:String!, $value:JSON!) {
-      change_column_value(item_id:$item_id, column_id:$column_id, value:$value) { id }
+    mutation($item_id: ID!, $column_id: String!, $value: JSON!) {
+      change_column_value(item_id: $item_id, column_id: $column_id, value: $value) { id }
     }
     """
-    _gql(q, {"item_id": item_id, "column_id": column_id, "value": value})
+    _gql(q, {"item_id": str(item_id), "column_id": column_id, "value": value})
 
 def extract_address_fields(columns: Dict[str, Any]) -> dict:
     def _cv_text(col_id: str) -> str:
@@ -90,22 +98,20 @@ def upload_file_to_files_column(item_id: int, column_id: str, filename: str, con
 
     operations = {
         "query": """
-          mutation ($file: File!, $item: Int!, $column: String!) {
+          mutation ($file: File!, $item: ID!, $column: String!) {
             add_file_to_column(file: $file, item_id: $item, column_id: $column) { id }
           }
         """,
-        "variables": {"file": None, "item": item_id, "column": column_id},
+        "variables": {"file": None, "item": str(item_id), "column": column_id},
     }
     files = {
         "operations": (None, json.dumps(operations), "application/json"),
         "map": (None, json.dumps({"0": ["variables.file"]}), "application/json"),
         "0": (filename, content, mtype),
     }
-    # ⚠️ L'upload doit cibler /v2/file sinon 400
-    url = f"{settings.MONDAY_API_URL}/file"
+    url = f"{settings.MONDAY_API_URL}/file"  # ✔️ endpoint correct
     r = requests.post(url, headers={"Authorization": settings.MONDAY_API_KEY}, files=files, timeout=90)
     if r.status_code >= 400:
-        # remonter le détail d'erreur pour debug
         try:
             detail = r.json()
         except Exception:
