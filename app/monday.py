@@ -8,11 +8,17 @@ import requests
 
 from .config import settings
 
+# ---- Auth header Monday ----
 MONDAY_HEADERS = {"Authorization": settings.MONDAY_API_KEY}
 
+
+# ---- Low-level GraphQL call ----
 def _gql(query: str, variables: dict | None = None) -> dict:
+    """
+    Envoie une requête GraphQL vers Monday. Lève RuntimeError si Monday renvoie "errors".
+    """
     r = requests.post(
-        settings.MONDAY_API_URL,
+        settings.MONDAY_API_URL,  # ex: https://api.monday.com/v2
         headers={**MONDAY_HEADERS, "Content-Type": "application/json"},
         json={"query": query, "variables": variables or {}},
         timeout=30,
@@ -23,54 +29,87 @@ def _gql(query: str, variables: dict | None = None) -> dict:
         raise RuntimeError(f"Monday GraphQL error: {data['errors']}")
     return data["data"]
 
+
+# ---- Lecture d'un item + toutes ses column_values ----
 def get_item_columns(item_id: int) -> Dict[str, Any]:
-    # ✔️ 1) type ID au lieu de Int
-    # ✔️ 2) ne plus demander additional_info
+    """
+    Retourne: {
+      'item_id': int,
+      'name': str,
+      'columns': { '<col_id>': {id, text, value, type}, ... }
+    }
+    """
     q = """
-    query($item_id: ID!) {
-      items(ids: [$item_id]) {
+    query ($item_id: [ID!]) {
+      items(ids: $item_id) {
         id
         name
-        column_values {
-          id
-          text
-          value
-          type
-        }
+        column_values { id text value type }
       }
     }
     """
-    data = _gql(q, {"item_id": str(item_id)})  # on passe l'ID en string pour être 100% compliant
+    # ids: [ID!] attend une liste de strings
+    data = _gql(q, {"item_id": [str(item_id)]})
     items = data.get("items") or []
     if not items:
         raise RuntimeError(f"Item {item_id} introuvable.")
     item = items[0]
-    colmap = {cv["id"]: cv for cv in item["column_values"]}
-    return {"item_id": int(item["id"]), "name": item["name"], "columns": colmap}
+    colmap = {cv["id"]: cv for cv in (item.get("column_values") or [])}
+    return {"item_id": int(item["id"]), "name": item.get("name", ""), "columns": colmap}
 
+
+# ---- Lecture "formula" tolérante: d'abord text, sinon value (JSON) ----
 def get_formula_display_value(columns: Dict[str, Any], formula_col_id: str) -> Optional[str]:
+    """
+    Monday renvoie parfois text="" pour les colonnes formula, mais la vraie
+    valeur est dans "value" (souvent une chaîne JSON).
+    On tente d'abord `text`, puis on parse `value`.
+    """
     cv = columns.get(formula_col_id)
     if not cv:
         return None
-    return cv.get("text")
 
+    # 1) préférer .text quand il est fourni
+    txt = cv.get("text")
+    if txt:
+        return txt
+
+    # 2) fallback: parser .value
+    raw = cv.get("value")
+    if not raw:
+        return None
+
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+        return parsed if isinstance(parsed, str) else str(parsed)
+    except Exception:
+        # En dernier recours, renvoyer la chaîne brute sans guillemets entourant
+        return str(raw).strip('"').strip()
+
+
+# ---- Ecrire un status simple ----
 def set_status(item_id: int, status_column_id: str, label: str) -> None:
     q = """
-    mutation($item_id: ID!, $column_id: String!, $label: String!) {
+    mutation($item_id: Int!, $column_id: String!, $label: String!) {
       change_simple_column_value(item_id: $item_id, column_id: $column_id, value: $label) { id }
     }
     """
-    _gql(q, {"item_id": str(item_id), "column_id": status_column_id, "label": label})
+    _gql(q, {"item_id": int(item_id), "column_id": status_column_id, "label": label})
 
+
+# ---- Ecrire un lien (colonne Link) ----
 def set_link_in_column(item_id: int, column_id: str, url: str, text: str = "Ouvrir") -> None:
+    # Pour Monday, `value` doit être un JSON sérialisé en string côté mutation
     value = json.dumps({"url": url, "text": text})
     q = """
-    mutation($item_id: ID!, $column_id: String!, $value: JSON!) {
-      change_column_value(item_id: $item_id, column_id: $column_id, value: $value) { id }
+    mutation($item_id:Int!, $column_id:String!, $value: JSON!) {
+      change_column_value(item_id:$item_id, column_id:$column_id, value:$value) { id }
     }
     """
-    _gql(q, {"item_id": str(item_id), "column_id": column_id, "value": value})
+    _gql(q, {"item_id": int(item_id), "column_id": column_id, "value": value})
 
+
+# ---- Extraction adresse, CP, ville (avec auto-parsing si manquants) ----
 def extract_address_fields(columns: Dict[str, Any]) -> dict:
     def _cv_text(col_id: str) -> str:
         cv = columns.get(col_id)
@@ -80,6 +119,7 @@ def extract_address_fields(columns: Dict[str, Any]) -> dict:
     postcode = _cv_text(settings.POSTCODE_COLUMN_ID) if settings.POSTCODE_COLUMN_ID else ""
     city = _cv_text(settings.CITY_COLUMN_ID) if settings.CITY_COLUMN_ID else ""
 
+    # Auto-extraction ".... 75001 PARIS"
     if (not postcode or not city) and addr_txt:
         m = re.search(r"\b(\d{5})\s+([A-Za-zÀ-ÿ\-\s']+)$", addr_txt.strip())
         if m:
@@ -88,29 +128,41 @@ def extract_address_fields(columns: Dict[str, Any]) -> dict:
 
     return {"address": addr_txt.strip(), "postcode": postcode.strip(), "city": city.strip()}
 
+
+# ---- Upload d'un fichier PDF dans une colonne Files ----
 def upload_file_to_files_column(item_id: int, column_id: str, filename: str, content: bytes) -> None:
-    """Upload via GraphQL multipart → /v2/file (obligatoire)."""
+    """
+    Upload GraphQL multipart OBLIGATOIRE sur /v2/file.
+    Erreurs 400 fréquentes si:
+      - mauvais endpoint (il faut .../v2/file)
+      - column_id n'est pas une colonne Files
+      - token invalide
+    """
     if not column_id:
-        raise RuntimeError("Aucune colonne Files (column_id) fournie.")
+        raise RuntimeError("Aucune colonne Files (column_id) fournie pour l'upload.")
+
     mtype, _ = mimetypes.guess_type(filename)
     if not mtype:
         mtype = "application/pdf"
 
     operations = {
         "query": """
-          mutation ($file: File!, $item: ID!, $column: String!) {
+          mutation ($file: File!, $item: Int!, $column: String!) {
             add_file_to_column(file: $file, item_id: $item, column_id: $column) { id }
           }
         """,
-        "variables": {"file": None, "item": str(item_id), "column": column_id},
+        "variables": {"file": None, "item": int(item_id), "column": column_id},
     }
     files = {
         "operations": (None, json.dumps(operations), "application/json"),
         "map": (None, json.dumps({"0": ["variables.file"]}), "application/json"),
         "0": (filename, content, mtype),
     }
-    url = f"{settings.MONDAY_API_URL}/file"  # ✔️ endpoint correct
-    r = requests.post(url, headers={"Authorization": settings.MONDAY_API_KEY}, files=files, timeout=90)
+
+    # IMPORTANT: endpoint /v2/file (pas /v2)
+    url = f"{settings.MONDAY_API_URL}/file"
+    r = requests.post(url, headers=MONDAY_HEADERS, files=files, timeout=90)
+
     if r.status_code >= 400:
         try:
             detail = r.json()
