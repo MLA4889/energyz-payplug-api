@@ -7,7 +7,7 @@ import re
 from .config import settings
 from .monday import (
     get_item_columns,
-    get_formula_display_value,
+    get_formula_display_value,  # <- on s'en sert pour la formule
     set_link_in_column,
     set_status,
 )
@@ -82,6 +82,28 @@ def _guess_postcode_city(address_text: str) -> tuple[str, str]:
         if m:
             return m.group(1), m.group(2).strip()
     return "00000", "N/A"
+
+def _read_text_or_formula(item_id: int, column_id: Optional[str]) -> str:
+    """
+    TENTE d'abord la lecture 'text' (colonnes normales),
+    puis la display_value (si c'est une colonne FORMULA).
+    """
+    if not column_id:
+        return ""
+    # 1) lecture standard
+    try:
+        cols = get_item_columns(item_id, [column_id])
+        txt = (cols.get(column_id, {}) or {}).get("text") or ""
+        if txt:
+            return txt.strip()
+    except Exception:
+        pass
+    # 2) display_value pour formule
+    try:
+        disp = get_formula_display_value(item_id, column_id) or ""
+        return disp.strip()
+    except Exception:
+        return ""
 
 # -----------------------
 # Health & debug Evoliz
@@ -232,17 +254,14 @@ def debug_quote_preview(item_id: int):
 
         cols = get_item_columns(item_id, col_ids) if col_ids else {}
 
-        def col_text(cid: Optional[str]) -> str:
-            if not cid:
-                return ""
-            return (cols.get(cid, {}) or {}).get("text") or ""
+        client_type_raw = (cols.get(settings.CLIENT_TYPE_COLUMN_ID, {}) or {}).get("text") or ""
+        vat_number = (cols.get(settings.VAT_NUMBER_COLUMN_ID, {}) or {}).get("text") or None
+        address = (cols.get(settings.ADDRESS_COLUMN_ID, {}) or {}).get("text") or ""
+        postcode = (cols.get(settings.POSTCODE_COLUMN_ID, {}) or {}).get("text") or ""
+        city = (cols.get(settings.CITY_COLUMN_ID, {}) or {}).get("text") or ""
 
-        client_type_raw = col_text(settings.CLIENT_TYPE_COLUMN_ID)
-        vat_number = col_text(settings.VAT_NUMBER_COLUMN_ID) or None
-        address = col_text(settings.ADDRESS_COLUMN_ID)
-        postcode = col_text(settings.POSTCODE_COLUMN_ID)
-        city = col_text(settings.CITY_COLUMN_ID)
-        description = col_text(settings.DESCRIPTION_COLUMN_ID) or f"Devis item {item_id}"
+        # *** description: texte ou formule ***
+        description = _read_text_or_formula(item_id, settings.DESCRIPTION_COLUMN_ID) or f"Devis item {item_id}"
 
         amount_ht_str, amount_ht = _read_amount_ht(item_id, amount_column_id)
         vat_rate = _read_vat_rate(item_id)
@@ -250,11 +269,8 @@ def debug_quote_preview(item_id: int):
         t = (client_type_raw or "").strip().lower()
         client_type = "Professionnel" if t in ["professionnel", "pro", "b2b", "entreprise"] else "Particulier"
 
-        ok = True
-        reasons = []
-        if amount_ht <= 0:
-            ok = False
-            reasons.append(f"Montant HT lu '{amount_ht_str}' → doit être > 0 (QUOTE_AMOUNT_FORMULA_ID).")
+        ok = amount_ht > 0
+        reasons = [] if ok else [f"Montant HT lu '{amount_ht_str}' → doit être > 0 (QUOTE_AMOUNT_FORMULA_ID)."]
 
         return {
             "status": "ok" if ok else "error",
@@ -277,7 +293,7 @@ def debug_quote_preview(item_id: int):
         raise HTTPException(500, f"Preview error: {e}")
 
 # -----------------------
-# Devis via Swagger (manuel)
+# Swagger (manuel)
 # -----------------------
 from pydantic import BaseModel, field_validator
 
@@ -393,15 +409,16 @@ async def quote_from_monday(request: Request):
         if not cid: return ""
         return (cols.get(cid, {}) or {}).get("text") or ""
 
-    client_type = col_text(settings.CLIENT_TYPE_COLUMN_ID) or "Particulier"
+    client_type_raw = col_text(settings.CLIENT_TYPE_COLUMN_ID)
+    client_type = "Professionnel" if (client_type_raw or "").strip().lower() in ["professionnel","pro","b2b","entreprise"] else "Particulier"
     vat_number = col_text(settings.VAT_NUMBER_COLUMN_ID) or None
     address = col_text(settings.ADDRESS_COLUMN_ID)
     postcode = col_text(settings.POSTCODE_COLUMN_ID)
     city = col_text(settings.CITY_COLUMN_ID)
 
-    # 🔥 NOUVEAU: description = colonne "Description presta" sinon nom de l'item, sinon fallback
-    description_from_col = col_text(settings.DESCRIPTION_COLUMN_ID)
-    item_name = evt.get("pulseName") or ""   # nom de l’item Monday
+    # *** description depuis colonne formule/texte ***
+    description_from_col = _read_text_or_formula(item_id, settings.DESCRIPTION_COLUMN_ID)
+    item_name = evt.get("pulseName") or ""
     description = (description_from_col or item_name or f"Devis item {item_id}").strip()
 
     if not postcode or not city:
@@ -412,9 +429,6 @@ async def quote_from_monday(request: Request):
     amount_ht_str, amount_ht = _read_amount_ht(item_id, settings.QUOTE_AMOUNT_FORMULA_ID)
     if amount_ht <= 0:
         raise HTTPException(400, f"Montant HT invalide (QUOTE_AMOUNT_FORMULA_ID): '{amount_ht_str}'")
-
-    t = client_type.strip().lower()
-    client_type = "Professionnel" if t in ["professionnel", "pro", "b2b", "entreprise"] else "Particulier"
 
     vat_rate = _read_vat_rate(item_id)
 
