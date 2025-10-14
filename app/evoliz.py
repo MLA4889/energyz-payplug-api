@@ -1,48 +1,27 @@
-import requests
-from .config import settings
-
-def _base(url: str) -> str:
-    # Évite les // et assure le bon host
-    base = settings.EVOLIZ_BASE_URL.rstrip("/")
-    return f"{base}{url}"
-
-def _raise_for_evoliz(r: requests.Response):
-    try:
-        data = r.json()
-    except Exception:
-        data = {"raw": r.text}
-    if r.status_code >= 400:
-        # Messages plus explicites en log
-        msg = data.get("message") or data.get("error") or data
-        raise RuntimeError(f"[Evoliz {r.status_code}] {msg}")
-
-def get_access_token() -> str:
-    payload = {
-        "public_key": settings.EVOLIZ_PUBLIC_KEY,
-        "secret_key": settings.EVOLIZ_SECRET_KEY,
-    }
-    r = requests.post(_base("/api/login"), json=payload, timeout=getattr(settings, "EVOLIZ_TIMEOUT", 20))
-    _raise_for_evoliz(r)
-    token = r.json().get("access_token")
-    if not token:
-        raise RuntimeError("Login Evoliz sans access_token (vérifie clés et droits API).")
-    return token
-
 def create_client_if_needed(token: str, client_data: dict) -> int:
     headers = {"Authorization": f"Bearer {token}"}
-    params = {"search": client_data["name"]}
+    # 1) Recherche
     r = requests.get(
         _base(f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/clients"),
-        headers=headers, params=params, timeout=getattr(settings, "EVOLIZ_TIMEOUT", 20)
+        headers=headers,
+        params={"search": client_data["name"]},
+        timeout=getattr(settings, "EVOLIZ_TIMEOUT", 20)
     )
     _raise_for_evoliz(r)
     existing = r.json().get("data", [])
     if existing:
         return existing[0]["clientid"]
 
+    client_type = client_data.get("client_type") or "Particulier"
+    vat_number = client_data.get("vat_number")
+
+    # Garde-fou côté serveur avant d'appeler Evoliz
+    if client_type == "Professionnel" and not vat_number:
+        raise RuntimeError("Client de type Professionnel : 'vat_number' requis.")
+
     payload = {
         "name": client_data["name"],
-        "type": "Professionnel",
+        "type": client_type,  # "Particulier" ou "Professionnel"
         "address": {
             "addr": client_data.get("address", "") or "",
             "postcode": client_data.get("postcode", "") or "",
@@ -50,6 +29,9 @@ def create_client_if_needed(token: str, client_data: dict) -> int:
             "iso2": "FR"
         }
     }
+    if vat_number:
+        payload["vat_number"] = vat_number
+
     r = requests.post(
         _base(f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/clients"),
         headers=headers, json=payload, timeout=getattr(settings, "EVOLIZ_TIMEOUT", 20)
@@ -62,13 +44,17 @@ def create_client_if_needed(token: str, client_data: dict) -> int:
 
 def create_quote(token: str, client_id: int, quote_data: dict) -> dict:
     headers = {"Authorization": f"Bearer {token}"}
+    # Par défaut, Evoliz calcule la TVA selon la config du compte.
+    # Si tu veux FORCER 20% sur la ligne : ajoute "vat": 20.0 dans la ligne.
     payload = {
         "clientid": client_id,
         "lines": [
             {
                 "designation": quote_data["description"],
                 "unit_price": quote_data["amount_ht"],
-                "quantity": 1
+                "quantity": 1,
+                # décommente si tu veux forcer 20% :
+                # "vat": 20.0
             }
         ],
         "currency": "EUR"
