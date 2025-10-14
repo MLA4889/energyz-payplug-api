@@ -1,118 +1,84 @@
 import requests
-from datetime import date
 from .config import settings
 
-__all__ = ["get_access_token", "create_client_if_needed", "create_quote"]
-
-def _base(url: str) -> str:
-    base = (settings.EVOLIZ_BASE_URL or "").rstrip("/")
-    return f"{base}{url}"
-
-def _timeout() -> int:
-    return int(getattr(settings, "EVOLIZ_TIMEOUT", 20))
-
-def _raise_for_evoliz(r: requests.Response):
-    try:
-        data = r.json()
-    except Exception:
-        data = {"raw": r.text}
-    if r.status_code >= 400:
-        msg = data.get("message") or data.get("error") or data
-        raise RuntimeError(f"[Evoliz {r.status_code}] {msg}")
-
-def get_access_token() -> str:
+def get_access_token():
     payload = {
         "public_key": settings.EVOLIZ_PUBLIC_KEY,
-        "secret_key": settings.EVOLIZ_SECRET_KEY,
+        "secret_key": settings.EVOLIZ_SECRET_KEY
     }
-    r = requests.post(_base("/api/login"), json=payload, timeout=_timeout())
-    _raise_for_evoliz(r)
-    token = (r.json() or {}).get("access_token")
+    r = requests.post(f"{settings.EVOLIZ_BASE_URL}/api/login", json=payload, timeout=30)
+    r.raise_for_status()
+    token = r.json().get("access_token")
     if not token:
-        raise RuntimeError("Login Evoliz OK mais 'access_token' absent. Vérifie clés & droits API.")
+        raise RuntimeError("Evoliz: pas de access_token reçu.")
     return token
 
-def create_client_if_needed(token: str, client_data: dict) -> int:
-    headers = {"Authorization": f"Bearer {token}"}
+def _auth_headers(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
 
-    # 1) Recherche d'un client existant
+def create_client_if_needed(token, client_data: dict):
+    # cherche par nom
     r = requests.get(
-        _base(f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/clients"),
-        headers=headers,
+        f"{settings.EVOLIZ_BASE_URL}/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/clients",
+        headers=_auth_headers(token),
         params={"search": client_data["name"]},
-        timeout=_timeout(),
+        timeout=30,
     )
-    _raise_for_evoliz(r)
-    existing = (r.json() or {}).get("data", [])
+    r.raise_for_status()
+    existing = r.json().get("data", [])
     if existing:
         return existing[0]["clientid"]
 
-    # 2) Création
-    client_type = client_data.get("client_type") or "Particulier"
-    vat_number = client_data.get("vat_number")
-
-    if client_type == "Professionnel" and not vat_number:
-        raise RuntimeError("Client de type Professionnel : 'vat_number' (TVA intracom) est obligatoire.")
-
     payload = {
         "name": client_data["name"],
-        "type": client_type,  # "Particulier" ou "Professionnel"
+        "type": "Professionnel" if client_data.get("client_type") == "Professionnel" else "Particulier",
         "address": {
-            "addr": client_data.get("address", "") or "",
-            "postcode": client_data.get("postcode", "") or "",
-            "town": client_data.get("city", "") or "",
+            "addr": client_data.get("address", ""),
+            "postcode": client_data.get("postcode", ""),
+            "town": client_data.get("city", ""),
             "iso2": "FR",
-        },
+        }
     }
-    if vat_number:
-        payload["vat_number"] = vat_number
+    # pro intracom ?
+    if client_data.get("client_type") == "Professionnel" and client_data.get("vat_number"):
+        payload["vat_number"] = client_data["vat_number"]
 
     r = requests.post(
-        _base(f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/clients"),
-        headers=headers,
+        f"{settings.EVOLIZ_BASE_URL}/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/clients",
+        headers=_auth_headers(token),
         json=payload,
-        timeout=_timeout(),
+        timeout=30,
     )
-    _raise_for_evoliz(r)
-    client_id = (r.json() or {}).get("clientid")
-    if not client_id:
-        raise RuntimeError("Création client Evoliz : 'clientid' manquant dans la réponse.")
-    return client_id
+    r.raise_for_status()
+    return r.json()["clientid"]
 
-def create_quote(token: str, client_id: int, quote_data: dict) -> dict:
+def create_quote(token, client_id, quote_data: dict):
     """
-    Crée un devis Evoliz.
-    Evoliz attend :
-      - documentdate (YYYY-MM-DD)
-      - term.paytermid (identifiant de la condition de paiement)
-      - items (lignes de devis)
-    On force TVA 20% sur la ligne comme demandé.
+    quote_data attend:
+      - description (str)
+      - amount_ht (float)
+      - vat_rate (float)  # ex: 20.0 ou 5.5
     """
-    headers = {"Authorization": f"Bearer {token}"}
-
-    # Par défaut : "comptant"/"à réception".
-    payterm_id = int(getattr(settings, "EVOLIZ_PAYTERM_ID", 1))
+    vat_rate = float(quote_data.get("vat_rate", settings.DEFAULT_VAT_RATE))
 
     payload = {
         "clientid": client_id,
-        "documentdate": date.today().isoformat(),      # ex. "2025-10-14"
-        "term": {"paytermid": payterm_id},             # ex. 1
-        "items": [
+        "lines": [
             {
                 "designation": quote_data["description"],
                 "unit_price": quote_data["amount_ht"],
                 "quantity": 1,
-                "vat": 20.0,                           # force 20%
+                "vat": vat_rate,              # <--- TAUX DE TVA
             }
         ],
         "currency": "EUR",
+        "prices_include_vat": False        # HT -> TVA ajoutée
     }
-
     r = requests.post(
-        _base(f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes"),
-        headers=headers,
+        f"{settings.EVOLIZ_BASE_URL}/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes",
+        headers=_auth_headers(token),
         json=payload,
-        timeout=_timeout(),
+        timeout=30,
     )
-    _raise_for_evoliz(r)
+    r.raise_for_status()
     return r.json()
