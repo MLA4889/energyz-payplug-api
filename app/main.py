@@ -23,12 +23,10 @@ def _monday_headers():
     return {"Authorization": settings.MONDAY_API_KEY}
 
 def upload_pdf_to_files_column(item_id: int, files_column_id: str, pdf_api_url: str, filename: str, token: str):
-    # Télécharge le PDF Evoliz avec le Bearer token
     r = requests.get(pdf_api_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
     r.raise_for_status()
     pdf_bytes = r.content
 
-    # Upload GraphQL multipart sur Monday
     api_url = settings.MONDAY_API_URL
     query = """
       mutation ($file: File!, $itemId: ID!, $columnId: String!) {
@@ -56,7 +54,7 @@ def _read_amount_ht(item_id: int, amount_column_id: Optional[str]) -> tuple[str,
             raw = get_formula_display_value(item_id, amount_column_id) or ""
         except Exception:
             raw = ""
-        if not raw:  # fallback
+        if not raw:
             cols = get_item_columns(item_id, [amount_column_id])
             raw = (cols.get(amount_column_id, {}) or {}).get("text") or ""
 
@@ -67,21 +65,18 @@ def _read_amount_ht(item_id: int, amount_column_id: Optional[str]) -> tuple[str,
     return raw, val
 
 def _read_vat_rate(item_id: int) -> float:
-    """Lit la TVA depuis la colonne Numbers si configurée, sinon DEFAULT_VAT_RATE."""
     col_id = settings.VAT_RATE_COLUMN_ID
     if not col_id:
         return settings.DEFAULT_VAT_RATE
     cols = get_item_columns(item_id, [col_id])
     raw = (cols.get(col_id, {}) or {}).get("text") or ""
     try:
-        # accepte "20", "20%", "5,5", "5.5"
         raw_clean = str(raw).replace("%", "").replace(",", ".").strip()
         return float(raw_clean) if raw_clean else settings.DEFAULT_VAT_RATE
     except Exception:
         return settings.DEFAULT_VAT_RATE
 
 def _guess_postcode_city(address_text: str) -> tuple[str, str]:
-    """Si CP/ville ne sont pas fournis, essaie de les déduire de l'adresse complète."""
     if address_text:
         m = re.search(r"(\b\d{5}\b)\s+([A-Za-zÀ-ÿ'’\-\s]+)$", address_text.strip())
         if m:
@@ -101,7 +96,6 @@ def health():
 
 @app.get("/debug/evoliz/login")
 def debug_evoliz_login():
-    """Ping Evoliz: renvoie un token si les clés + EVOLIZ_BASE_URL sont correctes."""
     try:
         token = evoliz.get_access_token()
         return {"status": "ok", "token_preview": token[:10] + "..."}
@@ -109,7 +103,7 @@ def debug_evoliz_login():
         return {"status": "error", "detail": str(e)}
 
 # -----------------------
-# Debug Monday: lecture rapide
+# Debug Monday
 # -----------------------
 @app.get("/debug/check/{item_id}/{n}")
 def debug_check(item_id: int, n: int):
@@ -138,7 +132,7 @@ def debug_check(item_id: int, n: int):
     }
 
 # -----------------------
-# Génération lien PayPlug
+# PayPlug
 # -----------------------
 @app.api_route("/pay/acompte/{n}", methods=["POST", "GET"])
 async def create_acompte_link(n: int, request: Request):
@@ -149,13 +143,11 @@ async def create_acompte_link(n: int, request: Request):
     except Exception:
         body = {}
 
-    # Challenge webhook
     if "challenge" in body:
         return {"challenge": body["challenge"]}
     if not body:
         return {"status": "ok", "message": "Webhook test accepté"}
 
-    # Lecture événement
     evt = body.get("event") or body.get("payload") or {}
     label = None
     try:
@@ -174,20 +166,17 @@ async def create_acompte_link(n: int, request: Request):
     if label and label != expected_label:
         return {"status": "ignored", "reason": f"label={label} != {expected_label}"}
 
-    # Item
     item_id = evt.get("itemId") or evt.get("pulseId")
     if not item_id:
         raise HTTPException(400, "itemId/pulseId manquant")
     item_id = int(item_id)
     item_name = evt.get("pulseName") or "Client"
 
-    # Infos client
     column_ids = [cid for cid in [settings.EMAIL_COLUMN_ID, settings.ADDRESS_COLUMN_ID] if cid]
     cols = get_item_columns(item_id, column_ids) if column_ids else {}
     email = (cols.get(settings.EMAIL_COLUMN_ID, {}) or {}).get("text") or ""
     address = (cols.get(settings.ADDRESS_COLUMN_ID, {}) or {}).get("text") or ""
 
-    # Montant
     formula_id = settings.FORMULA_COLUMN_IDS.get(str(n))
     if not formula_id:
         raise HTTPException(400, f"Aucune colonne formule configurée pour acompte {n}")
@@ -196,13 +185,11 @@ async def create_acompte_link(n: int, request: Request):
     if amount_cents <= 0:
         raise HTTPException(400, f"Montant invalide pour acompte {n}: '{amount_euros}'")
 
-    # Choix clé PayPlug selon IBAN
     iban_display_value = get_formula_display_value(item_id, settings.IBAN_FORMULA_COLUMN_ID)
     api_key = _choose_api_key(iban_display_value)
     if not api_key:
         raise HTTPException(400, f"IBAN non reconnu : '{iban_display_value}'")
 
-    # Création paiement
     url = create_payment(
         api_key=api_key,
         amount_cents=amount_cents,
@@ -212,7 +199,6 @@ async def create_acompte_link(n: int, request: Request):
         metadata={"customer_id": item_id, "acompte": str(n)},
     )
 
-    # Écriture lien Monday
     link_col = settings.LINK_COLUMN_IDS.get(str(n))
     if not link_col:
         raise HTTPException(400, f"Aucune colonne lien configurée pour acompte {n}")
@@ -220,7 +206,7 @@ async def create_acompte_link(n: int, request: Request):
     return {"status": "ok", "acompte": n, "payment_url": url}
 
 # -----------------------
-# Debug – Preview des valeurs pour devis
+# Debug – Preview devis
 # -----------------------
 @app.get("/debug/quote/preview/{item_id}")
 def debug_quote_preview(item_id: int):
@@ -256,7 +242,7 @@ def debug_quote_preview(item_id: int):
         address = col_text(settings.ADDRESS_COLUMN_ID)
         postcode = col_text(settings.POSTCODE_COLUMN_ID)
         city = col_text(settings.CITY_COLUMN_ID)
-        description = col_text(settings.DESCRIPTION_COLUMN_ID)
+        description = col_text(settings.DESCRIPTION_COLUMN_ID) or f"Devis item {item_id}"
 
         amount_ht_str, amount_ht = _read_amount_ht(item_id, amount_column_id)
         vat_rate = _read_vat_rate(item_id)
@@ -304,7 +290,7 @@ class QuoteRequest(BaseModel):
     amount_ht: float
     client_type: str = "Particulier"
     vat_number: Optional[str] = None
-    vat_rate: Optional[float] = None  # permet d'imposer 5.5 % etc.
+    vat_rate: Optional[float] = None
 
     @field_validator("client_type")
     @classmethod
@@ -377,7 +363,6 @@ async def quote_from_monday(request: Request):
         raise HTTPException(400, "itemId/pulseId manquant")
     item_id = int(item_id)
 
-    # Filtre label déclencheur
     trigger_label = settings.QUOTE_TRIGGER_LABEL
     label = None
     try:
@@ -394,22 +379,18 @@ async def quote_from_monday(request: Request):
     if label and label != trigger_label:
         return {"status": "ignored", "reason": f"label={label} != {trigger_label}"}
 
-    # Colonnes à lire
     col_ids = []
     for name in ["CLIENT_TYPE_COLUMN_ID","VAT_NUMBER_COLUMN_ID","ADDRESS_COLUMN_ID","POSTCODE_COLUMN_ID","CITY_COLUMN_ID","DESCRIPTION_COLUMN_ID"]:
         cid = getattr(settings, name, "")
-        if cid:
-            col_ids.append(cid)
+        if cid: col_ids.append(cid)
     if settings.QUOTE_AMOUNT_FORMULA_ID:
         col_ids.append(settings.QUOTE_AMOUNT_FORMULA_ID)
     if settings.VAT_RATE_COLUMN_ID:
         col_ids.append(settings.VAT_RATE_COLUMN_ID)
 
     cols = get_item_columns(item_id, col_ids) if col_ids else {}
-
     def col_text(cid: Optional[str]) -> str:
-        if not cid:
-            return ""
+        if not cid: return ""
         return (cols.get(cid, {}) or {}).get("text") or ""
 
     client_type = col_text(settings.CLIENT_TYPE_COLUMN_ID) or "Particulier"
@@ -417,8 +398,11 @@ async def quote_from_monday(request: Request):
     address = col_text(settings.ADDRESS_COLUMN_ID)
     postcode = col_text(settings.POSTCODE_COLUMN_ID)
     city = col_text(settings.CITY_COLUMN_ID)
-    description = col_text(settings.DESCRIPTION_COLUMN_ID)
-    client_name = evt.get("pulseName") or "Client"
+
+    # 🔥 NOUVEAU: description = colonne "Description presta" sinon nom de l'item, sinon fallback
+    description_from_col = col_text(settings.DESCRIPTION_COLUMN_ID)
+    item_name = evt.get("pulseName") or ""   # nom de l’item Monday
+    description = (description_from_col or item_name or f"Devis item {item_id}").strip()
 
     if not postcode or not city:
         auto_pc, auto_city = _guess_postcode_city(address)
@@ -432,30 +416,29 @@ async def quote_from_monday(request: Request):
     t = client_type.strip().lower()
     client_type = "Professionnel" if t in ["professionnel", "pro", "b2b", "entreprise"] else "Particulier"
 
-    vat_rate = _read_vat_rate(item_id)  # TVA depuis Monday (ou défaut)
+    vat_rate = _read_vat_rate(item_id)
 
     token = evoliz.get_access_token()
     client_info = {
-        "name": client_name,
+        "name": item_name or "Client",
         "address": address,
         "postcode": postcode,
         "city": city,
         "client_type": client_type,
         "vat_number": vat_number,
     }
-    quote_info = {"description": description or f"Devis item {item_id}", "amount_ht": amount_ht, "vat_rate": vat_rate}
+    quote_info = {"description": description, "amount_ht": amount_ht, "vat_rate": vat_rate}
     quote = evoliz.create_quote(token, evoliz.create_client_if_needed(token, client_info), quote_info)
 
-    pdf_api_url = quote.get("file")          # nécessite Bearer token pour le téléchargement
-    webdoc_url = quote.get("webdoc")         # lien public consultable
+    pdf_api_url = quote.get("file")
+    webdoc_url = quote.get("webdoc")
     doc_number = quote.get("document_number") or quote.get("quotenumber") or "Devis"
 
-    # Lien (webdoc prioritaire) dans la colonne Lien
+    link_text = (description[:60] + "…") if len(description) > 60 else description
     link_col = settings.QUOTE_LINK_COLUMN_ID
     if link_col and (webdoc_url or pdf_api_url):
-        set_link_in_column(item_id, settings.MONDAY_BOARD_ID, link_col, webdoc_url or pdf_api_url, text=f"Devis {doc_number}")
+        set_link_in_column(item_id, settings.MONDAY_BOARD_ID, link_col, webdoc_url or pdf_api_url, text=link_text)
 
-    # Upload du PDF dans la colonne Fichiers
     files_col = settings.QUOTE_FILES_COLUMN_ID
     if files_col and pdf_api_url:
         try:
@@ -463,7 +446,6 @@ async def quote_from_monday(request: Request):
         except Exception as e:
             print(f"⚠️ Upload fichier Monday échoué: {e}")
 
-    # Mise à jour du statut (optionnel)
     if settings.QUOTE_STATUS_COLUMN_ID and settings.QUOTE_STATUS_AFTER_CREATE:
         set_status(item_id, settings.MONDAY_BOARD_ID, settings.QUOTE_STATUS_COLUMN_ID, settings.QUOTE_STATUS_AFTER_CREATE)
 
@@ -476,4 +458,5 @@ async def quote_from_monday(request: Request):
         "webdoc_url": webdoc_url,
         "links_url": quote.get("links"),
         "vat_rate_used": vat_rate,
+        "description_used": description,
     }
