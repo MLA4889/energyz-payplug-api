@@ -240,3 +240,19 @@ async def invoice_from_monday(payload: dict = Body(...)):
         upload_file_to_files_column(item_id, files_col, f"Facture_{invoice_id}.pdf", pdf)
 
     return {"status": "ok", "invoice": {"id": invoice_id, "url": web_url, "kind": kind}}
+  
+# --- DEBUG PAYPLUG ---
+@app.get("/debug/payplug/{item_id}")
+def debug_payplug(item_id: int):
+    info = get_item_columns(item_id)
+    cols = info["columns"]
+    iban_txt = (settings.IBAN_FORMULA_COLUMN_ID and get_formula_display_value(cols, settings.IBAN_FORMULA_COLUMN_ID)) or ""
+    mode = settings.PAYPLUG_MODE
+    return {
+        "item_id": item_id,
+        "iban_raw": iban_txt,
+        "mode": mode,
+        "keys_available": list((settings.PAYPLUG_KEYS_LIVE if mode=="live" else settings.PAYPLUG_KEYS_TEST).keys()),
+        "hint": "Assure-toi qu'une des clés ci-dessus correspond à l'IBAN (variante sans espaces ou ajoute AUTRE_IBAN)."
+    }
+
