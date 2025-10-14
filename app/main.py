@@ -34,6 +34,8 @@ def upload_pdf_to_files_column(item_id: int, files_column_id: str, pdf_url: str,
         add_file_to_column (file: $file, item_id: $itemId, column_id: $columnId) { id }
       }
     """
+    variables = {"file": None, "itemId": item_id, "ColumnId": files_column_id}
+    # attention: l'API attend "column_id" (string) dans la variable, on garde la clé python "columnId"
     variables = {"file": None, "itemId": item_id, "columnId": files_column_id}
     files = {"0": (filename, pdf_bytes, "application/pdf")}
     data = {
@@ -269,6 +271,98 @@ class QuoteRequest(BaseModel):
             return "Professionnel"
         return "Particulier"
 
+# =======================
+# DEBUG: preview des données lues pour un devis
+# =======================
+@app.get("/debug/quote/preview/{item_id}")
+def debug_quote_preview(item_id: int):
+    try:
+        # Colonnes à lire
+        col_ids = []
+        for name in [
+            "CLIENT_TYPE_COLUMN_ID",
+            "VAT_NUMBER_COLUMN_ID",
+            "ADDRESS_COLUMN_ID",
+            "POSTCODE_COLUMN_ID",
+            "CITY_COLUMN_ID",
+            "DESCRIPTION_COLUMN_ID",
+        ]:
+            cid = getattr(settings, name, None)
+            if cid:
+                col_ids.append(cid)
+
+        amount_formula_id = getattr(settings, "QUOTE_AMOUNT_FORMULA_ID", None)
+        if amount_formula_id:
+            col_ids.append(amount_formula_id)
+
+        cols = get_item_columns(item_id, col_ids) if col_ids else {}
+
+        def col_text(cid: Optional[str]) -> str:
+            if not cid:
+                return ""
+            return (cols.get(cid, {}) or {}).get("text") or ""
+
+        client_type_raw = col_text(getattr(settings, "CLIENT_TYPE_COLUMN_ID", None))
+        vat_number = col_text(getattr(settings, "VAT_NUMBER_COLUMN_ID", None)) or None
+        address = col_text(getattr(settings, "ADDRESS_COLUMN_ID", None))
+        postcode = col_text(getattr(settings, "POSTCODE_COLUMN_ID", None))
+        city = col_text(getattr(settings, "CITY_COLUMN_ID", None))
+        description = col_text(getattr(settings, "DESCRIPTION_COLUMN_ID", None))
+
+        # Montant HT
+        amount_ht_str = get_formula_display_value(item_id, amount_formula_id) if amount_formula_id else ""
+        try:
+            amount_ht = float(str(amount_ht_str).replace("€", "").replace(",", ".").strip() or "0")
+        except Exception:
+            amount_ht = 0.0
+
+        # Normalisation type
+        t = (client_type_raw or "").strip().lower()
+        client_type = "Professionnel" if t in ["professionnel", "pro", "b2b", "entreprise"] else "Particulier"
+
+        ok = True
+        reasons = []
+        if amount_ht <= 0:
+            ok = False
+            reasons.append(f"Montant HT lu '{amount_ht_str}' → doit être > 0 (QUOTE_AMOUNT_FORMULA_ID).")
+        if client_type == "Professionnel" and not vat_number:
+            ok = False
+            reasons.append("TVA intracom vide alors que Type client = Professionnel (VAT_NUMBER_COLUMN_ID).")
+
+        return {
+            "status": "ok" if ok else "error",
+            "can_create_quote": ok,
+            "reasons": reasons,
+            "read_values": {
+                "client_type_raw": client_type_raw,
+                "client_type_normalized": client_type,
+                "vat_number": vat_number,
+                "address_text": address,
+                "postcode": postcode,
+                "city": city,
+                "description": description,
+                "amount_ht_str": amount_ht_str,
+                "amount_ht_parsed": amount_ht,
+                "amount_column_id": amount_formula_id,
+            },
+            "env_used": {
+                "CLIENT_TYPE_COLUMN_ID": getattr(settings, "CLIENT_TYPE_COLUMN_ID", ""),
+                "VAT_NUMBER_COLUMN_ID": getattr(settings, "VAT_NUMBER_COLUMN_ID", ""),
+                "ADDRESS_COLUMN_ID": getattr(settings, "ADDRESS_COLUMN_ID", ""),
+                "POSTCODE_COLUMN_ID": getattr(settings, "POSTCODE_COLUMN_ID", ""),
+                "CITY_COLUMN_ID": getattr(settings, "CITY_COLUMN_ID", ""),
+                "DESCRIPTION_COLUMN_ID": getattr(settings, "DESCRIPTION_COLUMN_ID", ""),
+                "QUOTE_AMOUNT_FORMULA_ID": getattr(settings, "QUOTE_AMOUNT_FORMULA_ID", ""),
+                "QUOTE_LINK_COLUMN_ID": getattr(settings, "QUOTE_LINK_COLUMN_ID", ""),
+                "QUOTE_FILES_COLUMN_ID": getattr(settings, "QUOTE_FILES_COLUMN_ID", ""),
+            }
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Preview error: {e}")
+
+# -----------------------
+# Création de devis via Swagger / API manuelle
+# -----------------------
 @app.post("/quote/create", summary="Create Quote From Monday")
 async def create_quote_from_monday(payload: QuoteRequest):
     """
