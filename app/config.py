@@ -15,6 +15,7 @@ class Settings(BaseModel):
     MONDAY_API_KEY: str = os.getenv("MONDAY_API_KEY", "")
     MONDAY_BOARD_ID: int = int(os.getenv("MONDAY_BOARD_ID", "0"))
     MONDAY_API_URL: str = os.getenv("MONDAY_API_URL", "https://api.monday.com/v2")
+    MONDAY_API_URL_FILE: str = os.getenv("MONDAY_API_URL_FILE", "https://api.monday.com/v2/file")  # <--- upload fichiers
 
     LINK_COLUMN_IDS: dict = _loads_env_json("LINK_COLUMN_IDS_JSON", {})
     FORMULA_COLUMN_IDS: dict = _loads_env_json("FORMULA_COLUMN_IDS_JSON", {})
@@ -34,14 +35,17 @@ class Settings(BaseModel):
     QUOTE_STATUS_COLUMN_ID: str = os.getenv("QUOTE_STATUS_COLUMN_ID", "")
     QUOTE_STATUS_AFTER_CREATE: str = os.getenv("QUOTE_STATUS_AFTER_CREATE", "")
 
-    # Colonnes optionnelles CP/Ville/Description
+    # Optionnel CP/Ville/Description
     POSTCODE_COLUMN_ID: str = os.getenv("POSTCODE_COLUMN_ID", "")
     CITY_COLUMN_ID: str = os.getenv("CITY_COLUMN_ID", "")
     DESCRIPTION_COLUMN_ID: str = os.getenv("DESCRIPTION_COLUMN_ID", "")
 
-    # --- Taux de TVA ---
+    # --- TVA ---
     VAT_RATE_COLUMN_ID: str = os.getenv("VAT_RATE_COLUMN_ID", "")
     DEFAULT_VAT_RATE: float = float(os.getenv("DEFAULT_VAT_RATE", "20.0"))
+
+    # --- Si tu veux écrire le TTC dans Monday (optionnel) ---
+    TOTAL_TTC_COLUMN_ID: str = os.getenv("TOTAL_TTC_COLUMN_ID", "")
 
     # ===== PayPlug =====
     PAYPLUG_MODE: str = os.getenv("PAYPLUG_MODE", "live")
