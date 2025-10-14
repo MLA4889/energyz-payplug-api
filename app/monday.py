@@ -48,7 +48,6 @@ def get_item_columns(item_id: int) -> Dict[str, Any]:
       }
     }
     """
-    # ids: [ID!] attend une liste de strings
     data = _gql(q, {"item_id": [str(item_id)]})
     items = data.get("items") or []
     if not items:
@@ -83,7 +82,6 @@ def get_formula_display_value(columns: Dict[str, Any], formula_col_id: str) -> O
         parsed = json.loads(raw) if isinstance(raw, str) else raw
         return parsed if isinstance(parsed, str) else str(parsed)
     except Exception:
-        # En dernier recours, renvoyer la chaîne brute sans guillemets entourant
         return str(raw).strip('"').strip()
 
 
@@ -99,7 +97,6 @@ def set_status(item_id: int, status_column_id: str, label: str) -> None:
 
 # ---- Ecrire un lien (colonne Link) ----
 def set_link_in_column(item_id: int, column_id: str, url: str, text: str = "Ouvrir") -> None:
-    # Pour Monday, `value` doit être un JSON sérialisé en string côté mutation
     value = json.dumps({"url": url, "text": text})
     q = """
     mutation($item_id:Int!, $column_id:String!, $value: JSON!) {
@@ -109,7 +106,7 @@ def set_link_in_column(item_id: int, column_id: str, url: str, text: str = "Ouvr
     _gql(q, {"item_id": int(item_id), "column_id": column_id, "value": value})
 
 
-# ---- Extraction adresse, CP, ville (avec auto-parsing si manquants) ----
+# ---- Extraction adresse, CP, ville ----
 def extract_address_fields(columns: Dict[str, Any]) -> dict:
     def _cv_text(col_id: str) -> str:
         cv = columns.get(col_id)
@@ -119,7 +116,6 @@ def extract_address_fields(columns: Dict[str, Any]) -> dict:
     postcode = _cv_text(settings.POSTCODE_COLUMN_ID) if settings.POSTCODE_COLUMN_ID else ""
     city = _cv_text(settings.CITY_COLUMN_ID) if settings.CITY_COLUMN_ID else ""
 
-    # Auto-extraction ".... 75001 PARIS"
     if (not postcode or not city) and addr_txt:
         m = re.search(r"\b(\d{5})\s+([A-Za-zÀ-ÿ\-\s']+)$", addr_txt.strip())
         if m:
@@ -129,14 +125,10 @@ def extract_address_fields(columns: Dict[str, Any]) -> dict:
     return {"address": addr_txt.strip(), "postcode": postcode.strip(), "city": city.strip()}
 
 
-# ---- Upload d'un fichier PDF dans une colonne Files ----
+# ---- Upload d'un fichier dans une colonne Files ----
 def upload_file_to_files_column(item_id: int, column_id: str, filename: str, content: bytes) -> None:
     """
     Upload GraphQL multipart OBLIGATOIRE sur /v2/file.
-    Erreurs 400 fréquentes si:
-      - mauvais endpoint (il faut .../v2/file)
-      - column_id n'est pas une colonne Files
-      - token invalide
     """
     if not column_id:
         raise RuntimeError("Aucune colonne Files (column_id) fournie pour l'upload.")
@@ -159,8 +151,7 @@ def upload_file_to_files_column(item_id: int, column_id: str, filename: str, con
         "0": (filename, content, mtype),
     }
 
-    # IMPORTANT: endpoint /v2/file (pas /v2)
-    url = f"{settings.MONDAY_API_URL}/file"
+    url = f"{settings.MONDAY_API_URL}/file"  # IMPORTANT
     r = requests.post(url, headers=MONDAY_HEADERS, files=files, timeout=90)
 
     if r.status_code >= 400:
