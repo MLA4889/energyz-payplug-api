@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Body, Request
 from typing import Any, Optional
 import json as _json
 import requests
+import re  # <-- pour extraire CP/ville
 
 from .config import settings
 from .monday import (
@@ -28,7 +29,7 @@ def upload_pdf_to_files_column(item_id: int, files_column_id: str, pdf_url: str,
     pdf_bytes = r.content
 
     # 2) Upload GraphQL multipart
-    api_url = settings.MONDAY_API_URL
+    api_url = settings.MONDAY_API_URL  # défini dans config.py (avec défaut)
     query = """
       mutation ($file: File!, $itemId: ID!, $columnId: String!) {
         add_file_to_column (file: $file, item_id: $itemId, column_id: $columnId) { id }
@@ -72,6 +73,20 @@ def _read_amount_ht(item_id: int, amount_column_id: Optional[str]) -> tuple[str,
     except Exception:
         val = 0.0
     return raw, val
+
+# -------- Deviner Code postal + Ville si absents --------
+def _guess_postcode_city(address_text: str) -> tuple[str, str]:
+    """
+    Essaie d'extraire '75008 Paris' etc depuis address_text.
+    Sinon, renvoie des valeurs par défaut compatibles Evoliz.
+    """
+    if address_text:
+        # ex: "12 rue de Paris 75008 Paris"
+        m = re.search(r"(\\b\\d{5}\\b)\\s+([A-Za-zÀ-ÿ'’\\-\\s]+)$", address_text.strip())
+        if m:
+            return m.group(1), m.group(2).strip()
+    # Valeurs par défaut si on ne trouve rien
+    return "00000", "N/A"
 
 # -----------------------
 # Health checks
@@ -393,6 +408,12 @@ async def create_quote_from_monday(payload: QuoteRequest):
     try:
         print(f"🧾 Création de devis Evoliz pour client : {payload.client_name} ({payload.client_type})")
 
+        # Fallback CP/Ville si manquants pour l'endpoint manuel
+        if not payload.postcode or not payload.city:
+            auto_pc, auto_city = _guess_postcode_city(payload.address)
+            payload.postcode = payload.postcode or auto_pc
+            payload.city = payload.city or auto_city
+
         if payload.client_type == "Professionnel" and not payload.vat_number:
             raise HTTPException(400, "Client Professionnel : 'vat_number' (TVA intracom) est requis.")
 
@@ -521,6 +542,12 @@ async def quote_from_monday(request: Request):
     city = col_text(getattr(settings, "CITY_COLUMN_ID", None))
     description = col_text(getattr(settings, "DESCRIPTION_COLUMN_ID", None))
     client_name = evt.get("pulseName") or "Client"
+
+    # Fallback CP/Ville si vides
+    if not postcode or not city:
+        auto_pc, auto_city = _guess_postcode_city(address)
+        postcode = postcode or auto_pc
+        city = city or auto_city
 
     # Montant HT robuste
     amount_ht_str, amount_ht = _read_amount_ht(item_id, amount_column_id)
