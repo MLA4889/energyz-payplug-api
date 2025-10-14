@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Body, Request
 from typing import Any, Optional
 import json as _json
 import requests
-import re  # <-- pour extraire CP/ville
+import re  # pour extraire CP/ville
 
 from .config import settings
 from .monday import (
@@ -22,13 +22,21 @@ app = FastAPI(title="ENERGYZ PayPlug API")
 def _monday_headers():
     return {"Authorization": settings.MONDAY_API_KEY}
 
-def upload_pdf_to_files_column(item_id: int, files_column_id: str, pdf_url: str, filename: str):
-    # 1) Télécharger le PDF Evoliz
-    r = requests.get(pdf_url, timeout=30)
+def upload_pdf_to_files_column(item_id: int, files_column_id: str, pdf_api_url: str, filename: str, token: str):
+    """
+    Télécharge le PDF depuis l'API Evoliz (lien privé) avec le Bearer token,
+    puis l'upload dans la colonne Files de Monday.
+    """
+    # 1) Télécharger le PDF depuis Evoliz (AUTH requise)
+    r = requests.get(
+        pdf_api_url,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
     r.raise_for_status()
     pdf_bytes = r.content
 
-    # 2) Upload GraphQL multipart
+    # 2) Upload GraphQL multipart vers Monday
     api_url = settings.MONDAY_API_URL  # défini dans config.py (avec défaut)
     query = """
       mutation ($file: File!, $itemId: ID!, $columnId: String!) {
@@ -82,7 +90,7 @@ def _guess_postcode_city(address_text: str) -> tuple[str, str]:
     """
     if address_text:
         # ex: "12 rue de Paris 75008 Paris"
-        m = re.search(r"(\\b\\d{5}\\b)\\s+([A-Za-zÀ-ÿ'’\\-\\s]+)$", address_text.strip())
+        m = re.search(r"(\b\d{5}\b)\s+([A-Za-zÀ-ÿ'’\-\s]+)$", address_text.strip())
         if m:
             return m.group(1), m.group(2).strip()
     # Valeurs par défaut si on ne trouve rien
@@ -439,9 +447,9 @@ async def create_quote_from_monday(payload: QuoteRequest):
             "status": "ok",
             "quote_id": quote.get("quoteid"),
             "quote_number": quote.get("document_number"),
-            "webdoc_url": quote.get("webdoc"),
+            "webdoc_url": quote.get("webdoc"),   # public
             "links_url": quote.get("links"),
-            "pdf_url": quote.get("file"),
+            "pdf_api_url": quote.get("file"),    # privé (auth Bearer)
         }
     except HTTPException:
         raise
@@ -470,9 +478,8 @@ async def quote_from_monday(request: Request):
     Webhook Monday déclenché par un statut (ex: 'Générer devis').
     - Lit les colonnes configurées dans settings
     - Crée client + devis dans Evoliz (TVA 20% forcée côté evoliz.py)
-    - Dépose le PDF du devis dans la colonne lien (QUOTE_LINK_COLUMN_ID)
-    - (Option) Bascule un statut (QUOTE_STATUS_COLUMN_ID => QUOTE_STATUS_AFTER_CREATE)
-    - (Option) Upload le PDF dans la colonne Files (QUOTE_FILES_COLUMN_ID)
+    - Dépose le lien webdoc (public) dans 'Devis'
+    - Upload le PDF (privé) dans la colonne 'Fichiers devis'
     """
     raw = await request.body()
     print(f"📩 Webhook Quote RAW: {raw.decode('utf-8', errors='ignore')}")
@@ -574,20 +581,28 @@ async def quote_from_monday(request: Request):
     quote = evoliz.create_quote(token, evoliz.create_client_if_needed(token, client_info), quote_info)
     print(f"✅ Devis Evoliz créé: {quote}")
 
-    pdf_url = quote.get("file")
+    pdf_api_url = quote.get("file")          # privé (API Evoliz -> nécessite Bearer)
+    webdoc_url = quote.get("webdoc")         # public/share
     doc_number = quote.get("document_number") or quote.get("quotenumber") or "Devis"
 
-    # Lien PDF dans la colonne Lien
+    # 1) Colonne "Devis" : on met le lien webdoc (public)
     link_col = getattr(settings, "QUOTE_LINK_COLUMN_ID", None)
-    if link_col and pdf_url:
-        set_link_in_column(item_id, settings.MONDAY_BOARD_ID, link_col, pdf_url, text=f"Devis {doc_number}")
-        print(f"🧾 PDF déposé (Lien): {pdf_url}")
+    if link_col and (webdoc_url or pdf_api_url):
+        link_to_use = webdoc_url or pdf_api_url
+        set_link_in_column(item_id, settings.MONDAY_BOARD_ID, link_col, link_to_use, text=f"Devis {doc_number}")
+        print(f"🧾 Lien déposé (webdoc): {link_to_use}")
 
-    # Upload PDF dans la colonne Fichiers (si configurée)
+    # 2) Colonne "Fichiers devis" : on télécharge le PDF via l'API Evoliz (auth Bearer) puis on l'upload vers Monday
     files_col = getattr(settings, "QUOTE_FILES_COLUMN_ID", None)
-    if files_col and pdf_url:
+    if files_col and pdf_api_url:
         try:
-            upload_pdf_to_files_column(item_id, files_col, pdf_url, filename=f"Devis_{doc_number}.pdf")
+            upload_pdf_to_files_column(
+                item_id,
+                files_col,
+                pdf_api_url,
+                filename=f"Devis_{doc_number}.pdf",
+                token=token,  # IMPORTANT : on passe le token Evoliz ici
+            )
             print("📎 PDF uploadé dans la colonne Fichiers.")
         except Exception as e:
             print(f"⚠️ Upload fichier Monday échoué: {e}")
@@ -603,8 +618,8 @@ async def quote_from_monday(request: Request):
         "item_id": item_id,
         "quote_id": quote.get("quoteid"),
         "quote_number": doc_number,
-        "pdf_url": pdf_url,
-        "webdoc_url": quote.get("webdoc"),
+        "pdf_api_url": pdf_api_url,
+        "webdoc_url": webdoc_url,
         "links_url": quote.get("links"),
         "client_type": client_type,
     }
