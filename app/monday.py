@@ -1,119 +1,113 @@
-import json as _json
+import json
+import mimetypes
+import re
+from typing import Any, Dict, Optional
+
 import requests
-from typing import Any, Dict
+
 from .config import settings
 
-MONDAY_API_URL = "https://api.monday.com/v2"
+MONDAY_HEADERS = {"Authorization": settings.MONDAY_API_KEY}
 
+def _gql(query: str, variables: dict | None = None) -> dict:
+    r = requests.post(
+        settings.MONDAY_API_URL,
+        headers={**MONDAY_HEADERS, "Content-Type": "application/json"},
+        json={"query": query, "variables": variables or {}},
+        timeout=30,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if "errors" in data:
+        raise RuntimeError(f"Monday GraphQL error: {data['errors']}")
+    return data["data"]
 
-# ---------------------- Utils ----------------------
-def _headers() -> Dict[str, str]:
-    """Prépare les headers de requête pour l’API Monday."""
-    return {
-        "Authorization": settings.MONDAY_API_KEY,
-        "Content-Type": "application/json",
-    }
-
-
-def _post(query: str, variables: Dict[str, Any], tag: str) -> Dict[str, Any]:
-    """
-    Envoie une requête GraphQL vers Monday.
-    Affiche les erreurs détaillées si la requête échoue.
-    """
-    try:
-        r = requests.post(MONDAY_API_URL, json={"query": query, "variables": variables}, headers=_headers())
-        r.raise_for_status()
-        data = r.json()
-        if data.get("errors"):
-            print(f"🧭 Erreur Monday API ({tag}): {data}")
-            raise RuntimeError(data["errors"][0].get("message", "Erreur inconnue Monday"))
-        return data.get("data", {})
-    except Exception as e:
-        print(f"❌ Exception dans _post ({tag}): {e}")
-        raise
-
-
-# ---------------------- Récupération ----------------------
-def get_item_columns(item_id: int, column_ids: list[str]) -> Dict[str, Any]:
-    """Récupère les valeurs de colonnes d’un item spécifique sur Monday."""
-    query = """
-    query ($itemId: [ID!]) {
-      items (ids: $itemId) {
-        column_values { id text value type }
-      }
-    }"""
-    data = _post(query, {"itemId": [item_id]}, tag="get_item_columns")
-    items = data.get("items", [])
-    if not items:
-        return {}
-    out = {}
-    for col in items[0].get("column_values", []):
-        if col["id"] in column_ids:
-            out[col["id"]] = {"text": col.get("text"), "value": col.get("value"), "type": col.get("type")}
-    return out
-
-
-def get_formula_display_value(item_id: int, formula_column_id: str) -> str:
-    """Récupère la valeur affichée (display_value) d’une colonne Formula."""
-    query = """
-    query ($itemId: [ID!], $columnId: [String!]) {
-      items (ids: $itemId) {
-        column_values(ids: $columnId) {
-          ... on FormulaValue { id display_value }
-        }
-      }
-    }"""
-    data = _post(query, {"itemId": [item_id], "columnId": [formula_column_id]}, tag="get_formula_display_value")
-    items = data.get("items", [])
-    if not items:
-        return ""
-    cvs = items[0].get("column_values", [])
-    return (cvs[0].get("display_value") if cvs else "") or ""
-
-
-# ---------------------- Écriture ----------------------
-def set_link_in_column(item_id: int, board_id: int, column_id: str, url: str, text: str = "Payer") -> None:
-    """
-    ✅ Corrigé : écrit un lien cliquable "Payer" dans une colonne Link sur Monday.
-    Assure que 'url' soit bien dans le champ du lien et 'text' dans le texte à afficher.
-    """
-    mutation = """
-    mutation ($itemId: ID!, $boardId: ID!, $columnValues: JSON!) {
-      change_multiple_column_values(item_id: $itemId, board_id: $boardId, column_values: $columnValues) {
+def get_item_columns(item_id: int) -> Dict[str, Any]:
+    q = """
+    query($item_id: [Int]) {
+      items(ids: $item_id) {
         id
+        name
+        column_values { id text value type additional_info }
       }
-    }"""
-
-    # 🩵 Correction : inversion text/url pour compatibilité Monday
-    column_values = {
-        column_id: {"text": text, "url": url}
     }
+    """
+    data = _gql(q, {"item_id": item_id})
+    items = data.get("items") or []
+    if not items:
+        raise RuntimeError(f"Item {item_id} introuvable.")
+    item = items[0]
+    colmap = {cv["id"]: cv for cv in item["column_values"]}
+    return {"item_id": int(item["id"]), "name": item["name"], "columns": colmap}
 
-    vars = {
-        "itemId": item_id,
-        "boardId": board_id,
-        "columnValues": _json.dumps(column_values)  # JSON encodé une seule fois ✅
+def get_formula_display_value(columns: Dict[str, Any], formula_col_id: str) -> Optional[str]:
+    cv = columns.get(formula_col_id)
+    if not cv:
+        return None
+    return cv.get("text")
+
+def set_status(item_id: int, status_column_id: str, label: str) -> None:
+    q = """
+    mutation($item_id: Int!, $column_id: String!, $label: String!) {
+      change_simple_column_value(item_id: $item_id, column_id: $column_id, value: $label) { id }
     }
+    """
+    _gql(q, {"item_id": item_id, "column_id": status_column_id, "label": label})
 
-    print(f"🔗 set_link_in_column (fix inversion) → {vars}")
-    _post(mutation, vars, tag="set_link_in_column")
-
-
-def set_status(item_id: int, board_id: int, status_column_id: str, label: str) -> None:
-    """✅ Met à jour une colonne de statut sur Monday."""
-    mutation = """
-    mutation ($itemId: ID!, $boardId: ID!, $columnValues: JSON!) {
-      change_multiple_column_values(item_id: $itemId, board_id: $boardId, column_values: $columnValues) {
-        id
-      }
-    }"""
-    column_values = {status_column_id: {"label": label}}
-
-    vars = {
-        "itemId": item_id,
-        "boardId": board_id,
-        "columnValues": _json.dumps(column_values)
+def set_link_in_column(item_id: int, column_id: str, url: str, text: str = "Ouvrir") -> None:
+    value = json.dumps({"url": url, "text": text})
+    q = """
+    mutation($item_id:Int!, $column_id:String!, $value:JSON!) {
+      change_column_value(item_id:$item_id, column_id:$column_id, value:$value) { id }
     }
+    """
+    _gql(q, {"item_id": item_id, "column_id": column_id, "value": value})
 
-    print(f"🎨 set_status (final) → {vars}")
-    _post(mutation, vars, tag="set_status")
+def extract_address_fields(columns: Dict[str, Any]) -> dict:
+    def _cv_text(col_id: str) -> str:
+        cv = columns.get(col_id)
+        return (cv.get("text") if cv else "") or ""
+
+    addr_txt = _cv_text(settings.ADDRESS_COLUMN_ID) if settings.ADDRESS_COLUMN_ID else ""
+    postcode = _cv_text(settings.POSTCODE_COLUMN_ID) if settings.POSTCODE_COLUMN_ID else ""
+    city = _cv_text(settings.CITY_COLUMN_ID) if settings.CITY_COLUMN_ID else ""
+
+    if (not postcode or not city) and addr_txt:
+        m = re.search(r"\b(\d{5})\s+([A-Za-zÀ-ÿ\-\s']+)$", addr_txt.strip())
+        if m:
+            postcode = postcode or m.group(1).strip()
+            city = city or m.group(2).strip()
+
+    return {"address": addr_txt.strip(), "postcode": postcode.strip(), "city": city.strip()}
+
+def upload_file_to_files_column(item_id: int, column_id: str, filename: str, content: bytes) -> None:
+    """Upload via GraphQL multipart → /v2/file (obligatoire)."""
+    if not column_id:
+        raise RuntimeError("Aucune colonne Files (column_id) fournie.")
+    mtype, _ = mimetypes.guess_type(filename)
+    if not mtype:
+        mtype = "application/pdf"
+
+    operations = {
+        "query": """
+          mutation ($file: File!, $item: Int!, $column: String!) {
+            add_file_to_column(file: $file, item_id: $item, column_id: $column) { id }
+          }
+        """,
+        "variables": {"file": None, "item": item_id, "column": column_id},
+    }
+    files = {
+        "operations": (None, json.dumps(operations), "application/json"),
+        "map": (None, json.dumps({"0": ["variables.file"]}), "application/json"),
+        "0": (filename, content, mtype),
+    }
+    # ⚠️ L'upload doit cibler /v2/file sinon 400
+    url = f"{settings.MONDAY_API_URL}/file"
+    r = requests.post(url, headers={"Authorization": settings.MONDAY_API_KEY}, files=files, timeout=90)
+    if r.status_code >= 400:
+        # remonter le détail d'erreur pour debug
+        try:
+            detail = r.json()
+        except Exception:
+            detail = r.text
+        raise RuntimeError(f"Upload fichier Monday échoué ({r.status_code}): {detail}")
