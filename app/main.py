@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Body, Request
-from fastapi.responses import JSONResponse
 from typing import Any, Optional
 import json as _json
+import requests
 
 from .config import settings
 from .monday import (
@@ -14,6 +14,39 @@ from .payments import create_payment, cents_from_str, _choose_api_key
 from . import evoliz
 
 app = FastAPI(title="ENERGYZ PayPlug API")
+
+# -----------------------
+# Helpers (Monday files)
+# -----------------------
+def _monday_headers():
+    return {"Authorization": settings.MONDAY_API_KEY}
+
+def upload_pdf_to_files_column(item_id: int, files_column_id: str, pdf_url: str, filename: str):
+    # 1) Télécharger le PDF Evoliz
+    r = requests.get(pdf_url, timeout=30)
+    r.raise_for_status()
+    pdf_bytes = r.content
+
+    # 2) Upload GraphQL multipart
+    api_url = settings.MONDAY_API_URL
+    query = """
+      mutation ($file: File!, $itemId: ID!, $columnId: String!) {
+        add_file_to_column (file: $file, item_id: $itemId, column_id: $columnId) { id }
+      }
+    """
+    variables = {"file": None, "itemId": item_id, "columnId": files_column_id}
+    files = {"0": (filename, pdf_bytes, "application/pdf")}
+    data = {
+        "query": query,
+        "variables": _json.dumps(variables),
+        "map": _json.dumps({"0": ["variables.file"]}),
+    }
+    resp = requests.post(api_url, headers=_monday_headers(), files=files, data=data, timeout=60)
+    resp.raise_for_status()
+    j = resp.json()
+    if "errors" in j:
+        raise RuntimeError(f"Monday add_file_to_column error: {j['errors']}")
+    return j
 
 # -----------------------
 # Health checks
@@ -270,10 +303,10 @@ async def create_quote_from_monday(payload: QuoteRequest):
         return {
             "status": "ok",
             "quote_id": quote.get("quoteid"),
-            "quote_number": quote.get("document_number"),  # numéro lisible
-            "webdoc_url": quote.get("webdoc"),             # page web devis
-            "links_url": quote.get("links"),               # fiche Evoliz
-            "pdf_url": quote.get("file"),                  # PDF direct
+            "quote_number": quote.get("document_number"),
+            "webdoc_url": quote.get("webdoc"),
+            "links_url": quote.get("links"),
+            "pdf_url": quote.get("file"),
         }
     except HTTPException:
         raise
@@ -296,14 +329,15 @@ def debug_evoliz_login():
 # =======================
 # Evoliz: création devis (depuis Monday - webhook)
 # =======================
-@app.post("/quote/from_monday", summary="Crée un devis Evoliz depuis un item Monday et dépose le PDF en colonne lien")
+@app.post("/quote/from_monday", summary="Crée un devis Evoliz depuis un item Monday et dépose le PDF")
 async def quote_from_monday(request: Request):
     """
     Webhook Monday déclenché par un statut (ex: 'Générer devis').
     - Lit les colonnes configurées dans settings
-    - Crée client + devis dans Evoliz
+    - Crée client + devis dans Evoliz (TVA 20% forcée côté evoliz.py)
     - Dépose le PDF du devis dans la colonne lien (QUOTE_LINK_COLUMN_ID)
     - (Option) Bascule un statut (QUOTE_STATUS_COLUMN_ID => QUOTE_STATUS_AFTER_CREATE)
+    - (Option) Upload le PDF dans la colonne Files (QUOTE_FILES_COLUMN_ID)
     """
     raw = await request.body()
     print(f"📩 Webhook Quote RAW: {raw.decode('utf-8', errors='ignore')}")
@@ -322,7 +356,7 @@ async def quote_from_monday(request: Request):
         raise HTTPException(400, "itemId/pulseId manquant")
     item_id = int(item_id)
 
-    # Si on veut filtrer sur un label de déclenchement
+    # Filtre label déclencheur
     trigger_label = getattr(settings, "QUOTE_TRIGGER_LABEL", "Générer devis")
     label = None
     try:
@@ -337,10 +371,10 @@ async def quote_from_monday(request: Request):
     except Exception:
         pass
     if label and label != trigger_label:
-        print(f"⚠️ Quote ignore: label={label} (attendu: {trigger_label})")
+        print(f"⚠️ Quote ignoré: label={label} (attendu: {trigger_label})")
         return {"status": "ignored", "reason": f"label={label} != {trigger_label}"}
 
-    # ----- Récup colonnes -----
+    # ----- Colonnes à lire -----
     col_ids = []
     for name in [
         "CLIENT_TYPE_COLUMN_ID",
@@ -354,14 +388,12 @@ async def quote_from_monday(request: Request):
         if cid:
             col_ids.append(cid)
 
-    # Montant (formule dédiée pour devis)
     amount_formula_id = getattr(settings, "QUOTE_AMOUNT_FORMULA_ID", None)
     if amount_formula_id:
         col_ids.append(amount_formula_id)
 
     cols = get_item_columns(item_id, col_ids) if col_ids else {}
 
-    # Valeurs texte
     def col_text(cid: Optional[str]) -> str:
         if not cid:
             return ""
@@ -373,7 +405,6 @@ async def quote_from_monday(request: Request):
     postcode = col_text(getattr(settings, "POSTCODE_COLUMN_ID", None))
     city = col_text(getattr(settings, "CITY_COLUMN_ID", None))
     description = col_text(getattr(settings, "DESCRIPTION_COLUMN_ID", None))
-    # Nom du client = nom de l'item par défaut
     client_name = evt.get("pulseName") or "Client"
 
     # Montant HT
@@ -385,17 +416,13 @@ async def quote_from_monday(request: Request):
     if amount_ht <= 0:
         raise HTTPException(400, f"Montant HT invalide (QUOTE_AMOUNT_FORMULA_ID): '{amount_ht_str}'")
 
-    # Normalisation du type client (Particulier/Professionnel)
+    # Normalisation type client
     t = client_type.strip().lower()
-    if t in ["professionnel", "pro", "b2b", "entreprise"]:
-        client_type = "Professionnel"
-    else:
-        client_type = "Particulier"
-
+    client_type = "Professionnel" if t in ["professionnel", "pro", "b2b", "entreprise"] else "Particulier"
     if client_type == "Professionnel" and not vat_number:
         raise HTTPException(400, "Client Professionnel : la colonne TVA intracom est vide.")
 
-    # ----- Appel Evoliz -----
+    # ----- Evoliz -----
     token = evoliz.get_access_token()
     client_info = {
         "name": client_name,
@@ -406,21 +433,30 @@ async def quote_from_monday(request: Request):
         "vat_number": vat_number,
     }
     quote_info = {"description": description or f"Devis item {item_id}", "amount_ht": amount_ht}
-
     quote = evoliz.create_quote(token, evoliz.create_client_if_needed(token, client_info), quote_info)
     print(f"✅ Devis Evoliz créé: {quote}")
 
-    # ----- Dépôt du PDF dans la colonne lien -----
     pdf_url = quote.get("file")
     doc_number = quote.get("document_number") or quote.get("quotenumber") or "Devis"
+
+    # Lien PDF dans la colonne Lien
     link_col = getattr(settings, "QUOTE_LINK_COLUMN_ID", None)
     if link_col and pdf_url:
         set_link_in_column(item_id, settings.MONDAY_BOARD_ID, link_col, pdf_url, text=f"Devis {doc_number}")
-        print(f"🧾 PDF déposé dans Monday: {pdf_url}")
+        print(f"🧾 PDF déposé (Lien): {pdf_url}")
 
-    # ----- (Option) mise à jour d'un statut -----
+    # Upload PDF dans la colonne Fichiers (si configurée)
+    files_col = getattr(settings, "QUOTE_FILES_COLUMN_ID", None)
+    if files_col and pdf_url:
+        try:
+            upload_pdf_to_files_column(item_id, files_col, pdf_url, filename=f"Devis_{doc_number}.pdf")
+            print("📎 PDF uploadé dans la colonne Fichiers.")
+        except Exception as e:
+            print(f"⚠️ Upload fichier Monday échoué: {e}")
+
+    # (Option) statut après création
     status_col = getattr(settings, "QUOTE_STATUS_COLUMN_ID", None)
-    status_label = getattr(settings, "QUOTE_STATUS_AFTER_CREATE", None)  # ex. "Devis généré"
+    status_label = getattr(settings, "QUOTE_STATUS_AFTER_CREATE", None)
     if status_col and status_label:
         set_status(item_id, settings.MONDAY_BOARD_ID, status_col, status_label)
 
