@@ -14,19 +14,20 @@ from .payments import create_payment, cents_from_str, _choose_api_key
 
 app = FastAPI(title="ENERGYZ PayPlug API")
 
-
-# --- Health checks ---
+# -----------------------
+# Health checks
+# -----------------------
 @app.get("/")
 def root():
     return {"status": "ok", "brand": settings.BRAND_NAME}
-
 
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "energyz-payplug-api"}
 
-
-# --- Debug: Check Monday Data ---
+# -----------------------
+# Debug Monday: lecture rapide
+# -----------------------
 @app.get("/debug/check/{item_id}/{n}")
 def debug_check(item_id: int, n: int):
     print(f"🔍 Debug check lancé pour item {item_id}, acompte {n}")
@@ -55,8 +56,9 @@ def debug_check(item_id: int, n: int):
         "api_key_found": bool(api_key),
     }
 
-
-# --- Endpoint principal : Générer lien PayPlug ---
+# -----------------------
+# Génération lien PayPlug
+# -----------------------
 @app.api_route("/pay/acompte/{n}", methods=["POST", "GET"])
 async def create_acompte_link(n: int, request: Request):
     """
@@ -71,14 +73,14 @@ async def create_acompte_link(n: int, request: Request):
     except Exception:
         body = {}
 
-    # --- Challenge pour vérification ---
+    # Challenge webhook
     if "challenge" in body:
         return {"challenge": body["challenge"]}
 
     if not body:
         return {"status": "ok", "message": "Webhook test accepté"}
 
-    # --- Lecture événement Monday ---
+    # Lecture événement Monday
     evt = body.get("event") or body.get("payload") or {}
     label = None
 
@@ -102,20 +104,20 @@ async def create_acompte_link(n: int, request: Request):
         print(f"⚠️ Label ignoré : {label} (attendu : {expected_label})")
         return {"status": "ignored", "reason": f"label={label} != {expected_label}"}
 
-    # --- Item ---
+    # Item
     item_id = evt.get("itemId") or evt.get("pulseId")
     if not item_id:
         raise HTTPException(400, "itemId ou pulseId manquant dans le payload Monday")
     item_id = int(item_id)
     item_name = evt.get("pulseName") or "Client"
 
-    # --- Lecture infos client ---
+    # Infos client
     column_ids = [cid for cid in [settings.EMAIL_COLUMN_ID, settings.ADDRESS_COLUMN_ID] if cid]
     cols = get_item_columns(item_id, column_ids) if column_ids else {}
     email = (cols.get(settings.EMAIL_COLUMN_ID, {}) or {}).get("text") or ""
     address = (cols.get(settings.ADDRESS_COLUMN_ID, {}) or {}).get("text") or ""
 
-    # --- Montant ---
+    # Montant
     formula_id = settings.FORMULA_COLUMN_IDS.get(str(n))
     if not formula_id:
         raise HTTPException(400, f"Aucune colonne formule configurée pour acompte {n}")
@@ -125,13 +127,13 @@ async def create_acompte_link(n: int, request: Request):
     if amount_cents <= 0:
         raise HTTPException(400, f"Montant invalide pour acompte {n}: '{amount_euros}'")
 
-    # --- Choix clé API PayPlug ---
+    # Choix clé PayPlug selon IBAN
     iban_display_value = get_formula_display_value(item_id, settings.IBAN_FORMULA_COLUMN_ID)
     api_key = _choose_api_key(iban_display_value)
     if not api_key:
         raise HTTPException(400, f"IBAN non reconnu : '{iban_display_value}'")
 
-    # --- Création paiement PayPlug ---
+    # Création paiement PayPlug
     url = create_payment(
         api_key=api_key,
         amount_cents=amount_cents,
@@ -141,7 +143,7 @@ async def create_acompte_link(n: int, request: Request):
         metadata={"customer_id": item_id, "acompte": str(n)},
     )
 
-    # --- Écriture du lien dans Monday ---
+    # Écriture lien dans Monday
     link_col = settings.LINK_COLUMN_IDS.get(str(n))
     if not link_col:
         raise HTTPException(400, f"Aucune colonne lien configurée pour acompte {n}")
@@ -151,8 +153,9 @@ async def create_acompte_link(n: int, request: Request):
 
     return {"status": "ok", "acompte": n, "payment_url": url}
 
-
-# --- Créer plusieurs liens ---
+# -----------------------
+# Générer plusieurs liens
+# -----------------------
 @app.post("/pay/all")
 async def create_all_links(request: Request):
     try:
@@ -168,8 +171,9 @@ async def create_all_links(request: Request):
                 out[str(n)] = {"status": "error", "detail": e.detail}
     return out
 
-
-# --- Notification PayPlug ---
+# -----------------------
+# Notification PayPlug
+# -----------------------
 @app.post("/pay/notify")
 async def payplug_notify(body: dict = Body(...)):
     if body.get("is_paid"):
@@ -184,8 +188,9 @@ async def payplug_notify(body: dict = Body(...)):
             set_status(item_id, settings.MONDAY_BOARD_ID, settings.STATUS_COLUMN_ID, label)
     return {"status": "processed"}
 
-
-# --- Test d’écriture dans Monday ---
+# -----------------------
+# Test écriture Monday
+# -----------------------
 @app.get("/debug/test_write/{item_id}")
 def debug_test_write(item_id: int):
     try:
@@ -205,13 +210,11 @@ def debug_test_write(item_id: int):
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
-
 # =======================
-#  Evoliz: création devis
+# Evoliz: création devis
 # =======================
 from pydantic import BaseModel, field_validator
 from . import evoliz
-
 
 class QuoteRequest(BaseModel):
     client_name: str
@@ -220,9 +223,8 @@ class QuoteRequest(BaseModel):
     city: str
     description: str
     amount_ht: float
-    # nouveaux champs pour gérer Particulier/Professionnel + TVA
-    client_type: str = "Particulier"          # "Particulier" ou "Professionnel"
-    vat_number: Optional[str] = None          # requis si Professionnel
+    client_type: str = "Particulier"     # "Particulier" ou "Professionnel"
+    vat_number: Optional[str] = None     # requis si Professionnel
 
     @field_validator("client_type")
     @classmethod
@@ -232,22 +234,18 @@ class QuoteRequest(BaseModel):
             return "Particulier"
         if v in ["professionnel", "pro", "b2b", "entreprise"]:
             return "Professionnel"
-        # défaut
         return "Particulier"
-
 
 @app.post("/quote/create", summary="Create Quote From Monday")
 async def create_quote_from_monday(payload: QuoteRequest):
     """
     Crée un devis Evoliz à partir d'une requête JSON (via Monday ou Swagger).
     - Si client_type = Professionnel => vat_number obligatoire
-    - TVA par défaut côté Evoliz = 20% (selon ta config). Pour la forcer sur la ligne,
-      mets "vat": 20.0 côté evoliz.create_quote().
+    - TVA forcée à 20% côté evoliz.create_quote()
     """
     try:
         print(f"🧾 Création de devis Evoliz pour client : {payload.client_name} ({payload.client_type})")
 
-        # Règle métier locale : Pro => TVA intracom obligatoire
         if payload.client_type == "Professionnel" and not payload.vat_number:
             raise HTTPException(400, "Client Professionnel : 'vat_number' (TVA intracom) est requis.")
 
@@ -272,7 +270,10 @@ async def create_quote_from_monday(payload: QuoteRequest):
         return {
             "status": "ok",
             "quote_id": quote.get("quoteid"),
-            "quote_number": quote.get("quotenumber"),
+            "quote_number": quote.get("document_number"),  # numéro lisible
+            "webdoc_url": quote.get("webdoc"),             # page web devis
+            "links_url": quote.get("links"),               # fiche Evoliz
+            "pdf_url": quote.get("file"),                  # PDF direct
         }
     except HTTPException:
         raise
@@ -280,13 +281,12 @@ async def create_quote_from_monday(payload: QuoteRequest):
         print(f"❌ Erreur Evoliz : {e}")
         raise HTTPException(500, f"Erreur lors de la création du devis : {e}")
 
-
-# --- Test de connexion API Evoliz ---
+# -----------------------
+# Debug Evoliz login
+# -----------------------
 @app.get("/debug/evoliz/login")
 def debug_evoliz_login():
-    """
-    Teste la connexion à l'API Evoliz (renvoie un token si OK)
-    """
+    """Teste la connexion à l'API Evoliz (renvoie un token si OK)"""
     try:
         token = evoliz.get_access_token()
         return {"status": "ok", "token_preview": token[:10] + "..."}
