@@ -34,8 +34,6 @@ def upload_pdf_to_files_column(item_id: int, files_column_id: str, pdf_url: str,
         add_file_to_column (file: $file, item_id: $itemId, column_id: $columnId) { id }
       }
     """
-    variables = {"file": None, "itemId": item_id, "ColumnId": files_column_id}
-    # attention: l'API attend "column_id" (string) dans la variable, on garde la clé python "columnId"
     variables = {"file": None, "itemId": item_id, "columnId": files_column_id}
     files = {"0": (filename, pdf_bytes, "application/pdf")}
     data = {
@@ -49,6 +47,31 @@ def upload_pdf_to_files_column(item_id: int, files_column_id: str, pdf_url: str,
     if "errors" in j:
         raise RuntimeError(f"Monday add_file_to_column error: {j['errors']}")
     return j
+
+# -------- Lecture robuste du Montant HT (formula OU numbers) --------
+def _read_amount_ht(item_id: int, amount_column_id: Optional[str]) -> tuple[str, float]:
+    """
+    1) essaie via get_formula_display_value (si c'est une formule),
+    2) sinon lit le texte de la colonne (si numbers).
+    Retourne (raw_str, parsed_float).
+    """
+    raw = ""
+    if amount_column_id:
+        # tentative 1: "formula display"
+        try:
+            raw = get_formula_display_value(item_id, amount_column_id) or ""
+        except Exception:
+            raw = ""
+        # tentative 2: lecture "text" de la colonne
+        if not raw:
+            cols = get_item_columns(item_id, [amount_column_id])
+            raw = (cols.get(amount_column_id, {}) or {}).get("text") or ""
+
+    try:
+        val = float(str(raw).replace("€", "").replace(" ", "").replace(",", ".").strip() or "0")
+    except Exception:
+        val = 0.0
+    return raw, val
 
 # -----------------------
 # Health checks
@@ -283,6 +306,7 @@ def debug_quote_preview(item_id: int):
             "CLIENT_TYPE_COLUMN_ID",
             "VAT_NUMBER_COLUMN_ID",
             "ADDRESS_COLUMN_ID",
+            # POSTCODE/CITY/DESCRIPTION sont optionnels
             "POSTCODE_COLUMN_ID",
             "CITY_COLUMN_ID",
             "DESCRIPTION_COLUMN_ID",
@@ -291,9 +315,9 @@ def debug_quote_preview(item_id: int):
             if cid:
                 col_ids.append(cid)
 
-        amount_formula_id = getattr(settings, "QUOTE_AMOUNT_FORMULA_ID", None)
-        if amount_formula_id:
-            col_ids.append(amount_formula_id)
+        amount_column_id = getattr(settings, "QUOTE_AMOUNT_FORMULA_ID", None)
+        if amount_column_id:
+            col_ids.append(amount_column_id)
 
         cols = get_item_columns(item_id, col_ids) if col_ids else {}
 
@@ -309,12 +333,8 @@ def debug_quote_preview(item_id: int):
         city = col_text(getattr(settings, "CITY_COLUMN_ID", None))
         description = col_text(getattr(settings, "DESCRIPTION_COLUMN_ID", None))
 
-        # Montant HT
-        amount_ht_str = get_formula_display_value(item_id, amount_formula_id) if amount_formula_id else ""
-        try:
-            amount_ht = float(str(amount_ht_str).replace("€", "").replace(",", ".").strip() or "0")
-        except Exception:
-            amount_ht = 0.0
+        # Montant HT robuste
+        amount_ht_str, amount_ht = _read_amount_ht(item_id, amount_column_id)
 
         # Normalisation type
         t = (client_type_raw or "").strip().lower()
@@ -343,7 +363,7 @@ def debug_quote_preview(item_id: int):
                 "description": description,
                 "amount_ht_str": amount_ht_str,
                 "amount_ht_parsed": amount_ht,
-                "amount_column_id": amount_formula_id,
+                "amount_column_id": amount_column_id,
             },
             "env_used": {
                 "CLIENT_TYPE_COLUMN_ID": getattr(settings, "CLIENT_TYPE_COLUMN_ID", ""),
@@ -474,6 +494,7 @@ async def quote_from_monday(request: Request):
         "CLIENT_TYPE_COLUMN_ID",
         "VAT_NUMBER_COLUMN_ID",
         "ADDRESS_COLUMN_ID",
+        # optionnels
         "POSTCODE_COLUMN_ID",
         "CITY_COLUMN_ID",
         "DESCRIPTION_COLUMN_ID",
@@ -482,9 +503,9 @@ async def quote_from_monday(request: Request):
         if cid:
             col_ids.append(cid)
 
-    amount_formula_id = getattr(settings, "QUOTE_AMOUNT_FORMULA_ID", None)
-    if amount_formula_id:
-        col_ids.append(amount_formula_id)
+    amount_column_id = getattr(settings, "QUOTE_AMOUNT_FORMULA_ID", None)
+    if amount_column_id:
+        col_ids.append(amount_column_id)
 
     cols = get_item_columns(item_id, col_ids) if col_ids else {}
 
@@ -501,12 +522,8 @@ async def quote_from_monday(request: Request):
     description = col_text(getattr(settings, "DESCRIPTION_COLUMN_ID", None))
     client_name = evt.get("pulseName") or "Client"
 
-    # Montant HT
-    amount_ht_str = get_formula_display_value(item_id, amount_formula_id) if amount_formula_id else ""
-    try:
-        amount_ht = float(str(amount_ht_str).replace("€", "").replace(",", ".").strip() or "0")
-    except Exception:
-        amount_ht = 0.0
+    # Montant HT robuste
+    amount_ht_str, amount_ht = _read_amount_ht(item_id, amount_column_id)
     if amount_ht <= 0:
         raise HTTPException(400, f"Montant HT invalide (QUOTE_AMOUNT_FORMULA_ID): '{amount_ht_str}'")
 
