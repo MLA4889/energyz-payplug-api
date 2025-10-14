@@ -34,7 +34,7 @@ class Settings(BaseModel):
     QUOTE_STATUS_COLUMN_ID: str = os.getenv("QUOTE_STATUS_COLUMN_ID", "")
     QUOTE_STATUS_AFTER_CREATE: str = os.getenv("QUOTE_STATUS_AFTER_CREATE", "")
 
-    # Colonnes optionnelles CP/Ville/Description
+    # (facultatif) colonnes séparées CP / Ville / Description
     POSTCODE_COLUMN_ID: str = os.getenv("POSTCODE_COLUMN_ID", "")
     CITY_COLUMN_ID: str = os.getenv("CITY_COLUMN_ID", "")
     DESCRIPTION_COLUMN_ID: str = os.getenv("DESCRIPTION_COLUMN_ID", "")
@@ -42,9 +42,6 @@ class Settings(BaseModel):
     # --- TVA ---
     VAT_RATE_COLUMN_ID: str = os.getenv("VAT_RATE_COLUMN_ID", "")
     DEFAULT_VAT_RATE: float = float(os.getenv("DEFAULT_VAT_RATE", "20.0"))
-
-    # (optionnel) colonne Numbers pour écrire le TTC calculé
-    TOTAL_TTC_COLUMN_ID: str = os.getenv("TOTAL_TTC_COLUMN_ID", "")
 
     # ===== PayPlug =====
     PAYPLUG_MODE: str = os.getenv("PAYPLUG_MODE", "live")
@@ -55,8 +52,7 @@ class Settings(BaseModel):
     PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
     BRAND_NAME: str = os.getenv("BRAND_NAME", "ENERGYZ")
 
-    # ===== Evoliz =====
-    # IMPORTANT: doit être **https://api.evoliz.com**
+    # ===== Evoliz (⚠️ URL à bien mettre : https://api.evoliz.com) =====
     EVOLIZ_PUBLIC_KEY: str = os.getenv("EVOLIZ_PUBLIC_KEY", "")
     EVOLIZ_SECRET_KEY: str = os.getenv("EVOLIZ_SECRET_KEY", "")
     EVOLIZ_COMPANY_ID: str = os.getenv("EVOLIZ_COMPANY_ID", "")
