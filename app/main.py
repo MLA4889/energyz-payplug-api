@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Body, Request
 from fastapi.responses import JSONResponse
-from typing import Any
+from typing import Any, Optional
 import json as _json
 
 from .config import settings
@@ -206,8 +206,10 @@ def debug_test_write(item_id: int):
         raise HTTPException(500, detail=str(e))
 
 
-# --- Création de devis Evoliz ---
-from pydantic import BaseModel
+# =======================
+#  Evoliz: création devis
+# =======================
+from pydantic import BaseModel, field_validator
 from . import evoliz
 
 
@@ -218,21 +220,44 @@ class QuoteRequest(BaseModel):
     city: str
     description: str
     amount_ht: float
+    # nouveaux champs pour gérer Particulier/Professionnel + TVA
+    client_type: str = "Particulier"          # "Particulier" ou "Professionnel"
+    vat_number: Optional[str] = None          # requis si Professionnel
+
+    @field_validator("client_type")
+    @classmethod
+    def _normalize_type(cls, v: str) -> str:
+        v = (v or "").strip().lower()
+        if v in ["particulier", "b2c", "perso", "privé", "prive"]:
+            return "Particulier"
+        if v in ["professionnel", "pro", "b2b", "entreprise"]:
+            return "Professionnel"
+        # défaut
+        return "Particulier"
 
 
 @app.post("/quote/create", summary="Create Quote From Monday")
 async def create_quote_from_monday(payload: QuoteRequest):
     """
     Crée un devis Evoliz à partir d'une requête JSON (via Monday ou Swagger).
+    - Si client_type = Professionnel => vat_number obligatoire
+    - TVA par défaut côté Evoliz = 20% (selon ta config). Pour la forcer sur la ligne,
+      mets "vat": 20.0 côté evoliz.create_quote().
     """
     try:
-        print(f"🧾 Création de devis Evoliz pour client : {payload.client_name}")
+        print(f"🧾 Création de devis Evoliz pour client : {payload.client_name} ({payload.client_type})")
+
+        # Règle métier locale : Pro => TVA intracom obligatoire
+        if payload.client_type == "Professionnel" and not payload.vat_number:
+            raise HTTPException(400, "Client Professionnel : 'vat_number' (TVA intracom) est requis.")
 
         client_info = {
             "name": payload.client_name,
             "address": payload.address,
             "postcode": payload.postcode,
             "city": payload.city,
+            "client_type": payload.client_type,
+            "vat_number": payload.vat_number,
         }
         quote_info = {
             "description": payload.description,
@@ -244,7 +269,13 @@ async def create_quote_from_monday(payload: QuoteRequest):
         quote = evoliz.create_quote(token, client_id, quote_info)
 
         print(f"✅ Devis créé avec succès : {quote}")
-        return {"status": "ok", "quote_id": quote.get("quoteid")}
+        return {
+            "status": "ok",
+            "quote_id": quote.get("quoteid"),
+            "quote_number": quote.get("quotenumber"),
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"❌ Erreur Evoliz : {e}")
         raise HTTPException(500, f"Erreur lors de la création du devis : {e}")
