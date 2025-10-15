@@ -27,7 +27,7 @@ def cents_from_str(s: str | None) -> int:
 def _configure_payplug(api_key: str):
     """
     Rendre la config compatible avec plusieurs versions du SDK PayPlug:
-    - payplug.set_secret_key(secret)  <-- (ta version demande celui-ci)
+    - payplug.set_secret_key(secret)  <-- le message d'erreur a montré que c'est ton cas
     - payplug.configure(secret)
     - payplug.set_api_key(secret)
     - payplug.configuration = payplug.Configuration(secret_key=secret)
@@ -40,12 +40,10 @@ def _configure_payplug(api_key: str):
         raise RuntimeError(f"PayPlug non installé ou import impossible: {e}")
 
     try:
-        # 1) Ta version (voir logs SecretKeyNotSet)
         if hasattr(payplug, "set_secret_key"):
             payplug.set_secret_key(api_key)  # type: ignore[attr-defined]
             return payplug
 
-        # 2) Variantes possibles
         if hasattr(payplug, "configure"):
             payplug.configure(api_key)  # type: ignore[attr-defined]
             return payplug
@@ -77,22 +75,27 @@ def create_payment(amount_cents: int, description: str, return_url: str, iban_di
         )
 
     payplug = _configure_payplug(api_key)
-
     desc = (description or "Acompte")[:255]
 
     Payment = getattr(payplug, "Payment", None)
     if Payment is None or not hasattr(Payment, "create"):
         raise RuntimeError("SDK PayPlug inattendu: 'Payment.create' est introuvable.")
 
-    payment = Payment.create(
-        amount=amount_cents,
-        currency="EUR",
-        hosted_payment={"return_url": return_url},
-        notification_url=None,
-        save_card=False,
-        metadata={"brand": settings.BRAND_NAME, "iban": iban_display_value, "mode": settings.PAYPLUG_MODE},
-        description=desc,
-    )
+    # Construire la payload sans notification_url si vide
+    data = {
+        "amount": amount_cents,
+        "currency": "EUR",
+        "hosted_payment": {"return_url": return_url},
+        "save_card": False,
+        "metadata": {"brand": settings.BRAND_NAME, "iban": iban_display_value, "mode": settings.PAYPLUG_MODE},
+        "description": desc,
+    }
+
+    notify_url = settings.PAYPLUG_NOTIFICATION_URL
+    if notify_url and (notify_url.startswith("http://") or notify_url.startswith("https://")):
+        data["notification_url"] = notify_url  # uniquement si valide
+
+    payment = Payment.create(**data)
 
     payment_id = getattr(payment, "id", None) or getattr(payment, "payment_id", None)
     hosted = getattr(payment, "hosted_payment", None)
