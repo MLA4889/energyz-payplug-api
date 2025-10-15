@@ -64,6 +64,7 @@ class Settings(BaseModel):
     PAYPLUG_MODE: str = os.getenv("PAYPLUG_MODE", "live")
     PAYPLUG_KEYS_LIVE: dict = _loads_env_json("PAYPLUG_KEYS_LIVE_JSON", {})
     PAYPLUG_KEYS_TEST: dict = _loads_env_json("PAYPLUG_KEYS_TEST_JSON", {})
+    PAYPLUG_NOTIFICATION_URL: str = os.getenv("PAYPLUG_NOTIFICATION_URL", "")
 
     # ===== Divers =====
     PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
@@ -75,7 +76,7 @@ class Settings(BaseModel):
     EVOLIZ_COMPANY_ID: str = os.getenv("EVOLIZ_COMPANY_ID", "")
     EVOLIZ_BASE_URL: str = os.getenv("EVOLIZ_BASE_URL", "https://api.evoliz.com").rstrip("/")
 
-    # ===== Fallback IBAN basé sur le status (NOUVEAU) =====
+    # ===== Fallback IBAN basé sur le status =====
     BUSINESS_STATUS_COLUMN_ID: str = os.getenv("BUSINESS_STATUS_COLUMN_ID", "")
     IBAN_BY_STATUS: dict = _loads_env_json("IBAN_BY_STATUS_JSON", {})
 
