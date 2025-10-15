@@ -93,12 +93,8 @@ def _download_evoliz_pdf(token: str, kind: str, document_id: int) -> Optional[by
     return None
 
 
-# ====== Fallback IBAN depuis le status (NOUVEAU) ======
+# ====== Fallback IBAN depuis le status ======
 def _iban_from_status(cols: Dict[str, Any]) -> str:
-    """
-    Si la formule IBAN est vide côté API, on lit le status 'Business Line / Société'
-    et on mappe via IBAN_BY_STATUS_JSON.
-    """
     if not settings.BUSINESS_STATUS_COLUMN_ID:
         return ""
     cv = cols.get(settings.BUSINESS_STATUS_COLUMN_ID) or {}
@@ -126,20 +122,34 @@ async def pay_acompte(n: int, item_id: Optional[int] = None, request: Request = 
     formula_col_id = settings.FORMULA_COLUMN_IDS.get(str(n))
     if not formula_col_id:
         raise HTTPException(400, f"FORMULA_COLUMN_IDS n°{n} non configurée")
+
     amount_txt = get_formula_display_value(cols, formula_col_id) or "0"
     amount_cents = cents_from_str(amount_txt)
+    if amount_cents <= 0:
+        raise HTTPException(
+            400,
+            f"Montant d'acompte {n} invalide pour l'item {item_id} "
+            f"(valeur lue='{amount_txt}'). Mets un nombre > 0 dans la colonne."
+        )
 
     desc = (settings.DESCRIPTION_COLUMN_ID and get_formula_display_value(cols, settings.DESCRIPTION_COLUMN_ID)) or info["name"]
     iban_txt = (settings.IBAN_FORMULA_COLUMN_ID and get_formula_display_value(cols, settings.IBAN_FORMULA_COLUMN_ID)) or ""
-
-    # ✅ Fallback si la formula est vide dans l'API
     if not iban_txt:
         iban_txt = _iban_from_status(cols)
-
     if not iban_txt:
         raise HTTPException(400, "IBAN introuvable (formula et fallback status vides).")
 
-    pay = create_payment(amount_cents, f"Acompte {n} – {desc}", f"{settings.PUBLIC_BASE_URL}/", iban_txt)
+    # return_url doit être http/https
+    base_url = settings.PUBLIC_BASE_URL or "https://energyz-payplug-api-1.onrender.com"
+    if not (base_url.startswith("http://") or base_url.startswith("https://")):
+        base_url = "https://energyz-payplug-api-1.onrender.com"
+
+    pay = create_payment(
+        amount_cents=amount_cents,
+        description=f"Acompte {n} – {desc}",
+        return_url=f"{base_url}/",
+        iban_display_value=iban_txt,
+    )
 
     link_col = settings.LINK_COLUMN_IDS.get(str(n))
     if link_col:
@@ -276,7 +286,7 @@ async def invoice_from_monday(payload: dict = Body(...)):
     return {"status": "ok", "invoice": {"id": invoice_id, "url": web_url, "kind": kind}}
 
 
-# --- DEBUG PAYPLUG (amélioré) ---
+# --- DEBUG PAYPLUG ---
 @app.get("/debug/payplug/{item_id}")
 def debug_payplug(item_id: int):
     info = get_item_columns(item_id)
