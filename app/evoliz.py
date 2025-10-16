@@ -33,12 +33,20 @@ def create_client_if_needed(token, client_data):
     r.raise_for_status()
     return r.json()["clientid"]
 
+from datetime import date
+import requests
+from .config import settings
+
 def create_quote(token, client_id, quote_data):
     headers = {"Authorization": f"Bearer {token}"}
+    today = date.today().strftime("%Y-%m-%d")
+
     payload = {
         "clientid": client_id,
         "doctype": "quote",
-        "rows": [
+        "documentdate": today,
+        "term": {"paytermid": 1},  # 1 = Paiement comptant (à adapter selon ton compte)
+        "items": [
             {
                 "designation": quote_data["description"],
                 "quantity": 1,
@@ -47,11 +55,14 @@ def create_quote(token, client_id, quote_data):
         ],
         "currency": "EUR"
     }
+
     url = f"{settings.EVOLIZ_BASE_URL}/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes"
-    r = requests.post(url, headers=headers, json=payload)
     print("📤 Payload Evoliz:", payload)
-    print("🌍 URL:", url)
-    print("🔑 Token:", token[:10], "...")
+    r = requests.post(url, headers=headers, json=payload)
     print("📦 Response:", r.text)
-    r.raise_for_status()
+
+    # En cas d’erreur, affichage clair
+    if not r.ok:
+        raise Exception(f"{r.status_code} {r.text}")
+
     return r.json()
