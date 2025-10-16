@@ -8,13 +8,14 @@ def cents_from_str(amount_str: str):
         return 0
 
 def _choose_api_key(iban_display_value: str):
-    """Choisit la clé API PayPlug selon l’IBAN (ou test/live par défaut)."""
-    if "TEST" in (iban_display_value or "").upper():
-        return settings.PAYPLUG_TEST_KEY
-    return settings.PAYPLUG_LIVE_KEY
+    """Choisit la clé API selon l’IBAN et le mode (test/live)."""
+    mode = settings.PAYPLUG_MODE
+    keyset = settings.PAYPLUG_KEYS
+    if mode == "live":
+        return keyset.get("live")
+    return keyset.get("test")
 
 def create_payment(api_key: str, amount_cents: int, email: str, address: str, customer_name: str, metadata: dict):
-    """Crée un paiement PayPlug."""
     headers = {"Authorization": f"Bearer {api_key}"}
     data = {
         "amount": amount_cents,
