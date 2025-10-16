@@ -4,7 +4,6 @@ import re
 from typing import Any, Dict, Optional
 
 import requests
-
 from .config import settings
 
 MONDAY_HEADERS = {"Authorization": settings.MONDAY_API_KEY}
@@ -25,10 +24,7 @@ def _gql(query: str, variables: dict | None = None) -> dict:
 
 
 def get_item_columns(item_id: int) -> Dict[str, Any]:
-    """
-    Récupère toutes les colonnes de l'item.
-    IMPORTANT : items(ids: $item_id) attend des ID -> variable typée [ID!]
-    """
+    # NOTE: items(ids: $item_id) attend un type [ID!], pas [Int]
     q = """
     query($item_id: [ID!]) {
       items(ids: $item_id) {
@@ -47,21 +43,18 @@ def get_item_columns(item_id: int) -> Dict[str, Any]:
     return {"item_id": int(item["id"]), "name": item["name"], "columns": colmap}
 
 
-# --------------------- helpers extraction ---------------------
+# -------- helpers lecture Formula / Numbers --------
 
 _NUM_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
 
-def _clean_text_number(s: str) -> str:
-    """Retire €, espaces, etc. et renvoie la 1ère forme numérique trouvée dans s."""
+def _clean_number_like(s: str) -> str:
     if not s:
         return ""
     s2 = s.replace("€", " ").replace("\u00a0", " ").strip()
     m = _NUM_RE.search(s2)
     return (m.group(0) if m else "").replace(",", ".")
 
-
-def _extract_from_value_field(raw: Any) -> str:
-    """`value` peut être None, un nombre simple, une string, ou un JSON sérialisé."""
+def _from_value_field(raw: Any) -> str:
     if raw is None:
         return ""
     if isinstance(raw, (int, float)):
@@ -72,54 +65,35 @@ def _extract_from_value_field(raw: Any) -> str:
             try:
                 parsed = json.loads(t)
             except Exception:
-                return _clean_text_number(t)
+                return _clean_number_like(t)
+            # Monday peut mettre {"text":"1500"} ou {"value":"1500"} etc.
             if isinstance(parsed, dict):
                 for key in ("text", "value", "display_value", "formatted"):
                     v = parsed.get(key)
                     if v:
-                        return _clean_text_number(str(v))
-            return _clean_text_number(t)
-        return _clean_text_number(t)
-    return _clean_text_number(str(raw))
+                        return _clean_number_like(str(v))
+            return _clean_number_like(t)
+        return _clean_number_like(t)
+    return _clean_number_like(str(raw))
 
-
-def get_formula_display_value(columns: Dict[str, Any], formula_col_id: str) -> Optional[str]:
-    """
-    Renvoie une string numérique exploitable depuis une colonne Formula.
-    Essaye d'abord 'text', puis parse 'value' (souvent JSON).
-    """
-    cv = columns.get(formula_col_id)
+def get_formula_display_value(columns: Dict[str, Any], col_id: str) -> Optional[str]:
+    cv = columns.get(col_id)
     if not cv:
         return None
 
+    # 1) text
     txt = (cv.get("text") or "").strip()
     if txt:
-        cleaned = _clean_text_number(txt)
-        if cleaned:
-            return cleaned
+        n = _clean_number_like(txt)
+        if n:
+            return n
 
-    return _extract_from_value_field(cv.get("value")) or None
+    # 2) value (souvent JSON)
+    val = _from_value_field(cv.get("value"))
+    if val:
+        return val
 
-
-# --------------------- autres utilitaires Monday ---------------------
-
-def set_status(item_id: int, status_column_id: str, label: str) -> None:
-    q = """
-    mutation($item_id: Int!, $column_id: String!, $label: String!) {
-      change_simple_column_value(item_id: $item_id, column_id: $column_id, value: $label) { id }
-    }
-    """
-    _gql(q, {"item_id": item_id, "column_id": status_column_id, "label": label})
-
-
-def set_link_in_column(item_id: int, column_id: str, url: str, text: str = "Ouvrir") -> None:
-    value = json.dumps({"url": url, "text": text})
-    q = """
-    mutation($item_id:Int!, $column_id:String!, $value:JSON!) {
-      change_column_value(item_id:$item_id, column_id:$column_id, value:$value) { id }
-    }
-    """
-    _gql(q, {"item_id": item_id, "column_id": column_id, "value": value})
+    return None
 
 
 def extract_address_fields(columns: Dict[str, Any]) -> dict:
@@ -140,8 +114,26 @@ def extract_address_fields(columns: Dict[str, Any]) -> dict:
     return {"address": addr_txt.strip(), "postcode": postcode.strip(), "city": city.strip()}
 
 
+def set_status(item_id: int, status_column_id: str, label: str) -> None:
+    q = """
+    mutation($item_id: Int!, $column_id: String!, $label: String!) {
+      change_simple_column_value(item_id: $item_id, column_id: $column_id, value: $label) { id }
+    }
+    """
+    _gql(q, {"item_id": item_id, "column_id": status_column_id, "label": label})
+
+
+def set_link_in_column(item_id: int, column_id: str, url: str, text: str = "Ouvrir") -> None:
+    value = json.dumps({"url": url, "text": text})
+    q = """
+    mutation($item_id:Int!, $column_id:String!, $value:JSON!) {
+      change_column_value(item_id:$item_id, column_id:$column_id, value:$value) { id }
+    }
+    """
+    _gql(q, {"item_id": item_id, "column_id": column_id, "value": value})
+
+
 def upload_file_to_files_column(item_id: int, column_id: str, filename: str, content: bytes) -> None:
-    """Upload via GraphQL multipart → /v2/file (obligatoire)."""
     if not column_id:
         raise RuntimeError("Aucune colonne Files (column_id) fournie.")
     mtype, _ = mimetypes.guess_type(filename)
