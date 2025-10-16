@@ -1,147 +1,102 @@
 import requests
-from fastapi import HTTPException
-from .config import settings
 import json
+from .config import settings
+
+MONDAY_API_URL = "https://api.monday.com/v2"
+HEADERS = {
+    "Authorization": settings.MONDAY_API_KEY,
+    "Content-Type": "application/json"
+}
 
 
-# --- Récupérer les colonnes d’un item ---
+# --- Récupère les colonnes d'un item ---
 def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
-    """
-    Récupère les colonnes d’un élément Monday (email, adresse, etc.)
-    """
-    query = {
-        "query": f"""
-        query {{
-            items (ids: {item_id}) {{
+    """Retourne les valeurs texte des colonnes demandées"""
+    query = """
+    query ($item_id: Int!) {
+        items (ids: [$item_id]) {
+            column_values {
                 id
-                name
-                column_values {{
-                    id
-                    text
-                    value
-                }}
-            }}
-        }}
-        """
+                text
+                value
+            }
+        }
     }
-
-    headers = {
-        "Authorization": settings.MONDAY_API_KEY,
-        "Content-Type": "application/json",
-    }
-
-    r = requests.post("https://api.monday.com/v2", headers=headers, json=query)
-    res = r.json()
-    print("🔍 Monday response:", json.dumps(res, indent=2))
-
-    # --- Gestion des erreurs ---
-    if "data" not in res:
-        raise HTTPException(500, f"Erreur Monday: {res}")
-
-    items = res["data"]["items"]
-    if not items:
-        return {}
-
+    """
+    response = requests.post(MONDAY_API_URL, headers=HEADERS, json={"query": query, "variables": {"item_id": item_id}})
+    response.raise_for_status()
+    data = response.json()
+    if "errors" in data:
+        raise Exception(f"Erreur Monday: {data['errors']}")
+    cols = data["data"]["items"][0]["column_values"]
     result = {}
-    for col in items[0]["column_values"]:
+    for col in cols:
         if col["id"] in column_ids:
-            result[col["id"]] = col
+            result[col["id"]] = {"text": col.get("text") or "", "value": col.get("value")}
     return result
 
 
-# --- Récupérer la valeur d’une formule (montant) ---
-def get_formula_display_value(item_id: int, formula_column_id: str) -> str:
-    """
-    Retourne la valeur affichée d’une colonne formule (ex: montant acompte)
-    """
-    query = {
-        "query": f"""
-        query {{
-            items (ids: {item_id}) {{
-                column_values (ids: ["{formula_column_id}"]) {{
-                    text
-                }}
-            }}
-        }}
-        """
+# --- Récupère la valeur affichée d’une formule ---
+def get_formula_display_value(item_id: int, column_id: str) -> str:
+    """Récupère le texte visible d'une formule Monday"""
+    query = """
+    query ($item_id: Int!, $column_id: String!) {
+        items (ids: [$item_id]) {
+            column_values(ids: [$column_id]) {
+                id
+                text
+            }
+        }
     }
-
-    headers = {
-        "Authorization": settings.MONDAY_API_KEY,
-        "Content-Type": "application/json",
-    }
-
-    r = requests.post("https://api.monday.com/v2", headers=headers, json=query)
-    res = r.json()
-    print(f"🔢 Formula response for {formula_column_id}:", json.dumps(res, indent=2))
-
+    """
+    variables = {"item_id": item_id, "column_id": column_id}
+    response = requests.post(MONDAY_API_URL, headers=HEADERS, json={"query": query, "variables": variables})
+    response.raise_for_status()
+    data = response.json()
     try:
-        return res["data"]["items"][0]["column_values"][0]["text"]
+        text_value = data["data"]["items"][0]["column_values"][0]["text"]
+        return text_value.strip() if text_value else ""
     except Exception:
         return ""
 
 
-# --- Écrire un lien dans une colonne (PayPlug ou Devis) ---
-def set_link_in_column(item_id: int, board_id: int, column_id: str, url: str, text: str):
-    """
-    Met à jour une colonne lien sur Monday
-    """
-    mutation = {
-        "query": f"""
-        mutation {{
-            change_column_value (
-                board_id: {board_id},
-                item_id: {item_id},
-                column_id: "{column_id}",
-                value: "{{\\"url\\": \\"{url}\\", \\"text\\": \\"{text}\\"}}"
-            ) {{
-                id
-            }}
-        }}
-        """
+# --- Met à jour un lien dans une colonne ---
+def set_link_in_column(item_id: int, board_id: int, column_id: str, url: str, text: str = "Payer"):
+    """Écrit un lien cliquable dans Monday"""
+    mutation = """
+    mutation ($item_id: Int!, $board_id: Int!, $column_id: String!, $value: JSON!) {
+        change_simple_column_value(
+            item_id: $item_id,
+            board_id: $board_id,
+            column_id: $column_id,
+            value: $value
+        ) {
+            id
+        }
     }
-
-    headers = {
-        "Authorization": settings.MONDAY_API_KEY,
-        "Content-Type": "application/json",
-    }
-
-    r = requests.post("https://api.monday.com/v2", headers=headers, json=mutation)
-    res = r.json()
-    print("🔗 Monday link update:", json.dumps(res, indent=2))
-
-    if "errors" in res:
-        raise HTTPException(500, f"Erreur Monday lors de l’écriture du lien: {res}")
+    """
+    value = json.dumps({"url": url, "text": text})
+    variables = {"item_id": item_id, "board_id": board_id, "column_id": column_id, "value": value}
+    res = requests.post(MONDAY_API_URL, headers=HEADERS, json={"query": mutation, "variables": variables})
+    res.raise_for_status()
+    return res.json()
 
 
-# --- Mettre à jour le statut d’un item (ex: payé) ---
+# --- Change un statut ---
 def set_status(item_id: int, board_id: int, column_id: str, label: str):
-    """
-    Change un statut sur Monday (ex: 'Payé acompte')
-    """
-    mutation = {
-        "query": f"""
-        mutation {{
-            change_simple_column_value (
-                board_id: {board_id},
-                item_id: {item_id},
-                column_id: "{column_id}",
-                value: "{label}"
-            ) {{
-                id
-            }}
-        }}
-        """
+    mutation = """
+    mutation ($item_id: Int!, $board_id: Int!, $column_id: String!, $value: String!) {
+        change_simple_column_value(
+            item_id: $item_id,
+            board_id: $board_id,
+            column_id: $column_id,
+            value: $value
+        ) {
+            id
+        }
     }
-
-    headers = {
-        "Authorization": settings.MONDAY_API_KEY,
-        "Content-Type": "application/json",
-    }
-
-    r = requests.post("https://api.monday.com/v2", headers=headers, json=mutation)
-    res = r.json()
-    print("🟩 Monday status update:", json.dumps(res, indent=2))
-
-    if "errors" in res:
-        raise HTTPException(500, f"Erreur Monday lors du changement de statut: {res}")
+    """
+    variables = {"item_id": item_id, "board_id": board_id, "column_id": column_id, "value": label}
+    res = requests.post(MONDAY_API_URL, headers=HEADERS, json={"query": mutation, "variables": variables})
+    res.raise_for_status()
+    return res.json()
