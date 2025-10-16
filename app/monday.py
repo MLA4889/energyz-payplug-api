@@ -25,9 +25,12 @@ def _gql(query: str, variables: dict | None = None) -> dict:
 
 
 def get_item_columns(item_id: int) -> Dict[str, Any]:
-    # Note: ne pas demander "additional_info" – certaines versions de l’API ne l’exposent pas
+    """
+    Récupère toutes les colonnes de l'item.
+    IMPORTANT : items(ids: $item_id) attend des ID -> variable typée [ID!]
+    """
     q = """
-    query($item_id: [Int]) {
+    query($item_id: [ID!]) {
       items(ids: $item_id) {
         id
         name
@@ -35,7 +38,7 @@ def get_item_columns(item_id: int) -> Dict[str, Any]:
       }
     }
     """
-    data = _gql(q, {"item_id": item_id})
+    data = _gql(q, {"item_id": str(item_id)})
     items = data.get("items") or []
     if not items:
         raise RuntimeError(f"Item {item_id} introuvable.")
@@ -52,7 +55,6 @@ def _clean_text_number(s: str) -> str:
     """Retire €, espaces, etc. et renvoie la 1ère forme numérique trouvée dans s."""
     if not s:
         return ""
-    # remplace virgule par point, retire euros et espaces
     s2 = s.replace("€", " ").replace("\u00a0", " ").strip()
     m = _NUM_RE.search(s2)
     return (m.group(0) if m else "").replace(",", ".")
@@ -62,29 +64,22 @@ def _extract_from_value_field(raw: Any) -> str:
     """`value` peut être None, un nombre simple, une string, ou un JSON sérialisé."""
     if raw is None:
         return ""
-    # nombre direct
     if isinstance(raw, (int, float)):
         return str(raw)
-    # string
     if isinstance(raw, str):
-        # si JSON sérialisé -> tente json.loads
         t = raw.strip()
         if (t.startswith("{") and t.endswith("}")) or (t.startswith("[") and t.endswith("]")):
             try:
                 parsed = json.loads(t)
             except Exception:
-                # pas du JSON exploitable -> essaie d'extraire un nombre de la string brute
                 return _clean_text_number(t)
-            # cherche des champs classiques
-            for key in ("text", "value", "display_value", "formatted"):
-                v = parsed.get(key) if isinstance(parsed, dict) else None
-                if v:
-                    return _clean_text_number(str(v))
-            # sinon, tente une extraction brute
+            if isinstance(parsed, dict):
+                for key in ("text", "value", "display_value", "formatted"):
+                    v = parsed.get(key)
+                    if v:
+                        return _clean_text_number(str(v))
             return _clean_text_number(t)
-        # pas du JSON -> extraction brute
         return _clean_text_number(t)
-    # fallback
     return _clean_text_number(str(raw))
 
 
@@ -97,14 +92,12 @@ def get_formula_display_value(columns: Dict[str, Any], formula_col_id: str) -> O
     if not cv:
         return None
 
-    # 1) le plus simple : text
     txt = (cv.get("text") or "").strip()
     if txt:
         cleaned = _clean_text_number(txt)
         if cleaned:
             return cleaned
 
-    # 2) sinon, value (souvent JSON)
     return _extract_from_value_field(cv.get("value")) or None
 
 
