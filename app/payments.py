@@ -1,80 +1,38 @@
-import requests
-import json
+from typing import Optional
+import payplug
 from .config import settings
 
+def _choose_api_key(iban_display_value: str) -> Optional[str]:
+    keymap = settings.PAYPLUG_KEYS_LIVE if settings.PAYPLUG_MODE == "live" else settings.PAYPLUG_KEYS_TEST
+    if not iban_display_value:
+        return keymap.get("AUTRE_IBAN")
+    k = " ".join(iban_display_value.split())  # normaliser espaces
+    return keymap.get(k) or keymap.get("AUTRE_IBAN")
 
-def _choose_api_key(iban_display: str) -> str | None:
-    if not iban_display:
-        print("⚠️ Aucun IBAN trouvé dans Monday.")
-        return None
-
+def cents_from_str(s: str | None) -> int:
+    if not s:
+        return 0
+    s = s.replace("€", "").replace(" ", "").replace(",", ".")
     try:
-        keys_json = (
-            settings.PAYPLUG_KEYS_JSON
-            if settings.PAYPLUG_MODE == "live"
-            else settings.PAYPLUG_KEYS_TEST_JSON
-        )
-        iban_map = json.loads(keys_json)
-        for iban_prefix, key in iban_map.items():
-            if iban_prefix.replace(" ", "") in iban_display.replace(" ", ""):
-                print(f"✅ Clé trouvée pour IBAN: {iban_prefix}")
-                return key
-        print("⚠️ IBAN non trouvé dans les clés PayPlug.")
-        return None
-    except Exception as e:
-        print(f"❌ Erreur lecture JSON PayPlug : {e}")
-        return None
-
-
-def cents_from_str(amount_str: str) -> int:
-    try:
-        clean = str(amount_str).replace("€", "").replace(",", ".").strip()
-        return int(round(float(clean) * 100))
+        return int(round(float(s) * 100))
     except Exception:
-        print(f"⚠️ Montant invalide: {amount_str}")
         return 0
 
-
-def create_payment(api_key: str, amount_cents: int, email: str, address: str, customer_name: str, metadata: dict):
+def create_payment(amount_cents: int, description: str, return_url: str, iban_display_value: str) -> dict:
+    api_key = _choose_api_key(iban_display_value)
     if not api_key:
-        raise ValueError("❌ Clé PayPlug manquante.")
-    if amount_cents <= 0:
-        raise ValueError(f"❌ Montant invalide: {amount_cents}")
+        raise RuntimeError("Aucune clé PayPlug correspondante à l'IBAN sélectionné.")
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
+    # PayPlug SDK v2 : set_secret_key
+    payplug.set_secret_key(api_key)
 
-    payload = {
-        "amount": amount_cents,
-        "currency": "EUR",
-        "customer": {
-            "email": email or "client@demo.com",
-            "first_name": customer_name.split()[0] if customer_name else "",
-            "last_name": customer_name.split()[-1] if len(customer_name.split()) > 1 else "",
-            "address1": address or "Adresse inconnue",
-            "country": "FR"
-        },
-        "hosted_payment": {
-            "return_url": f"{settings.PUBLIC_BASE_URL}/success",
-            "cancel_url": f"{settings.PUBLIC_BASE_URL}/cancel"
-        },
-        "notification_url": f"{settings.PUBLIC_BASE_URL}/pay/notify",
-        "metadata": metadata
-    }
-
-    print(f"🔹 Envoi vers PayPlug : {json.dumps(payload, indent=2)}")
-
-    res = requests.post("https://api.payplug.com/v1/payments", headers=headers, json=payload)
-    if res.status_code >= 400:
-        print(f"❌ Erreur PayPlug ({res.status_code}): {res.text}")
-        res.raise_for_status()
-
-    data = res.json()
-    url = data.get("hosted_payment", {}).get("payment_url")
-    if not url:
-        raise Exception(f"Réponse PayPlug invalide: {data}")
-
-    print(f"✅ Paiement OK: {url}")
-    return url
+    payment = payplug.Payment.create(
+        amount=amount_cents,
+        currency='EUR',
+        hosted_payment={'return_url': return_url},
+        notification_url=None,
+        save_card=False,
+        metadata={"brand": settings.BRAND_NAME, "iban": iban_display_value, "mode": settings.PAYPLUG_MODE},
+        description=(description or "Acompte")[:255],
+    )
+    return {"id": payment.id, "url": payment.hosted_payment.payment_url, "status": payment.status}
