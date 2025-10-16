@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Body, Request
 from typing import Any
-import json as _json
 from pydantic import BaseModel
+import json as _json
 
 from .config import settings
 from .monday import get_item_columns, get_formula_display_value, set_link_in_column, set_status
@@ -19,7 +19,7 @@ def health():
     return {"status": "ok", "service": "energyz-payplug-api"}
 
 
-# --- Génération de lien PayPlug (identique version stable) ---
+# --- Génération lien PayPlug ---
 @app.api_route("/pay/acompte/{n}", methods=["POST", "GET"])
 async def create_acompte_link(n: int, request: Request):
     raw_body = await request.body()
@@ -37,7 +37,6 @@ async def create_acompte_link(n: int, request: Request):
 
     evt = body.get("event") or body.get("payload") or {}
     label = None
-
     try:
         val = evt.get("value")
         if isinstance(val, str):
