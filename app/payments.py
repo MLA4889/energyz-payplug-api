@@ -1,113 +1,39 @@
 from typing import Optional
+import payplug
 from .config import settings
 
 
 def _choose_api_key(iban_display_value: str) -> Optional[str]:
-    """
-    Choisit la clé PayPlug selon l'IBAN (en mode live ou test).
-    Si aucun IBAN ne matche, on tente la clé 'AUTRE_IBAN' si elle existe.
-    """
     keymap = settings.PAYPLUG_KEYS_LIVE if settings.PAYPLUG_MODE == "live" else settings.PAYPLUG_KEYS_TEST
     if not iban_display_value:
         return keymap.get("AUTRE_IBAN")
-    k = " ".join(iban_display_value.split())  # normalise espaces
+    k = " ".join(iban_display_value.split())  # normaliser espaces
     return keymap.get(k) or keymap.get("AUTRE_IBAN")
 
 
 def cents_from_str(s: str | None) -> int:
     if not s:
         return 0
-    s = s.replace("€", "").replace(" ", "").replace(",", ".")
+    s = s.replace("€", "").replace(" ", "").replace("\u00a0", "").replace(",", ".")
     try:
         return int(round(float(s) * 100))
     except Exception:
         return 0
 
 
-def _configure_payplug(api_key: str):
-    """
-    Rendre la config compatible avec plusieurs versions du SDK PayPlug:
-    - payplug.set_secret_key(secret)  <-- le message d'erreur a montré que c'est ton cas
-    - payplug.configure(secret)
-    - payplug.set_api_key(secret)
-    - payplug.configuration = payplug.Configuration(secret_key=secret)
-    - payplug.config = {'secret_key': secret}
-    Retourne le module payplug configuré.
-    """
-    try:
-        import payplug  # import tardif
-    except Exception as e:
-        raise RuntimeError(f"PayPlug non installé ou import impossible: {e}")
-
-    try:
-        if hasattr(payplug, "set_secret_key"):
-            payplug.set_secret_key(api_key)  # type: ignore[attr-defined]
-            return payplug
-
-        if hasattr(payplug, "configure"):
-            payplug.configure(api_key)  # type: ignore[attr-defined]
-            return payplug
-
-        if hasattr(payplug, "set_api_key"):
-            payplug.set_api_key(api_key)  # type: ignore[attr-defined]
-            return payplug
-
-        if hasattr(payplug, "Configuration"):
-            payplug.configuration = payplug.Configuration(secret_key=api_key)  # type: ignore[attr-defined]
-            return payplug
-
-        if hasattr(payplug, "config"):
-            payplug.config = {"secret_key": api_key}  # type: ignore[attr-defined]
-            return payplug
-
-        raise RuntimeError("Aucune méthode de configuration PayPlug compatible trouvée.")
-    except Exception as e:
-        raise RuntimeError(f"Erreur configuration PayPlug: {e}")
-
-
 def create_payment(amount_cents: int, description: str, return_url: str, iban_display_value: str) -> dict:
     api_key = _choose_api_key(iban_display_value)
     if not api_key:
-        mode = settings.PAYPLUG_MODE
-        raise RuntimeError(
-            f"Aucune clé PayPlug correspondante. Mode={mode}. IBAN lu='{iban_display_value}'. "
-            "Ajoute l'IBAN exact dans PAYPLUG_KEYS_*_JSON ou fournis 'AUTRE_IBAN' par défaut."
-        )
+        raise RuntimeError("Aucune clé PayPlug correspondante à l'IBAN sélectionné.")
+    payplug.set_secret_key(api_key)
 
-    payplug = _configure_payplug(api_key)
-    desc = (description or "Acompte")[:255]
-
-    Payment = getattr(payplug, "Payment", None)
-    if Payment is None or not hasattr(Payment, "create"):
-        raise RuntimeError("SDK PayPlug inattendu: 'Payment.create' est introuvable.")
-
-    # Construire la payload sans notification_url si vide
-    data = {
-        "amount": amount_cents,
-        "currency": "EUR",
-        "hosted_payment": {"return_url": return_url},
-        "save_card": False,
-        "metadata": {"brand": settings.BRAND_NAME, "iban": iban_display_value, "mode": settings.PAYPLUG_MODE},
-        "description": desc,
-    }
-
-    notify_url = settings.PAYPLUG_NOTIFICATION_URL
-    if notify_url and (notify_url.startswith("http://") or notify_url.startswith("https://")):
-        data["notification_url"] = notify_url  # uniquement si valide
-
-    payment = Payment.create(**data)
-
-    payment_id = getattr(payment, "id", None) or getattr(payment, "payment_id", None)
-    hosted = getattr(payment, "hosted_payment", None)
-    url = None
-    if hosted and hasattr(hosted, "payment_url"):
-        url = hosted.payment_url
-    elif isinstance(payment, dict):
-        url = payment.get("hosted_payment", {}).get("payment_url")
-        payment_id = payment.get("id", payment_id)
-    if not url:
-        url = getattr(payment, "payment_url", None)
-
-    status = getattr(payment, "status", None) or (payment.get("status") if isinstance(payment, dict) else None)
-
-    return {"id": payment_id, "url": url, "status": status}
+    payment = payplug.Payment.create(
+        amount=amount_cents,
+        currency='EUR',
+        hosted_payment={'return_url': return_url},
+        notification_url=None,
+        save_card=False,
+        metadata={"brand": settings.BRAND_NAME, "iban": iban_display_value, "mode": settings.PAYPLUG_MODE},
+        description=(description or "Acompte")[:255],
+    )
+    return {"id": payment.id, "url": payment.hosted_payment.payment_url, "status": payment.status}
