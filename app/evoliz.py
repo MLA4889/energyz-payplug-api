@@ -37,17 +37,21 @@ def create_quote(token, client_id, quote_data):
     headers = {"Authorization": f"Bearer {token}"}
     payload = {
         "clientid": client_id,
-        "lines": [
+        "doctype": "quote",
+        "rows": [
             {
                 "designation": quote_data["description"],
-                "unit_price": quote_data["amount_ht"],
-                "quantity": 1
+                "quantity": 1,
+                "unit_price": quote_data["amount_ht"]
             }
         ],
         "currency": "EUR"
     }
-    r = requests.post(
-        f"{settings.EVOLIZ_BASE_URL}/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes",
-        headers=headers, json=payload)
+    url = f"{settings.EVOLIZ_BASE_URL}/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes"
+    r = requests.post(url, headers=headers, json=payload)
+    print("📤 Payload Evoliz:", payload)
+    print("🌍 URL:", url)
+    print("🔑 Token:", token[:10], "...")
+    print("📦 Response:", r.text)
     r.raise_for_status()
     return r.json()
