@@ -4,10 +4,7 @@ from .config import settings
 
 
 def get_access_token():
-    payload = {
-        "public_key": settings.EVOLIZ_PUBLIC_KEY,
-        "secret_key": settings.EVOLIZ_SECRET_KEY
-    }
+    payload = {"public_key": settings.EVOLIZ_PUBLIC_KEY, "secret_key": settings.EVOLIZ_SECRET_KEY}
     r = requests.post(f"{settings.EVOLIZ_BASE_URL}/api/login", json=payload, timeout=30)
     r.raise_for_status()
     token = r.json().get("access_token")
@@ -40,7 +37,7 @@ def create_client_if_needed(token, client_data: dict):
             "postcode": client_data.get("postcode", ""),
             "town": client_data.get("city", ""),
             "iso2": "FR",
-        }
+        },
     }
     if client_data.get("client_type") == "Professionnel" and client_data.get("vat_number"):
         payload["vat_number"] = client_data["vat_number"]
@@ -60,15 +57,10 @@ def create_quote(token, client_id, quote_data: dict):
     payload = {
         "clientid": client_id,
         "lines": [
-            {
-                "designation": quote_data["description"],
-                "unit_price": quote_data["amount_ht"],
-                "quantity": 1,
-                "vat": vat_rate,
-            }
+            {"designation": quote_data["description"], "unit_price": quote_data["amount_ht"], "quantity": 1, "vat": vat_rate}
         ],
         "currency": "EUR",
-        "prices_include_vat": False
+        "prices_include_vat": False,
     }
     r = requests.post(
         f"{settings.EVOLIZ_BASE_URL}/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes",
@@ -90,15 +82,10 @@ def create_invoice(token, client_id, invoice_data: dict):
         "documentdate": documentdate,
         "term": {"paytermid": paytermid},
         "lines": [
-            {
-                "designation": invoice_data["description"],
-                "unit_price": invoice_data["amount_ht"],
-                "quantity": 1,
-                "vat": vat_rate,
-            }
+            {"designation": invoice_data["description"], "unit_price": invoice_data["amount_ht"], "quantity": 1, "vat": vat_rate}
         ],
         "currency": "EUR",
-        "prices_include_vat": False
+        "prices_include_vat": False,
     }
     r = requests.post(
         f"{settings.EVOLIZ_BASE_URL}/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/invoices",
