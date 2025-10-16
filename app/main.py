@@ -1,32 +1,27 @@
-from __future__ import annotations
+from fastapi import FastAPI, HTTPException, Request, Query
+from fastapi.responses import JSONResponse
+from typing import Any, Optional
 
-from datetime import date
-from typing import Any, Dict, Optional
-
-from fastapi import Body, FastAPI, HTTPException, Request
-import requests
+import payplug
 
 from .config import settings
 from .monday import (
     get_item_columns,
-    get_formula_display_value,
+    extract_display_number,
+    extract_display_text,
+    get_status_label,
     set_link_in_column,
     set_status,
-    extract_address_fields,
-    upload_file_to_files_column,
-    get_iban_via_formula_or_status,
-    get_amount_from_formula_or_mapping,
+    upload_file_to_column,
 )
-from .payments import create_payment, cents_from_str
-from .evoliz import get_access_token, create_client_if_needed, create_quote, create_invoice
-
-app = FastAPI(title=f"{settings.BRAND_NAME} PayPlug & Evoliz API")
+from .payments import _choose_api_key, cents_from_str, create_payment, normalize_iban
+from .evoliz import get_access_token, create_client_if_needed, create_quote, create_invoice, fetch_pdf
 
 
-def _target_files_col() -> str:
-    return settings.DOC_FILES_COLUMN_ID or settings.INVOICE_FILES_COLUMN_ID or settings.QUOTE_FILES_COLUMN_ID
+app = FastAPI(title=f"{settings.BRAND_NAME} PayPlug/Evoliz Bridge")
 
 
+# --- Health checks ---
 @app.get("/")
 def root():
     return {"status": "ok", "brand": settings.BRAND_NAME}
@@ -37,265 +32,318 @@ def health():
     return {
         "status": "ok",
         "brand": settings.BRAND_NAME,
-        "board": settings.MONDAY_BOARD_ID,
         "payplug_mode": settings.PAYPLUG_MODE,
-        "files_col": _target_files_col(),
-        "evoliz_company": settings.EVOLIZ_COMPANY_ID,
+        "board_id": settings.MONDAY_BOARD_ID,
+        "public_base_url": settings.PUBLIC_BASE_URL
     }
 
 
+# --- Helpers lecture Monday item ---
+def _read_common_from_monday(item_id: int) -> dict:
+    cols = get_item_columns(item_id)
+
+    business_label = get_status_label(cols, settings.BUSINESS_STATUS_COLUMN_ID) or ""
+    name = cols.get("name", {}).get("text") or f"Item {item_id}"
+
+    # Adresse
+    address_text = extract_display_text(cols.get(settings.ADDRESS_COLUMN_ID)) or ""
+
+    # Description presta
+    description = extract_display_text(cols.get(settings.DESCRIPTION_COLUMN_ID)) or name
+
+    # TVA (nombre), fallback DEFAULT_VAT_RATE
+    vat_rate = extract_display_number(cols.get(settings.VAT_RATE_COLUMN_ID))
+    vat_rate = float(vat_rate) if vat_rate is not None else float(settings.DEFAULT_VAT_RATE)
+
+    # Client type
+    client_type = get_status_label(cols, settings.CLIENT_TYPE_COLUMN_ID) or "Particulier"
+    vat_number = extract_display_text(cols.get(settings.VAT_NUMBER_COLUMN_ID)) or ""
+
+    # Total HT pour devis
+    total_ht = extract_display_number(cols.get(settings.QUOTE_AMOUNT_FORMULA_ID)) or 0.0
+
+    # IBAN via formula puis fallback statut
+    iban_formula_text = extract_display_text(cols.get(settings.IBAN_FORMULA_COLUMN_ID))
+    iban = iban_formula_text or settings.PAYPLUG_IBAN_BY_STATUS.get(business_label, "")
+    iban = normalize_iban(iban) or ""
+
+    return {
+        "cols": cols,
+        "business_label": business_label,
+        "name": name,
+        "address": address_text,
+        "description": description,
+        "vat_rate": vat_rate,
+        "client_type": client_type,
+        "vat_number": vat_number,
+        "total_ht": float(total_ht),
+        "iban": iban,
+    }
+
+
+def _read_acompte_amount(n: str, cols: dict, business_label: str) -> float:
+    """
+    1) essaie la colonne formula correspondante
+    2) sinon fallback via ACOMPTE_AMOUNTS_JSON
+    """
+    col_id = settings.FORMULA_COLUMN_IDS.get(str(n))
+    amt = None
+    if col_id:
+        amt = extract_display_number(cols.get(col_id))
+    if amt is None:
+        # fallback
+        fallback_map = settings.ACOMPTE_AMOUNTS.get(str(n), {})
+        val = fallback_map.get(business_label)
+        if val is not None:
+            amt = float(val)
+    return float(amt or 0.0)
+
+
+# --- Debug: Evoliz ---
 @app.get("/debug/evoliz/login")
 def debug_evoliz_login():
-    token = get_access_token()
-    return {"status": "ok", "token_preview": token[:12] + "..."}
+    try:
+        token = get_access_token()
+        return {"status": "ok", "token_preview": (token[:6] + "..." if token else "")}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
+# --- Debug: quote preview ---
 @app.get("/debug/quote/preview/{item_id}")
 def debug_quote_preview(item_id: int):
-    info = get_item_columns(item_id)
-    cols = info["columns"]
-
-    amount_ht_txt = cols.get(settings.QUOTE_AMOUNT_FORMULA_ID, {}).get("text") or "0"
-    vat_rate_txt = cols.get(settings.VAT_RATE_COLUMN_ID, {}).get("text") or str(settings.DEFAULT_VAT_RATE)
-    desc = (settings.DESCRIPTION_COLUMN_ID and get_formula_display_value(cols, settings.DESCRIPTION_COLUMN_ID)) or info["name"]
-    vat_number = cols.get(settings.VAT_NUMBER_COLUMN_ID, {}).get("text") if settings.VAT_NUMBER_COLUMN_ID else None
-
+    info = _read_common_from_monday(item_id)
     return {
         "item_id": item_id,
-        "name": info["name"],
-        "description": desc,
-        "amount_ht_text": amount_ht_txt,
-        "vat_rate_text": vat_rate_txt,
-        "vat_number": vat_number,
-        "address": extract_address_fields(cols),
+        "business": info["business_label"],
+        "iban": info["iban"],
+        "description": info["description"],
+        "vat_rate": info["vat_rate"],
+        "client_type": info["client_type"],
+        "vat_number": info["vat_number"],
+        "total_ht": info["total_ht"],
     }
 
 
-# -------- PayPlug (acompte) --------
-@app.api_route("/pay/acompte/{n}", methods=["GET", "POST"])
-async def pay_acompte(n: int, item_id: Optional[int] = None, request: Request = None):
-    if request and request.method == "POST":
-        try:
-            payload = await request.json()
-            item_id = item_id or int(payload["event"]["pulseId"])
-        except Exception:
-            pass
-    if not item_id:
-        raise HTTPException(400, "item_id manquant")
-
-    info = get_item_columns(item_id)
-    cols = info["columns"]
-
-    # Montant HT (fallback mapping si formula vide)
-    formula_col_id = settings.FORMULA_COLUMN_IDS.get(str(n), "")
-    amount_ht = get_amount_from_formula_or_mapping(cols, formula_col_id, n)
-    if amount_ht <= 0:
-        raise HTTPException(
-            400,
-            f"Montant d'acompte {n} invalide pour l'item {item_id} (valeur lue='{amount_ht}'). "
-            f"Renseigne une formule valide OU configure ACOMPTE_AMOUNTS_JSON."
-        )
-
-    # IBAN via formula ou mapping statut
-    iban_txt = get_iban_via_formula_or_status(cols)
-    if not iban_txt:
-        raise HTTPException(
-            400,
-            "IBAN introuvable (formula vide ET mapping par statut non défini). "
-            "Complète IBAN_FORMULA_COLUMN_ID ou PAYPLUG_IBAN_BY_STATUS_JSON."
-        )
-
-    amount_cents = int(round(amount_ht * 100))
-    desc = (settings.DESCRIPTION_COLUMN_ID and get_formula_display_value(cols, settings.DESCRIPTION_COLUMN_ID)) or info["name"]
-
-    pay = create_payment(amount_cents, f"Acompte {n} – {desc}", f"{settings.PUBLIC_BASE_URL}/", iban_txt)
-
-    link_col = settings.LINK_COLUMN_IDS.get(str(n))
-    if link_col:
-        set_link_in_column(item_id, link_col, pay["url"], f"Payer acompte {n}")
-
-    return {"status": "ok", "payment": pay}
-
-
-# -------- Helpers --------
-def _read_vat_rate(cols: Dict[str, Any]) -> float:
-    txt = cols.get(settings.VAT_RATE_COLUMN_ID, {}).get("text") if settings.VAT_RATE_COLUMN_ID else None
-    if not txt:
-        return settings.DEFAULT_VAT_RATE
-    try:
-        return float(str(txt).replace(",", "."))
-    except Exception:
-        return settings.DEFAULT_VAT_RATE
-
-
-def _download_evoliz_pdf(token: str, kind: str, document_id: int) -> Optional[bytes]:
-    try:
-        url = f"{settings.EVOLIZ_BASE_URL}/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/{kind}/{document_id}/pdf"
-        r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=60)
-        r.raise_for_status()
-        if r.headers.get("content-type", "").lower().startswith("application/pdf"):
-            return r.content
-    except Exception:
-        pass
-    return None
-
-
-# -------- Devis --------
-@app.post("/quote/from_monday")
-async def quote_from_monday_webhook(payload: dict = Body(...)):
-    try:
-        item_id = int(payload["event"]["pulseId"])
-    except Exception:
-        raise HTTPException(400, "payload sans item_id")
-
-    label = payload.get("event", {}).get("value")
-    if label != settings.QUOTE_TRIGGER_LABEL:
-        return {"status": "ignored", "reason": f"label != {settings.QUOTE_TRIGGER_LABEL}"}
-
-    info = get_item_columns(item_id)
-    cols = info["columns"]
-
-    amount_txt = cols.get(settings.QUOTE_AMOUNT_FORMULA_ID, {}).get("text") or "0"
-    amount_ht = round(cents_from_str(amount_txt) / 100.0, 2)
-    vat_rate = _read_vat_rate(cols)
-    desc = (settings.DESCRIPTION_COLUMN_ID and get_formula_display_value(cols, settings.DESCRIPTION_COLUMN_ID)) or info["name"]
-
-    vat_number = cols.get(settings.VAT_NUMBER_COLUMN_ID, {}).get("text") if settings.VAT_NUMBER_COLUMN_ID else None
-    client_type = cols.get(settings.CLIENT_TYPE_COLUMN_ID, {}).get("text") if settings.CLIENT_TYPE_COLUMN_ID else None
-    addr = extract_address_fields(cols)
-
-    token = get_access_token()
-    client_id = create_client_if_needed(token, {
-        "name": info["name"], "client_type": client_type or "", "vat_number": vat_number or "", **addr
-    })
-    q = create_quote(token, client_id, {"description": desc, "amount_ht": amount_ht, "vat_rate": vat_rate})
-    quote_id = q.get("documentid") or q.get("quoteid") or q.get("id")
-    web_url = q.get("url") or q.get("portal_url") or ""
-
-    if web_url and settings.QUOTE_LINK_COLUMN_ID:
-        set_link_in_column(item_id, settings.QUOTE_LINK_COLUMN_ID, web_url, "Devis")
-
-    pdf = quote_id and _download_evoliz_pdf(token, "quotes", int(quote_id))
-    files_col = _target_files_col()
-    if pdf and files_col:
-        upload_file_to_files_column(item_id, files_col, f"Devis_{quote_id}.pdf", pdf)
-
-    if settings.QUOTE_STATUS_COLUMN_ID and settings.QUOTE_STATUS_AFTER_CREATE:
-        set_status(item_id, settings.QUOTE_STATUS_COLUMN_ID, settings.QUOTE_STATUS_AFTER_CREATE)
-
-    return {"status": "ok", "quote": {"id": quote_id, "url": web_url}}
-
-
-# -------- Factures --------
-def _compute_invoice_amount(cols: Dict[str, Any], kind: str) -> float:
-    total_txt = cols.get(settings.QUOTE_AMOUNT_FORMULA_ID, {}).get("text") or "0"
-    ac1_txt = settings.FORMULA_COLUMN_IDS.get("1") and get_formula_display_value(cols, settings.FORMULA_COLUMN_IDS["1"]) or ""
-    ac2_txt = settings.FORMULA_COLUMN_IDS.get("2") and get_formula_display_value(cols, settings.FORMULA_COLUMN_IDS["2"]) or ""
-    total = cents_from_str(total_txt) / 100.0
-
-    # si Monday ne renvoie rien, fallback mapping
-    if not ac1_txt:
-        ac1 = settings.ACOMPTE_AMOUNTS.get("1", {}).get(
-            cols.get(settings.BUSINESS_STATUS_COLUMN_ID, {}).get("text", ""), 0
-        )
-    else:
-        ac1 = cents_from_str(ac1_txt) / 100.0
-
-    if not ac2_txt:
-        ac2 = settings.ACOMPTE_AMOUNTS.get("2", {}).get(
-            cols.get(settings.BUSINESS_STATUS_COLUMN_ID, {}).get("text", ""), 0
-        )
-    else:
-        ac2 = cents_from_str(ac2_txt) / 100.0
-
-    if kind == "ac1":
-        return round(float(ac1), 2)
-    if kind == "ac2":
-        return round(float(ac2), 2)
-    return round(max(total - ac1 - ac2, 0.0), 2)
-
-
-def _label_to_kind(label: str) -> Optional[str]:
-    if label == settings.INVOICE_LABEL_ACOMPTE1: return "ac1"
-    if label == settings.INVOICE_LABEL_ACOMPTE2: return "ac2"
-    if label == settings.INVOICE_LABEL_SOLDE:    return "solde"
-    return None
-
-
-def _invoice_link_column_id(kind: str) -> Optional[str]:
-    if kind == "ac1": return settings.INVOICE_LINK_AC1_COLUMN_ID or None
-    if kind == "ac2": return settings.INVOICE_LINK_AC2_COLUMN_ID or None
-    if kind == "solde": return settings.INVOICE_LINK_FINAL_COLUMN_ID or None
-    return None
-
-
-@app.post("/invoice/from_monday")
-async def invoice_from_monday(payload: dict = Body(...)):
-    try:
-        item_id = int(payload["event"]["pulseId"])
-    except Exception:
-        raise HTTPException(400, "payload sans item_id")
-
-    label = payload.get("event", {}).get("value", "")
-    kind = _label_to_kind(label)
-    if not kind:
-        return {"status": "ignored", "reason": f"label {label} non géré"}
-
-    info = get_item_columns(item_id)
-    cols = info["columns"]
-
-    amount_ht = _compute_invoice_amount(cols, kind)
-    if amount_ht <= 0:
-        raise HTTPException(400, f"Montant HT nul pour {kind}")
-
-    vat_rate = _read_vat_rate(cols)
-    desc = (settings.DESCRIPTION_COLUMN_ID and get_formula_display_value(cols, settings.DESCRIPTION_COLUMN_ID)) or info["name"]
-
-    vat_number = cols.get(settings.VAT_NUMBER_COLUMN_ID, {}).get("text") if settings.VAT_NUMBER_COLUMN_ID else None
-    client_type = cols.get(settings.CLIENT_TYPE_COLUMN_ID, {}).get("text") if settings.CLIENT_TYPE_COLUMN_ID else None
-    addr = extract_address_fields(cols)
-
-    token = get_access_token()
-    client_id = create_client_if_needed(token, {
-        "name": info["name"], "client_type": client_type or "", "vat_number": vat_number or "", **addr
-    })
-
-    inv = create_invoice(token, client_id, {
-        "description": f"{desc} – {'Acompte 1' if kind=='ac1' else 'Acompte 2' if kind=='ac2' else 'Solde'}",
-        "amount_ht": amount_ht,
-        "vat_rate": vat_rate,
-        "paytermid": settings.EVOLIZ_PAYTERM_ID,
-        "documentdate": date.today().isoformat(),
-    })
-    invoice_id = inv.get("documentid") or inv.get("invoiceid") or inv.get("id")
-    web_url = inv.get("url") or inv.get("portal_url") or ""
-
-    link_col = _invoice_link_column_id(kind)
-    if link_col and web_url:
-        set_link_in_column(item_id, link_col, web_url, f"Facture {kind}")
-
-    pdf = invoice_id and _download_evoliz_pdf(token, "invoices", int(invoice_id))
-    files_col = _target_files_col()
-    if pdf and files_col:
-        upload_file_to_files_column(item_id, files_col, f"Facture_{invoice_id}.pdf", pdf)
-
-    return {"status": "ok", "invoice": {"id": invoice_id, "url": web_url, "kind": kind}}
-
-
-# --- DEBUG PAYPLUG ---
+# --- Debug: PayPlug ---
 @app.get("/debug/payplug/{item_id}")
 def debug_payplug(item_id: int):
-    info = get_item_columns(item_id)
-    cols = info["columns"]
-    iban_formula = ""
-    if settings.IBAN_FORMULA_COLUMN_ID:
-        iban_formula = cols.get(settings.IBAN_FORMULA_COLUMN_ID, {}).get("text") or ""
-    iban_status = cols.get(settings.BUSINESS_STATUS_COLUMN_ID, {}).get("text") or ""
+    info = _read_common_from_monday(item_id)
+    key = _choose_api_key(info["iban"])
     return {
         "item_id": item_id,
-        "iban_raw": get_iban_via_formula_or_status(cols),
-        "iban_formula": iban_formula,
-        "iban_from_status": iban_status and settings.PAYPLUG_IBAN_BY_STATUS.get(iban_status, ""),
+        "business": info["business_label"],
+        "iban_raw": info["iban"],
         "mode": settings.PAYPLUG_MODE,
-        "keys_available": list((settings.PAYPLUG_KEYS_LIVE if settings.PAYPLUG_MODE=='live' else settings.PAYPLUG_KEYS_TEST).keys()),
+        "keys_available": {
+            "test_has_any": bool(settings.PAYPLUG_KEYS_TEST),
+            "live_has_any": bool(settings.PAYPLUG_KEYS_LIVE),
+        },
+        "selected_key_is_set": bool(key),
     }
+
+
+# --- PayPlug: lien acompte ---
+@app.api_route("/pay/acompte/{n}", methods=["GET", "POST"])
+def pay_acompte(n: int, item_id: int = Query(..., description="Monday item_id")):
+    if str(n) not in settings.FORMULA_COLUMN_IDS and str(n) not in settings.ACOMPTE_AMOUNTS:
+        raise HTTPException(status_code=400, detail=f"Acompte {n} non configuré")
+
+    info = _read_common_from_monday(item_id)
+
+    # IBAN -> clé PayPlug (ou fallback via statut)
+    api_key = _choose_api_key(info["iban"])
+    if not api_key:
+        raise HTTPException(status_code=400, detail="Aucune clé PayPlug correspondante à l'IBAN sélectionné")
+
+    payplug.set_secret_key(api_key)
+
+    # Montant acompte
+    amount_ht = _read_acompte_amount(str(n), info["cols"], info["business_label"])
+    if amount_ht <= 0:
+        raise HTTPException(status_code=400, detail=f"Montant d'acompte {n} invalide (valeur lue '{amount_ht}')")
+
+    amount_cents = cents_from_str(amount_ht)
+    return_url = f"{settings.PUBLIC_BASE_URL}/pay/return?item_id={item_id}&n={n}"
+    description = f"{settings.BRAND_NAME} - Acompte {n} - {info['name']}"
+
+    try:
+        payment = create_payment(amount_cents, description, return_url)
+    except payplug.exceptions.SecretKeyNotSet:
+        raise HTTPException(status_code=500, detail="payplug.exceptions.SecretKeyNotSet")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # Ecrit le lien dans la colonne adéquate si configurée
+    link_col = settings.LINK_COLUMN_IDS.get(str(n), "")
+    if link_col:
+        try:
+            set_link_in_column(item_id, link_col, payment.hosted_payment.payment_url, f"Lien acompte {n}")
+        except Exception:
+            pass
+
+    # Option: statut après paiement (à gérer via webhook PayPlug si tu veux l'automatiser)
+    return {"status": "ok", "payment": {"url": payment.hosted_payment.payment_url}}
+
+
+# --- Webhook: Générer devis ---
+@app.post("/quote/from_monday")
+def quote_from_monday(req: Request):
+    payload = {}
+    try:
+        payload = req.json() if hasattr(req, "json") else {}
+    except Exception:
+        payload = {}
+
+    # Monday envoie {event: {pulseId: "...", columnId: "...", value: "...", ...}}
+    body = payload or {}
+    event = body.get("event", {})
+    item_id = int(event.get("pulseId") or event.get("itemId") or 0)
+    if not item_id:
+        # Permet d'appeler manuellement sans webhook: ?item_id=...
+        item_id = int(req.query_params.get("item_id", "0"))
+    if not item_id:
+        raise HTTPException(status_code=400, detail="item_id manquant")
+
+    info = _read_common_from_monday(item_id)
+
+    # Vérifie que le label correspond bien au trigger
+    label = get_status_label(info["cols"], settings.QUOTE_STATUS_COLUMN_ID) or ""
+    if settings.QUOTE_TRIGGER_LABEL and label != settings.QUOTE_TRIGGER_LABEL:
+        # on ne bloque pas, mais on informe
+        pass
+
+    # Evoliz
+    try:
+        token = get_access_token()
+        client_id = create_client_if_needed(token, {
+            "name": info["name"],
+            "client_type": info["client_type"],
+            "address": info["address"],
+            "postcode": "",  # optionnel si colonnes spécifiques pas remplies
+            "city": "",
+            "vat_number": info["vat_number"],
+        })
+        qdata = create_quote(token, client_id, {
+            "description": info["description"],
+            "amount_ht": info["total_ht"],
+            "vat_rate": info["vat_rate"],
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Evoliz: {e}")
+
+    # Lien document (webdoc) si présent dans la réponse
+    # Selon Evoliz, on peut avoir "web" ou il faut composer l'URL. Par sécurité, on set au moins un lien interne.
+    quote_id = int(qdata.get("quoteid") or qdata.get("id") or 0)
+    quote_url = qdata.get("url") or qdata.get("public_link") or ""
+    if not quote_url:
+        quote_url = f"https://app.evoliz.com/companies/{settings.EVOLIZ_COMPANY_ID}/quotes/{quote_id}"
+
+    # Ecrit lien + status
+    try:
+        set_link_in_column(item_id, settings.QUOTE_LINK_COLUMN_ID, quote_url, "Devis Evoliz")
+    except Exception:
+        pass
+
+    if settings.QUOTE_STATUS_AFTER_CREATE:
+        try:
+            set_status(item_id, settings.QUOTE_STATUS_COLUMN_ID, settings.QUOTE_STATUS_AFTER_CREATE)
+        except Exception:
+            pass
+
+    # Upload PDF si dispo
+    try:
+        pdf = fetch_pdf(token, "quotes", quote_id)
+        if pdf:
+            content, filename = pdf
+            upload_file_to_column(item_id, settings.QUOTE_FILES_COLUMN_ID, filename, content)
+    except Exception:
+        pass
+
+    return {"status": "ok", "quote_id": quote_id, "url": quote_url}
+
+
+# --- Webhook: Facturer (acompte 1/2/solde) ---
+@app.post("/invoice/from_monday")
+def invoice_from_monday(req: Request):
+    payload = {}
+    try:
+        payload = req.json() if hasattr(req, "json") else {}
+    except Exception:
+        payload = {}
+
+    body = payload or {}
+    event = body.get("event", {})
+    item_id = int(event.get("pulseId") or event.get("itemId") or 0)
+    if not item_id:
+        item_id = int(req.query_params.get("item_id", "0"))
+    if not item_id:
+        raise HTTPException(status_code=400, detail="item_id manquant")
+
+    info = _read_common_from_monday(item_id)
+    label = get_status_label(info["cols"], settings.QUOTE_STATUS_COLUMN_ID) or ""
+
+    # Détermine le type de facture demandé
+    inv_type = None
+    if label == settings.INVOICE_LABEL_ACOMPTE1:
+        inv_type = "AC1"
+        amt_ht = _read_acompte_amount("1", info["cols"], info["business_label"])
+        link_col = settings.INVOICE_LINK_AC1_COLUMN_ID
+    elif label == settings.INVOICE_LABEL_ACOMPTE2:
+        inv_type = "AC2"
+        amt_ht = _read_acompte_amount("2", info["cols"], info["business_label"])
+        link_col = settings.INVOICE_LINK_AC2_COLUMN_ID
+    elif label == settings.INVOICE_LABEL_SOLDE:
+        inv_type = "SOLDE"
+        ac1 = _read_acompte_amount("1", info["cols"], info["business_label"])
+        ac2 = _read_acompte_amount("2", info["cols"], info["business_label"])
+        amt_ht = max(info["total_ht"] - ac1 - ac2, 0.0)
+        link_col = settings.INVOICE_LINK_FINAL_COLUMN_ID
+    else:
+        raise HTTPException(status_code=400, detail=f"Label de statut inattendu: {label}")
+
+    if amt_ht <= 0:
+        raise HTTPException(status_code=400, detail=f"Montant HT invalide pour {inv_type}: {amt_ht}")
+
+    # Evoliz
+    try:
+        token = get_access_token()
+        client_id = create_client_if_needed(token, {
+            "name": info["name"],
+            "client_type": info["client_type"],
+            "address": info["address"],
+            "postcode": "",
+            "city": "",
+            "vat_number": info["vat_number"],
+        })
+        idata = create_invoice(token, client_id, {
+            "description": f"{info['description']} - {inv_type}",
+            "amount_ht": amt_ht,
+            "vat_rate": info["vat_rate"],
+            "paytermid": settings.EVOLIZ_PAYTERM_ID,
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Evoliz: {e}")
+
+    invoice_id = int(idata.get("invoiceid") or idata.get("id") or 0)
+    invoice_url = idata.get("url") or idata.get("public_link") or ""
+    if not invoice_url:
+        invoice_url = f"https://app.evoliz.com/companies/{settings.EVOLIZ_COMPANY_ID}/invoices/{invoice_id}"
+
+    # Ecrit lien + upload PDF
+    try:
+        if link_col:
+            set_link_in_column(item_id, link_col, invoice_url, f"Facture {inv_type}")
+    except Exception:
+        pass
+
+    try:
+        pdf = fetch_pdf(token, "invoices", invoice_id)
+        if pdf:
+            content, filename = pdf
+            files_col = settings.INVOICE_FILES_COLUMN_ID or settings.QUOTE_FILES_COLUMN_ID
+            upload_file_to_column(item_id, files_col, filename, content)
+    except Exception:
+        pass
+
+    return {"status": "ok", "invoice_id": invoice_id, "url": invoice_url}
