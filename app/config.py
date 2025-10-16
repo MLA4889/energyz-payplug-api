@@ -23,6 +23,8 @@ class Settings(BaseModel):
     STATUS_AFTER_PAY: dict = _loads_env_json("STATUS_AFTER_PAY_JSON", {})
     STATUS_COLUMN_ID: str = os.getenv("STATUS_COLUMN_ID", "")
     IBAN_FORMULA_COLUMN_ID: str = os.getenv("IBAN_FORMULA_COLUMN_ID", "")
+    BUSINESS_STATUS_COLUMN_ID: str = os.getenv("BUSINESS_STATUS_COLUMN_ID", "")  # ex: color_mkwnxf1h
+    BUSINESS_TO_IBAN: dict = _loads_env_json("BUSINESS_TO_IBAN_JSON", {})  # {"Energyz MAR":"FR76 ...", ...}
 
     # ===== Devis depuis Monday =====
     CLIENT_TYPE_COLUMN_ID: str = os.getenv("CLIENT_TYPE_COLUMN_ID", "")
@@ -30,9 +32,8 @@ class Settings(BaseModel):
     QUOTE_AMOUNT_FORMULA_ID: str = os.getenv("QUOTE_AMOUNT_FORMULA_ID", "")
     QUOTE_LINK_COLUMN_ID: str = os.getenv("QUOTE_LINK_COLUMN_ID", "")
 
-    # Colonne Files unique (optionnelle)
+    # Une seule colonne Files pour tout (optionnelle)
     DOC_FILES_COLUMN_ID: str = os.getenv("DOC_FILES_COLUMN_ID", "")
-    # Backward compat si tu veux séparer
     QUOTE_FILES_COLUMN_ID: str = os.getenv("QUOTE_FILES_COLUMN_ID", "")
     INVOICE_FILES_COLUMN_ID: str = os.getenv("INVOICE_FILES_COLUMN_ID", "")
 
