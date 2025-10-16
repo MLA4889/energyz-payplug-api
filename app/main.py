@@ -9,12 +9,13 @@ import requests
 from .config import settings
 from .monday import (
     get_item_columns,
-    get_formula_text,
-    get_formula_number,
+    get_formula_display_value,
     set_link_in_column,
     set_status,
     extract_address_fields,
     upload_file_to_files_column,
+    get_iban_via_formula_or_status,
+    get_amount_from_formula_or_mapping,
 )
 from .payments import create_payment, cents_from_str
 from .evoliz import get_access_token, create_client_if_needed, create_quote, create_invoice
@@ -24,43 +25,6 @@ app = FastAPI(title=f"{settings.BRAND_NAME} PayPlug & Evoliz API")
 
 def _target_files_col() -> str:
     return settings.DOC_FILES_COLUMN_ID or settings.INVOICE_FILES_COLUMN_ID or settings.QUOTE_FILES_COLUMN_ID
-
-
-def _read_vat_rate(cols: Dict[str, Any]) -> float:
-    txt = ""
-    if settings.VAT_RATE_COLUMN_ID:
-        cv = cols.get(settings.VAT_RATE_COLUMN_ID)
-        if cv:
-            txt = (cv.get("text") or "").replace(",", ".")
-    try:
-        return float(txt) if txt else settings.DEFAULT_VAT_RATE
-    except Exception:
-        return settings.DEFAULT_VAT_RATE
-
-
-def _download_evoliz_pdf(token: str, kind: str, document_id: int) -> Optional[bytes]:
-    try:
-        url = f"{settings.EVOLIZ_BASE_URL}/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/{kind}/{document_id}/pdf"
-        r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=60)
-        r.raise_for_status()
-        if r.headers.get("content-type", "").lower().startswith("application/pdf"):
-            return r.content
-    except Exception:
-        pass
-    return None
-
-
-def _iban_for_item(cols: Dict[str, Any]) -> str:
-    # 1) priorité à la colonne formula IBAN
-    iban = get_formula_text(cols, settings.IBAN_FORMULA_COLUMN_ID) or ""
-    if iban:
-        return iban
-    # 2) fallback: mapping Business Line -> IBAN
-    if settings.BUSINESS_STATUS_COLUMN_ID and settings.BUSINESS_TO_IBAN:
-        label = (cols.get(settings.BUSINESS_STATUS_COLUMN_ID, {}).get("text") or "").strip()
-        if label and settings.BUSINESS_TO_IBAN.get(label):
-            return settings.BUSINESS_TO_IBAN[label]
-    return ""
 
 
 @app.get("/")
@@ -90,10 +54,12 @@ def debug_evoliz_login():
 def debug_quote_preview(item_id: int):
     info = get_item_columns(item_id)
     cols = info["columns"]
-    amount_ht_txt = (cols.get(settings.QUOTE_AMOUNT_FORMULA_ID, {}) or {}).get("text") or "0"
-    vat_rate_txt = (cols.get(settings.VAT_RATE_COLUMN_ID, {}) or {}).get("text") or str(settings.DEFAULT_VAT_RATE)
-    desc = (settings.DESCRIPTION_COLUMN_ID and get_formula_text(cols, settings.DESCRIPTION_COLUMN_ID)) or info["name"]
+
+    amount_ht_txt = cols.get(settings.QUOTE_AMOUNT_FORMULA_ID, {}).get("text") or "0"
+    vat_rate_txt = cols.get(settings.VAT_RATE_COLUMN_ID, {}).get("text") or str(settings.DEFAULT_VAT_RATE)
+    desc = (settings.DESCRIPTION_COLUMN_ID and get_formula_display_value(cols, settings.DESCRIPTION_COLUMN_ID)) or info["name"]
     vat_number = cols.get(settings.VAT_NUMBER_COLUMN_ID, {}).get("text") if settings.VAT_NUMBER_COLUMN_ID else None
+
     return {
         "item_id": item_id,
         "name": info["name"],
@@ -120,20 +86,27 @@ async def pay_acompte(n: int, item_id: Optional[int] = None, request: Request = 
     info = get_item_columns(item_id)
     cols = info["columns"]
 
-    formula_col_id = settings.FORMULA_COLUMN_IDS.get(str(n))
-    if not formula_col_id:
-        raise HTTPException(400, f"FORMULA_COLUMN_IDS n°{n} non configurée")
-
-    amount_float = get_formula_number(cols, formula_col_id)
-    amount_cents = int(round(amount_float * 100))
-    if amount_cents <= 0:
+    # Montant HT (fallback mapping si formula vide)
+    formula_col_id = settings.FORMULA_COLUMN_IDS.get(str(n), "")
+    amount_ht = get_amount_from_formula_or_mapping(cols, formula_col_id, n)
+    if amount_ht <= 0:
         raise HTTPException(
             400,
-            f"Montant d'acompte {n} invalide pour l'item {item_id} (valeur lue='{amount_float}'). Mets un nombre > 0 dans la colonne formule.",
+            f"Montant d'acompte {n} invalide pour l'item {item_id} (valeur lue='{amount_ht}'). "
+            f"Renseigne une formule valide OU configure ACOMPTE_AMOUNTS_JSON."
         )
 
-    desc = (settings.DESCRIPTION_COLUMN_ID and get_formula_text(cols, settings.DESCRIPTION_COLUMN_ID)) or info["name"]
-    iban_txt = _iban_for_item(cols)
+    # IBAN via formula ou mapping statut
+    iban_txt = get_iban_via_formula_or_status(cols)
+    if not iban_txt:
+        raise HTTPException(
+            400,
+            "IBAN introuvable (formula vide ET mapping par statut non défini). "
+            "Complète IBAN_FORMULA_COLUMN_ID ou PAYPLUG_IBAN_BY_STATUS_JSON."
+        )
+
+    amount_cents = int(round(amount_ht * 100))
+    desc = (settings.DESCRIPTION_COLUMN_ID and get_formula_display_value(cols, settings.DESCRIPTION_COLUMN_ID)) or info["name"]
 
     pay = create_payment(amount_cents, f"Acompte {n} – {desc}", f"{settings.PUBLIC_BASE_URL}/", iban_txt)
 
@@ -142,6 +115,29 @@ async def pay_acompte(n: int, item_id: Optional[int] = None, request: Request = 
         set_link_in_column(item_id, link_col, pay["url"], f"Payer acompte {n}")
 
     return {"status": "ok", "payment": pay}
+
+
+# -------- Helpers --------
+def _read_vat_rate(cols: Dict[str, Any]) -> float:
+    txt = cols.get(settings.VAT_RATE_COLUMN_ID, {}).get("text") if settings.VAT_RATE_COLUMN_ID else None
+    if not txt:
+        return settings.DEFAULT_VAT_RATE
+    try:
+        return float(str(txt).replace(",", "."))
+    except Exception:
+        return settings.DEFAULT_VAT_RATE
+
+
+def _download_evoliz_pdf(token: str, kind: str, document_id: int) -> Optional[bytes]:
+    try:
+        url = f"{settings.EVOLIZ_BASE_URL}/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/{kind}/{document_id}/pdf"
+        r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=60)
+        r.raise_for_status()
+        if r.headers.get("content-type", "").lower().startswith("application/pdf"):
+            return r.content
+    except Exception:
+        pass
+    return None
 
 
 # -------- Devis --------
@@ -159,17 +155,19 @@ async def quote_from_monday_webhook(payload: dict = Body(...)):
     info = get_item_columns(item_id)
     cols = info["columns"]
 
-    amount_txt = (cols.get(settings.QUOTE_AMOUNT_FORMULA_ID, {}) or {}).get("text") or "0"
+    amount_txt = cols.get(settings.QUOTE_AMOUNT_FORMULA_ID, {}).get("text") or "0"
     amount_ht = round(cents_from_str(amount_txt) / 100.0, 2)
     vat_rate = _read_vat_rate(cols)
-    desc = (settings.DESCRIPTION_COLUMN_ID and get_formula_text(cols, settings.DESCRIPTION_COLUMN_ID)) or info["name"]
+    desc = (settings.DESCRIPTION_COLUMN_ID and get_formula_display_value(cols, settings.DESCRIPTION_COLUMN_ID)) or info["name"]
 
     vat_number = cols.get(settings.VAT_NUMBER_COLUMN_ID, {}).get("text") if settings.VAT_NUMBER_COLUMN_ID else None
     client_type = cols.get(settings.CLIENT_TYPE_COLUMN_ID, {}).get("text") if settings.CLIENT_TYPE_COLUMN_ID else None
     addr = extract_address_fields(cols)
 
     token = get_access_token()
-    client_id = create_client_if_needed(token, {"name": info["name"], "client_type": client_type or "", "vat_number": vat_number or "", **addr})
+    client_id = create_client_if_needed(token, {
+        "name": info["name"], "client_type": client_type or "", "vat_number": vat_number or "", **addr
+    })
     q = create_quote(token, client_id, {"description": desc, "amount_ht": amount_ht, "vat_rate": vat_rate})
     quote_id = q.get("documentid") or q.get("quoteid") or q.get("id")
     web_url = q.get("url") or q.get("portal_url") or ""
@@ -190,34 +188,44 @@ async def quote_from_monday_webhook(payload: dict = Body(...)):
 
 # -------- Factures --------
 def _compute_invoice_amount(cols: Dict[str, Any], kind: str) -> float:
-    total_txt = (cols.get(settings.QUOTE_AMOUNT_FORMULA_ID, {}) or {}).get("text") or "0"
+    total_txt = cols.get(settings.QUOTE_AMOUNT_FORMULA_ID, {}).get("text") or "0"
+    ac1_txt = settings.FORMULA_COLUMN_IDS.get("1") and get_formula_display_value(cols, settings.FORMULA_COLUMN_IDS["1"]) or ""
+    ac2_txt = settings.FORMULA_COLUMN_IDS.get("2") and get_formula_display_value(cols, settings.FORMULA_COLUMN_IDS["2"]) or ""
     total = cents_from_str(total_txt) / 100.0
-    ac1 = get_formula_number(cols, settings.FORMULA_COLUMN_IDS.get("1", "")) if settings.FORMULA_COLUMN_IDS.get("1") else 0.0
-    ac2 = get_formula_number(cols, settings.FORMULA_COLUMN_IDS.get("2", "")) if settings.FORMULA_COLUMN_IDS.get("2") else 0.0
+
+    # si Monday ne renvoie rien, fallback mapping
+    if not ac1_txt:
+        ac1 = settings.ACOMPTE_AMOUNTS.get("1", {}).get(
+            cols.get(settings.BUSINESS_STATUS_COLUMN_ID, {}).get("text", ""), 0
+        )
+    else:
+        ac1 = cents_from_str(ac1_txt) / 100.0
+
+    if not ac2_txt:
+        ac2 = settings.ACOMPTE_AMOUNTS.get("2", {}).get(
+            cols.get(settings.BUSINESS_STATUS_COLUMN_ID, {}).get("text", ""), 0
+        )
+    else:
+        ac2 = cents_from_str(ac2_txt) / 100.0
+
     if kind == "ac1":
-        return round(ac1, 2)
+        return round(float(ac1), 2)
     if kind == "ac2":
-        return round(ac2, 2)
+        return round(float(ac2), 2)
     return round(max(total - ac1 - ac2, 0.0), 2)
 
 
 def _label_to_kind(label: str) -> Optional[str]:
-    if label == settings.INVOICE_LABEL_ACOMPTE1:
-        return "ac1"
-    if label == settings.INVOICE_LABEL_ACOMPTE2:
-        return "ac2"
-    if label == settings.INVOICE_LABEL_SOLDE:
-        return "solde"
+    if label == settings.INVOICE_LABEL_ACOMPTE1: return "ac1"
+    if label == settings.INVOICE_LABEL_ACOMPTE2: return "ac2"
+    if label == settings.INVOICE_LABEL_SOLDE:    return "solde"
     return None
 
 
 def _invoice_link_column_id(kind: str) -> Optional[str]:
-    if kind == "ac1":
-        return settings.INVOICE_LINK_AC1_COLUMN_ID or None
-    if kind == "ac2":
-        return settings.INVOICE_LINK_AC2_COLUMN_ID or None
-    if kind == "solde":
-        return settings.INVOICE_LINK_FINAL_COLUMN_ID or None
+    if kind == "ac1": return settings.INVOICE_LINK_AC1_COLUMN_ID or None
+    if kind == "ac2": return settings.INVOICE_LINK_AC2_COLUMN_ID or None
+    if kind == "solde": return settings.INVOICE_LINK_FINAL_COLUMN_ID or None
     return None
 
 
@@ -241,26 +249,24 @@ async def invoice_from_monday(payload: dict = Body(...)):
         raise HTTPException(400, f"Montant HT nul pour {kind}")
 
     vat_rate = _read_vat_rate(cols)
-    desc = (settings.DESCRIPTION_COLUMN_ID and get_formula_text(cols, settings.DESCRIPTION_COLUMN_ID)) or info["name"]
+    desc = (settings.DESCRIPTION_COLUMN_ID and get_formula_display_value(cols, settings.DESCRIPTION_COLUMN_ID)) or info["name"]
 
     vat_number = cols.get(settings.VAT_NUMBER_COLUMN_ID, {}).get("text") if settings.VAT_NUMBER_COLUMN_ID else None
     client_type = cols.get(settings.CLIENT_TYPE_COLUMN_ID, {}).get("text") if settings.CLIENT_TYPE_COLUMN_ID else None
     addr = extract_address_fields(cols)
 
     token = get_access_token()
-    client_id = create_client_if_needed(token, {"name": info["name"], "client_type": client_type or "", "vat_number": vat_number or "", **addr})
+    client_id = create_client_if_needed(token, {
+        "name": info["name"], "client_type": client_type or "", "vat_number": vat_number or "", **addr
+    })
 
-    inv = create_invoice(
-        token,
-        client_id,
-        {
-            "description": f"{desc} – {'Acompte 1' if kind=='ac1' else 'Acompte 2' if kind=='ac2' else 'Solde'}",
-            "amount_ht": amount_ht,
-            "vat_rate": vat_rate,
-            "paytermid": settings.EVOLIZ_PAYTERM_ID,
-            "documentdate": date.today().isoformat(),
-        },
-    )
+    inv = create_invoice(token, client_id, {
+        "description": f"{desc} – {'Acompte 1' if kind=='ac1' else 'Acompte 2' if kind=='ac2' else 'Solde'}",
+        "amount_ht": amount_ht,
+        "vat_rate": vat_rate,
+        "paytermid": settings.EVOLIZ_PAYTERM_ID,
+        "documentdate": date.today().isoformat(),
+    })
     invoice_id = inv.get("documentid") or inv.get("invoiceid") or inv.get("id")
     web_url = inv.get("url") or inv.get("portal_url") or ""
 
@@ -281,17 +287,15 @@ async def invoice_from_monday(payload: dict = Body(...)):
 def debug_payplug(item_id: int):
     info = get_item_columns(item_id)
     cols = info["columns"]
-    iban_formula = get_formula_text(cols, settings.IBAN_FORMULA_COLUMN_ID) or ""
-    iban_from_status = ""
-    if settings.BUSINESS_STATUS_COLUMN_ID and settings.BUSINESS_TO_IBAN:
-        label = (cols.get(settings.BUSINESS_STATUS_COLUMN_ID, {}).get("text") or "").strip()
-        iban_from_status = settings.BUSINESS_TO_IBAN.get(label, "")
-    mode = settings.PAYPLUG_MODE
+    iban_formula = ""
+    if settings.IBAN_FORMULA_COLUMN_ID:
+        iban_formula = cols.get(settings.IBAN_FORMULA_COLUMN_ID, {}).get("text") or ""
+    iban_status = cols.get(settings.BUSINESS_STATUS_COLUMN_ID, {}).get("text") or ""
     return {
         "item_id": item_id,
-        "iban_raw": _iban_for_item(cols),
+        "iban_raw": get_iban_via_formula_or_status(cols),
         "iban_formula": iban_formula,
-        "iban_from_status": iban_from_status,
-        "mode": mode,
-        "keys_available": list((settings.PAYPLUG_KEYS_LIVE if mode == "live" else settings.PAYPLUG_KEYS_TEST).keys()),
+        "iban_from_status": iban_status and settings.PAYPLUG_IBAN_BY_STATUS.get(iban_status, ""),
+        "mode": settings.PAYPLUG_MODE,
+        "keys_available": list((settings.PAYPLUG_KEYS_LIVE if settings.PAYPLUG_MODE=='live' else settings.PAYPLUG_KEYS_TEST).keys()),
     }
