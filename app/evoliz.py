@@ -1,68 +1,68 @@
 import requests
 from .config import settings
 
-def get_access_token():
-    payload = {
-        "public_key": settings.EVOLIZ_PUBLIC_KEY,
-        "secret_key": settings.EVOLIZ_SECRET_KEY
-    }
-    r = requests.post(f"{settings.EVOLIZ_BASE_URL}/api/login", json=payload)
+def get_access_token() -> str:
+    payload = {"public_key": settings.EVOLIZ_PUBLIC_KEY, "secret_key": settings.EVOLIZ_SECRET_KEY}
+    r = requests.post(f"{settings.EVOLIZ_BASE_URL}/api/login", json=payload, timeout=30)
     r.raise_for_status()
-    return r.json().get("access_token")
+    token = r.json().get("access_token")
+    if not token:
+        raise RuntimeError("Evoliz: pas de access_token reçu.")
+    return token
 
-def create_client_if_needed(token, client_data):
-    headers = {"Authorization": f"Bearer {token}"}
-    search_url = f"{settings.EVOLIZ_BASE_URL}/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/clients"
-    r = requests.get(search_url, headers=headers, params={"search": client_data["name"]})
+def _auth(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
+
+def create_client_if_needed(token: str, client_data: dict) -> int:
+    r = requests.get(
+        f"{settings.EVOLIZ_BASE_URL}/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/clients",
+        headers=_auth(token),
+        params={"search": client_data["name"]},
+        timeout=30,
+    )
     r.raise_for_status()
-    existing = r.json().get("data", [])
-    if existing:
-        return existing[0]["clientid"]
+    hits = r.json().get("data", [])
+    if hits:
+        return hits[0]["clientid"]
 
     payload = {
         "name": client_data["name"],
-        "type": "Professionnel",
+        "type": "Professionnel" if client_data.get("client_type") == "Professionnel" else "Particulier",
         "address": {
             "addr": client_data.get("address", ""),
             "postcode": client_data.get("postcode", ""),
             "town": client_data.get("city", ""),
-            "iso2": "FR"
+            "iso2": "FR",
         }
     }
-    r = requests.post(search_url, headers=headers, json=payload)
+    if client_data.get("client_type") == "Professionnel" and client_data.get("vat_number"):
+        payload["vat_number"] = client_data["vat_number"]
+
+    r = requests.post(
+        f"{settings.EVOLIZ_BASE_URL}/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/clients",
+        headers=_auth(token), json=payload, timeout=30
+    )
     r.raise_for_status()
     return r.json()["clientid"]
 
-from datetime import date
-import requests
-from .config import settings
-
-def create_quote(token, client_id, quote_data):
-    headers = {"Authorization": f"Bearer {token}"}
-    today = date.today().strftime("%Y-%m-%d")
-
+def create_quote(token: str, client_id: int, quote_data: dict) -> dict:
+    vat_rate = float(quote_data.get("vat_rate", settings.DEFAULT_VAT_RATE))
     payload = {
         "clientid": client_id,
-        "doctype": "quote",
-        "documentdate": today,
-        "term": {"paytermid": 1},  # 1 = Paiement comptant (à adapter selon ton compte)
-        "items": [
+        "lines": [
             {
                 "designation": quote_data["description"],
+                "unit_price": quote_data["amount_ht"],
                 "quantity": 1,
-                "unit_price": quote_data["amount_ht"]
+                "vat": vat_rate,
             }
         ],
-        "currency": "EUR"
+        "currency": "EUR",
+        "prices_include_vat": False
     }
-
-    url = f"{settings.EVOLIZ_BASE_URL}/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes"
-    print("📤 Payload Evoliz:", payload)
-    r = requests.post(url, headers=headers, json=payload)
-    print("📦 Response:", r.text)
-
-    # En cas d’erreur, affichage clair
-    if not r.ok:
-        raise Exception(f"{r.status_code} {r.text}")
-
+    r = requests.post(
+        f"{settings.EVOLIZ_BASE_URL}/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes",
+        headers=_auth(token), json=payload, timeout=30
+    )
+    r.raise_for_status()
     return r.json()
