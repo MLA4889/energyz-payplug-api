@@ -1,41 +1,62 @@
 from typing import Optional
+import re
 import payplug
+
 from .config import settings
 
 
-def _choose_api_key(iban_display_value: str) -> Optional[str]:
-    keymap = settings.PAYPLUG_KEYS_LIVE if settings.PAYPLUG_MODE == "live" else settings.PAYPLUG_KEYS_TEST
-    if not iban_display_value:
+def normalize_iban(iban: str | None) -> Optional[str]:
+    if not iban:
         return None
-    k = " ".join(iban_display_value.split())
-    return keymap.get(k)
+    s = iban.strip().upper()
+    s = re.sub(r"\s+", "", s)
+    return s or None
 
 
-def cents_from_str(s: str | None) -> int:
+def _choose_api_key(iban_display_value: str | None) -> Optional[str]:
+    """
+    1) Normalise l'IBAN
+    2) Cherche la clé correspondante selon PAYPLUG_MODE
+    """
+    iban_norm = normalize_iban(iban_display_value)
+    if not iban_norm:
+        return None
+    mapping = settings.PAYPLUG_KEYS_TEST if settings.PAYPLUG_MODE == "test" else settings.PAYPLUG_KEYS_LIVE
+    # Les IBAN dans l'env peuvent contenir des espaces -> normalisons aussi
+    for k, v in mapping.items():
+        if normalize_iban(k) == iban_norm:
+            return v
+    return None
+
+
+def cents_from_str(val: str | float | int) -> int:
+    """
+    Convertit une entrée (ex: "1 234,56") en centimes.
+    """
+    if isinstance(val, (int, float)):
+        amount = float(val)
+        return int(round(amount * 100))
+
+    s = (val or "").strip()
+    s = s.replace("\u202f", "").replace(" ", "").replace(",", ".")
     if not s:
         return 0
-    s = str(s).replace("€", "").replace(" ", "").replace(",", ".")
     try:
         return int(round(float(s) * 100))
     except Exception:
         return 0
 
 
-def create_payment(amount_cents: int, description: str, return_url: str, iban_display_value: str) -> dict:
-    api_key = _choose_api_key(iban_display_value)
-    if not api_key:
-        raise RuntimeError(
-            "Aucune clé PayPlug correspondante à l'IBAN sélectionné. "
-            "Vérifie PAYPLUG_KEYS_*_JSON et l'IBAN lu (formula/ mapping statut)."
-        )
-    payplug.set_secret_key(api_key)  # SDK PayPlug
+def create_payment(amount_cents: int, description: str, return_url: str) -> dict:
+    if amount_cents <= 0:
+        raise ValueError("Montant invalide pour PayPlug")
+    # payplug secret key doit être réglée avant l'appel (voir main)
     payment = payplug.Payment.create(
         amount=amount_cents,
         currency='EUR',
-        hosted_payment={'return_url': return_url},
-        notification_url="https://example.com/payplug/webhook",  # met un vrai endpoint si besoin
-        save_card=False,
-        metadata={"brand": settings.BRAND_NAME, "iban": iban_display_value, "mode": settings.PAYPLUG_MODE},
-        description=(description or "Acompte")[:255],
+        description=description[:250] if description else settings.BRAND_NAME,
+        hosted_payment={
+            "return_url": return_url,
+        }
     )
-    return {"id": payment.id, "url": payment.hosted_payment.payment_url, "status": payment.status}
+    return payment
