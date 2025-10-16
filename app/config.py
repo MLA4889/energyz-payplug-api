@@ -30,9 +30,9 @@ class Settings(BaseModel):
     QUOTE_AMOUNT_FORMULA_ID: str = os.getenv("QUOTE_AMOUNT_FORMULA_ID", "")
     QUOTE_LINK_COLUMN_ID: str = os.getenv("QUOTE_LINK_COLUMN_ID", "")
 
-    # ✅ Une seule colonne Files (doc centralisée)
+    # Colonne Files unique (optionnelle)
     DOC_FILES_COLUMN_ID: str = os.getenv("DOC_FILES_COLUMN_ID", "")
-    # Backward compat (laisser vides si tu centralises tout)
+    # Backward compat si tu veux séparer
     QUOTE_FILES_COLUMN_ID: str = os.getenv("QUOTE_FILES_COLUMN_ID", "")
     INVOICE_FILES_COLUMN_ID: str = os.getenv("INVOICE_FILES_COLUMN_ID", "")
 
@@ -64,7 +64,6 @@ class Settings(BaseModel):
     PAYPLUG_MODE: str = os.getenv("PAYPLUG_MODE", "live")
     PAYPLUG_KEYS_LIVE: dict = _loads_env_json("PAYPLUG_KEYS_LIVE_JSON", {})
     PAYPLUG_KEYS_TEST: dict = _loads_env_json("PAYPLUG_KEYS_TEST_JSON", {})
-    PAYPLUG_NOTIFICATION_URL: str = os.getenv("PAYPLUG_NOTIFICATION_URL", "")
 
     # ===== Divers =====
     PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
@@ -75,10 +74,6 @@ class Settings(BaseModel):
     EVOLIZ_SECRET_KEY: str = os.getenv("EVOLIZ_SECRET_KEY", "")
     EVOLIZ_COMPANY_ID: str = os.getenv("EVOLIZ_COMPANY_ID", "")
     EVOLIZ_BASE_URL: str = os.getenv("EVOLIZ_BASE_URL", "https://api.evoliz.com").rstrip("/")
-
-    # ===== Fallback IBAN basé sur le status =====
-    BUSINESS_STATUS_COLUMN_ID: str = os.getenv("BUSINESS_STATUS_COLUMN_ID", "")
-    IBAN_BY_STATUS: dict = _loads_env_json("IBAN_BY_STATUS_JSON", {})
 
 
 settings = Settings()
