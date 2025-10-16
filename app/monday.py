@@ -24,10 +24,10 @@ def _gql(query: str, variables: dict | None = None) -> dict:
 
 
 def get_item_columns(item_id: int) -> Dict[str, Any]:
-    # NOTE: items(ids: $item_id) attend un type [ID!], pas [Int]
+    # IMPORTANT: type ID! (sinon erreur)
     q = """
-    query($item_id: [ID!]) {
-      items(ids: $item_id) {
+    query($item_id: ID!) {
+      items(ids: [$item_id]) {
         id
         name
         column_values { id text value type }
@@ -39,79 +39,52 @@ def get_item_columns(item_id: int) -> Dict[str, Any]:
     if not items:
         raise RuntimeError(f"Item {item_id} introuvable.")
     item = items[0]
-    colmap = {cv["id"]: cv for cv in item["column_values"]}
-    return {"item_id": int(item["id"]), "name": item["name"], "columns": colmap}
+    return {
+        "item_id": int(item["id"]),
+        "name": item["name"],
+        "columns": {cv["id"]: cv for cv in (item.get("column_values") or [])},
+    }
 
 
-# -------- helpers lecture Formula / Numbers --------
-
-_NUM_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
-
-def _clean_number_like(s: str) -> str:
-    if not s:
-        return ""
-    s2 = s.replace("€", " ").replace("\u00a0", " ").strip()
-    m = _NUM_RE.search(s2)
-    return (m.group(0) if m else "").replace(",", ".")
-
-def _from_value_field(raw: Any) -> str:
-    if raw is None:
-        return ""
-    if isinstance(raw, (int, float)):
-        return str(raw)
-    if isinstance(raw, str):
-        t = raw.strip()
-        if (t.startswith("{") and t.endswith("}")) or (t.startswith("[") and t.endswith("]")):
-            try:
-                parsed = json.loads(t)
-            except Exception:
-                return _clean_number_like(t)
-            # Monday peut mettre {"text":"1500"} ou {"value":"1500"} etc.
-            if isinstance(parsed, dict):
-                for key in ("text", "value", "display_value", "formatted"):
-                    v = parsed.get(key)
-                    if v:
-                        return _clean_number_like(str(v))
-            return _clean_number_like(t)
-        return _clean_number_like(t)
-    return _clean_number_like(str(raw))
-
-def get_formula_display_value(columns: Dict[str, Any], col_id: str) -> Optional[str]:
+def _cv_text(columns: Dict[str, Any], col_id: str) -> str:
     cv = columns.get(col_id)
     if not cv:
+        return ""
+    # 1) souvent ok
+    if cv.get("text"):
+        return str(cv["text"]).strip()
+    # 2) parfois Monday met le "text" dans value (JSON)
+    try:
+        if cv.get("value"):
+            v = cv["value"]
+            if isinstance(v, str):
+                v = json.loads(v)
+            if isinstance(v, dict):
+                t = v.get("text")
+                if t:
+                    return str(t).strip()
+    except Exception:
+        pass
+    return ""
+
+
+def get_formula_text(columns: Dict[str, Any], formula_col_id: str) -> Optional[str]:
+    if not formula_col_id:
         return None
-
-    # 1) text
-    txt = (cv.get("text") or "").strip()
-    if txt:
-        n = _clean_number_like(txt)
-        if n:
-            return n
-
-    # 2) value (souvent JSON)
-    val = _from_value_field(cv.get("value"))
-    if val:
-        return val
-
-    return None
+    return _cv_text(columns, formula_col_id) or None
 
 
-def extract_address_fields(columns: Dict[str, Any]) -> dict:
-    def _cv_text(col_id: str) -> str:
-        cv = columns.get(col_id)
-        return (cv.get("text") if cv else "") or ""
-
-    addr_txt = _cv_text(settings.ADDRESS_COLUMN_ID) if settings.ADDRESS_COLUMN_ID else ""
-    postcode = _cv_text(settings.POSTCODE_COLUMN_ID) if settings.POSTCODE_COLUMN_ID else ""
-    city = _cv_text(settings.CITY_COLUMN_ID) if settings.CITY_COLUMN_ID else ""
-
-    if (not postcode or not city) and addr_txt:
-        m = re.search(r"\b(\d{5})\s+([A-Za-zÀ-ÿ\-\s']+)$", addr_txt.strip())
-        if m:
-            postcode = postcode or m.group(1).strip()
-            city = city or m.group(2).strip()
-
-    return {"address": addr_txt.strip(), "postcode": postcode.strip(), "city": city.strip()}
+def get_formula_number(columns: Dict[str, Any], formula_col_id: str) -> float:
+    """Renvoie un nombre (float) à partir d'une colonne formula."""
+    txt = get_formula_text(columns, formula_col_id) or ""
+    if not txt:
+        return 0.0
+    # nettoyer €
+    txt = txt.replace("€", "").replace(" ", "").replace("\u00a0", "").replace(",", ".")
+    try:
+        return float(txt)
+    except Exception:
+        return 0.0
 
 
 def set_status(item_id: int, status_column_id: str, label: str) -> None:
@@ -131,6 +104,20 @@ def set_link_in_column(item_id: int, column_id: str, url: str, text: str = "Ouvr
     }
     """
     _gql(q, {"item_id": item_id, "column_id": column_id, "value": value})
+
+
+def extract_address_fields(columns: Dict[str, Any]) -> dict:
+    addr_txt = _cv_text(columns, settings.ADDRESS_COLUMN_ID) if settings.ADDRESS_COLUMN_ID else ""
+    postcode = _cv_text(columns, settings.POSTCODE_COLUMN_ID) if settings.POSTCODE_COLUMN_ID else ""
+    city = _cv_text(columns, settings.CITY_COLUMN_ID) if settings.CITY_COLUMN_ID else ""
+
+    if (not postcode or not city) and addr_txt:
+        m = re.search(r"\b(\d{5})\s+([A-Za-zÀ-ÿ\-\s']+)$", addr_txt.strip())
+        if m:
+            postcode = postcode or m.group(1).strip()
+            city = city or m.group(2).strip()
+
+    return {"address": addr_txt.strip(), "postcode": postcode.strip(), "city": city.strip()}
 
 
 def upload_file_to_files_column(item_id: int, column_id: str, filename: str, content: bytes) -> None:
@@ -153,7 +140,7 @@ def upload_file_to_files_column(item_id: int, column_id: str, filename: str, con
         "map": (None, json.dumps({"0": ["variables.file"]}), "application/json"),
         "0": (filename, content, mtype),
     }
-    url = f"{settings.MONDAY_API_URL}/file"
+    url = f"{settings.MONDAY_API_URL}/file"  # /v2/file
     r = requests.post(url, headers={"Authorization": settings.MONDAY_API_KEY}, files=files, timeout=90)
     if r.status_code >= 400:
         try:
