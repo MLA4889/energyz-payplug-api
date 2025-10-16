@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import Body, FastAPI, HTTPException, Request
 import requests
+import json
 
 from .config import settings
 from .monday import (
@@ -22,7 +23,6 @@ app = FastAPI(title=f"{settings.BRAND_NAME} PayPlug & Evoliz API")
 
 
 def _target_files_col() -> str:
-    """Une seule colonne Files prioritaire (DOC_FILES_COLUMN_ID) avec fallback éventuels."""
     return settings.DOC_FILES_COLUMN_ID or settings.INVOICE_FILES_COLUMN_ID or settings.QUOTE_FILES_COLUMN_ID
 
 
@@ -53,12 +53,10 @@ def debug_evoliz_login():
 def debug_quote_preview(item_id: int):
     info = get_item_columns(item_id)
     cols = info["columns"]
-
     amount_ht_txt = cols.get(settings.QUOTE_AMOUNT_FORMULA_ID, {}).get("text") or "0"
     vat_rate_txt = cols.get(settings.VAT_RATE_COLUMN_ID, {}).get("text") or str(settings.DEFAULT_VAT_RATE)
     desc = (settings.DESCRIPTION_COLUMN_ID and get_formula_display_value(cols, settings.DESCRIPTION_COLUMN_ID)) or info["name"]
     vat_number = cols.get(settings.VAT_NUMBER_COLUMN_ID, {}).get("text") if settings.VAT_NUMBER_COLUMN_ID else None
-
     return {
         "item_id": item_id,
         "name": info["name"],
@@ -70,7 +68,6 @@ def debug_quote_preview(item_id: int):
     }
 
 
-# -------- Helpers --------
 def _read_vat_rate(cols: Dict[str, Any]) -> float:
     txt = cols.get(settings.VAT_RATE_COLUMN_ID, {}).get("text") if settings.VAT_RATE_COLUMN_ID else None
     if not txt:
@@ -93,7 +90,6 @@ def _download_evoliz_pdf(token: str, kind: str, document_id: int) -> Optional[by
     return None
 
 
-# ====== Fallback IBAN depuis le status ======
 def _iban_from_status(cols: Dict[str, Any]) -> str:
     if not settings.BUSINESS_STATUS_COLUMN_ID:
         return ""
@@ -104,18 +100,75 @@ def _iban_from_status(cols: Dict[str, Any]) -> str:
     return settings.IBAN_BY_STATUS.get(label, "")
 
 
-# -------- PayPlug (acompte) --------
-@app.api_route("/pay/acompte/{n}", methods=["GET", "POST"])
-async def pay_acompte(n: int, item_id: Optional[int] = None, request: Request = None):
-    if request and request.method == "POST":
+def _best_base_url() -> str:
+    base_url = settings.PUBLIC_BASE_URL or "https://energyz-payplug-api-1.onrender.com"
+    if not (base_url.startswith("http://") or base_url.startswith("https://")):
+        base_url = "https://energyz-payplug-api-1.onrender.com"
+    return base_url
+
+
+# ---------------------- PAY / ACOMPTE ----------------------
+def _extract_item_id_from_anything(request: Request, parsed_json: Optional[dict]) -> Optional[int]:
+    """
+    Accepte plusieurs formats possibles (Monday, query params, form-encoded, texte…)
+    Retourne un int ou None.
+    """
+    # 1) Query params
+    for k in ("item_id", "itemId", "pulseId"):
+        v = request.query_params.get(k)
+        if v and v.isdigit():
+            return int(v)
+
+    # 2) JSON déjà parsé
+    if isinstance(parsed_json, dict):
+        # format Monday standard
         try:
-            payload = await request.json()
-            item_id = item_id or int(payload["event"]["pulseId"])
+            v = parsed_json["event"]["pulseId"]
+            if v:
+                return int(v)
         except Exception:
             pass
-    if not item_id:
-        raise HTTPException(400, "item_id manquant")
+        # variantes simples
+        for k in ("pulseId", "itemId", "item_id"):
+            try:
+                v = parsed_json.get(k)
+                if v:
+                    return int(v)
+            except Exception:
+                pass
 
+    # 3) essaye de parser x-www-form-urlencoded ou texte
+    # (Render/Starlette a déjà lu le body une fois, on ne relit pas ici pour éviter un await .body() vide.)
+
+    return None
+
+
+@app.api_route("/pay/acompte/{n}", methods=["GET", "POST"])
+async def pay_acompte(n: int, item_id: Optional[int] = None, request: Request = None):
+    parsed: Optional[dict] = None
+
+    # si GET ?item_id=... marche déjà
+    if not item_id:
+        item_id = None
+
+    # tente de lire le JSON si POST
+    if request and request.method == "POST":
+        try:
+            parsed = await request.json()
+        except Exception:
+            parsed = None
+
+    # meilleure source disponible: query, json, paramètres
+    item_id = item_id or _extract_item_id_from_anything(request, parsed)
+
+    if not item_id:
+        raise HTTPException(
+            400,
+            "item_id manquant. En POST, envoie le JSON Monday (event.pulseId) "
+            "ou passe ?item_id=... dans l'URL."
+        )
+
+    # ----- logique métier -----
     info = get_item_columns(item_id)
     cols = info["columns"]
 
@@ -129,7 +182,7 @@ async def pay_acompte(n: int, item_id: Optional[int] = None, request: Request = 
         raise HTTPException(
             400,
             f"Montant d'acompte {n} invalide pour l'item {item_id} "
-            f"(valeur lue='{amount_txt}'). Mets un nombre > 0 dans la colonne."
+            f"(valeur lue='{amount_txt}'). Mets un nombre > 0 dans la colonne formule."
         )
 
     desc = (settings.DESCRIPTION_COLUMN_ID and get_formula_display_value(cols, settings.DESCRIPTION_COLUMN_ID)) or info["name"]
@@ -139,26 +192,21 @@ async def pay_acompte(n: int, item_id: Optional[int] = None, request: Request = 
     if not iban_txt:
         raise HTTPException(400, "IBAN introuvable (formula et fallback status vides).")
 
-    # return_url doit être http/https
-    base_url = settings.PUBLIC_BASE_URL or "https://energyz-payplug-api-1.onrender.com"
-    if not (base_url.startswith("http://") or base_url.startswith("https://")):
-        base_url = "https://energyz-payplug-api-1.onrender.com"
-
     pay = create_payment(
         amount_cents=amount_cents,
         description=f"Acompte {n} – {desc}",
-        return_url=f"{base_url}/",
+        return_url=f"{_best_base_url()}/",
         iban_display_value=iban_txt,
     )
 
     link_col = settings.LINK_COLUMN_IDS.get(str(n))
-    if link_col:
+    if link_col and pay.get("url"):
         set_link_in_column(item_id, link_col, pay["url"], f"Payer acompte {n}")
 
-    return {"status": "ok", "payment": pay}
+    return {"status": "ok", "payment": pay, "debug": {"item_id": item_id, "amount_cents": amount_cents}}
 
 
-# -------- Devis --------
+# ---------------------- DEVIS ----------------------
 @app.post("/quote/from_monday")
 async def quote_from_monday_webhook(payload: dict = Body(...)):
     try:
@@ -204,7 +252,7 @@ async def quote_from_monday_webhook(payload: dict = Body(...)):
     return {"status": "ok", "quote": {"id": quote_id, "url": web_url}}
 
 
-# -------- Factures --------
+# ---------------------- FACTURES ----------------------
 def _compute_invoice_amount(cols: Dict[str, Any], kind: str) -> float:
     total_txt = cols.get(settings.QUOTE_AMOUNT_FORMULA_ID, {}).get("text") or "0"
     ac1_txt = settings.FORMULA_COLUMN_IDS.get("1") and get_formula_display_value(cols, settings.FORMULA_COLUMN_IDS["1"]) or "0"
