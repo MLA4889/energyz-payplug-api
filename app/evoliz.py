@@ -8,16 +8,12 @@ def get_access_token():
     }
     r = requests.post(f"{settings.EVOLIZ_BASE_URL}/api/login", json=payload)
     r.raise_for_status()
-    token = r.json().get("access_token")
-    return token
+    return r.json().get("access_token")
 
 def create_client_if_needed(token, client_data):
     headers = {"Authorization": f"Bearer {token}"}
-    r = requests.get(
-        f"{settings.EVOLIZ_BASE_URL}/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/clients",
-        headers=headers,
-        params={"search": client_data["name"]}
-    )
+    search_url = f"{settings.EVOLIZ_BASE_URL}/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/clients"
+    r = requests.get(search_url, headers=headers, params={"search": client_data["name"]})
     r.raise_for_status()
     existing = r.json().get("data", [])
     if existing:
@@ -33,9 +29,7 @@ def create_client_if_needed(token, client_data):
             "iso2": "FR"
         }
     }
-    r = requests.post(
-        f"{settings.EVOLIZ_BASE_URL}/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/clients",
-        headers=headers, json=payload)
+    r = requests.post(search_url, headers=headers, json=payload)
     r.raise_for_status()
     return r.json()["clientid"]
 
