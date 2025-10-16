@@ -5,7 +5,6 @@ from typing import Any, Dict, Optional
 
 from fastapi import Body, FastAPI, HTTPException, Request
 import requests
-import json
 
 from .config import settings
 from .monday import (
@@ -43,6 +42,8 @@ def health():
     }
 
 
+# ------------------ DEBUG ------------------
+
 @app.get("/debug/evoliz/login")
 def debug_evoliz_login():
     token = get_access_token()
@@ -53,10 +54,12 @@ def debug_evoliz_login():
 def debug_quote_preview(item_id: int):
     info = get_item_columns(item_id)
     cols = info["columns"]
-    amount_ht_txt = cols.get(settings.QUOTE_AMOUNT_FORMULA_ID, {}).get("text") or "0"
-    vat_rate_txt = cols.get(settings.VAT_RATE_COLUMN_ID, {}).get("text") or str(settings.DEFAULT_VAT_RATE)
+
+    amount_ht_txt = (cols.get(settings.QUOTE_AMOUNT_FORMULA_ID, {}) or {}).get("text") or "0"
+    vat_rate_txt = (cols.get(settings.VAT_RATE_COLUMN_ID, {}) or {}).get("text") or str(settings.DEFAULT_VAT_RATE)
     desc = (settings.DESCRIPTION_COLUMN_ID and get_formula_display_value(cols, settings.DESCRIPTION_COLUMN_ID)) or info["name"]
     vat_number = cols.get(settings.VAT_NUMBER_COLUMN_ID, {}).get("text") if settings.VAT_NUMBER_COLUMN_ID else None
+
     return {
         "item_id": item_id,
         "name": info["name"],
@@ -67,6 +70,64 @@ def debug_quote_preview(item_id: int):
         "address": extract_address_fields(cols),
     }
 
+
+@app.get("/debug/payplug/{item_id}")
+def debug_payplug(item_id: int):
+    info = get_item_columns(item_id)
+    cols = info["columns"]
+    iban_txt = (settings.IBAN_FORMULA_COLUMN_ID and get_formula_display_value(cols, settings.IBAN_FORMULA_COLUMN_ID)) or ""
+    mode = settings.PAYPLUG_MODE
+    keys = list((settings.PAYPLUG_KEYS_LIVE if mode == "live" else settings.PAYPLUG_KEYS_TEST).keys())
+    return {"item_id": item_id, "iban_raw": iban_txt, "mode": mode, "keys_available": keys}
+
+
+# ------------------ PayPlug (acompte) ------------------
+
+@app.api_route("/pay/acompte/{n}", methods=["GET", "POST"])
+async def pay_acompte(n: int, item_id: Optional[int] = None, request: Request = None):
+    # lecture item_id depuis webhook Monday si POST
+    if request and request.method == "POST":
+        try:
+            payload = await request.json()
+            item_id = item_id or int(payload["event"]["pulseId"])
+        except Exception:
+            pass
+    if not item_id:
+        raise HTTPException(400, "item_id manquant")
+
+    info = get_item_columns(item_id)
+    cols = info["columns"]
+
+    # montant depuis FORMULA_COLUMN_IDS[n]
+    formula_col_id = settings.FORMULA_COLUMN_IDS.get(str(n))
+    if not formula_col_id:
+        raise HTTPException(400, f"FORMULA_COLUMN_IDS n°{n} non configurée")
+    amount_txt = get_formula_display_value(cols, formula_col_id) or ""
+    amount_cents = cents_from_str(amount_txt)
+    if amount_cents <= 0:
+        raise HTTPException(400, f"Montant d'acompte {n} invalide pour l'item {item_id} (valeur lue='{amount_txt or '0'}'). Mets un nombre > 0 dans la colonne formule.")
+
+    # description + IBAN
+    desc = (settings.DESCRIPTION_COLUMN_ID and get_formula_display_value(cols, settings.DESCRIPTION_COLUMN_ID)) or info["name"]
+    iban_txt = (settings.IBAN_FORMULA_COLUMN_ID and get_formula_display_value(cols, settings.IBAN_FORMULA_COLUMN_ID)) or ""
+
+    pay = create_payment(amount_cents, f"Acompte {n} – {desc}", f"{settings.PUBLIC_BASE_URL}/", iban_txt)
+
+    link_col = settings.LINK_COLUMN_IDS.get(str(n))
+    if link_col:
+        set_link_in_column(item_id, link_col, pay["url"], f"Payer acompte {n}")
+
+    # statut post-paiement (optionnel – serait plutôt dans un webhook IPN)
+    if settings.STATUS_COLUMN_ID and settings.STATUS_AFTER_PAY.get(str(n)):
+        try:
+            set_status(item_id, settings.STATUS_COLUMN_ID, settings.STATUS_AFTER_PAY[str(n)])
+        except Exception:
+            pass
+
+    return {"status": "ok", "payment": pay}
+
+
+# ------------------ helpers devis/factures ------------------
 
 def _read_vat_rate(cols: Dict[str, Any]) -> float:
     txt = cols.get(settings.VAT_RATE_COLUMN_ID, {}).get("text") if settings.VAT_RATE_COLUMN_ID else None
@@ -90,123 +151,8 @@ def _download_evoliz_pdf(token: str, kind: str, document_id: int) -> Optional[by
     return None
 
 
-def _iban_from_status(cols: Dict[str, Any]) -> str:
-    if not settings.BUSINESS_STATUS_COLUMN_ID:
-        return ""
-    cv = cols.get(settings.BUSINESS_STATUS_COLUMN_ID) or {}
-    label = (cv.get("text") or "").strip()
-    if not label:
-        return ""
-    return settings.IBAN_BY_STATUS.get(label, "")
+# ------------------ Devis ------------------
 
-
-def _best_base_url() -> str:
-    base_url = settings.PUBLIC_BASE_URL or "https://energyz-payplug-api-1.onrender.com"
-    if not (base_url.startswith("http://") or base_url.startswith("https://")):
-        base_url = "https://energyz-payplug-api-1.onrender.com"
-    return base_url
-
-
-# ---------------------- PAY / ACOMPTE ----------------------
-def _extract_item_id_from_anything(request: Request, parsed_json: Optional[dict]) -> Optional[int]:
-    """
-    Accepte plusieurs formats possibles (Monday, query params, form-encoded, texte…)
-    Retourne un int ou None.
-    """
-    # 1) Query params
-    for k in ("item_id", "itemId", "pulseId"):
-        v = request.query_params.get(k)
-        if v and v.isdigit():
-            return int(v)
-
-    # 2) JSON déjà parsé
-    if isinstance(parsed_json, dict):
-        # format Monday standard
-        try:
-            v = parsed_json["event"]["pulseId"]
-            if v:
-                return int(v)
-        except Exception:
-            pass
-        # variantes simples
-        for k in ("pulseId", "itemId", "item_id"):
-            try:
-                v = parsed_json.get(k)
-                if v:
-                    return int(v)
-            except Exception:
-                pass
-
-    # 3) essaye de parser x-www-form-urlencoded ou texte
-    # (Render/Starlette a déjà lu le body une fois, on ne relit pas ici pour éviter un await .body() vide.)
-
-    return None
-
-
-@app.api_route("/pay/acompte/{n}", methods=["GET", "POST"])
-async def pay_acompte(n: int, item_id: Optional[int] = None, request: Request = None):
-    parsed: Optional[dict] = None
-
-    # si GET ?item_id=... marche déjà
-    if not item_id:
-        item_id = None
-
-    # tente de lire le JSON si POST
-    if request and request.method == "POST":
-        try:
-            parsed = await request.json()
-        except Exception:
-            parsed = None
-
-    # meilleure source disponible: query, json, paramètres
-    item_id = item_id or _extract_item_id_from_anything(request, parsed)
-
-    if not item_id:
-        raise HTTPException(
-            400,
-            "item_id manquant. En POST, envoie le JSON Monday (event.pulseId) "
-            "ou passe ?item_id=... dans l'URL."
-        )
-
-    # ----- logique métier -----
-    info = get_item_columns(item_id)
-    cols = info["columns"]
-
-    formula_col_id = settings.FORMULA_COLUMN_IDS.get(str(n))
-    if not formula_col_id:
-        raise HTTPException(400, f"FORMULA_COLUMN_IDS n°{n} non configurée")
-
-    amount_txt = get_formula_display_value(cols, formula_col_id) or "0"
-    amount_cents = cents_from_str(amount_txt)
-    if amount_cents <= 0:
-        raise HTTPException(
-            400,
-            f"Montant d'acompte {n} invalide pour l'item {item_id} "
-            f"(valeur lue='{amount_txt}'). Mets un nombre > 0 dans la colonne formule."
-        )
-
-    desc = (settings.DESCRIPTION_COLUMN_ID and get_formula_display_value(cols, settings.DESCRIPTION_COLUMN_ID)) or info["name"]
-    iban_txt = (settings.IBAN_FORMULA_COLUMN_ID and get_formula_display_value(cols, settings.IBAN_FORMULA_COLUMN_ID)) or ""
-    if not iban_txt:
-        iban_txt = _iban_from_status(cols)
-    if not iban_txt:
-        raise HTTPException(400, "IBAN introuvable (formula et fallback status vides).")
-
-    pay = create_payment(
-        amount_cents=amount_cents,
-        description=f"Acompte {n} – {desc}",
-        return_url=f"{_best_base_url()}/",
-        iban_display_value=iban_txt,
-    )
-
-    link_col = settings.LINK_COLUMN_IDS.get(str(n))
-    if link_col and pay.get("url"):
-        set_link_in_column(item_id, link_col, pay["url"], f"Payer acompte {n}")
-
-    return {"status": "ok", "payment": pay, "debug": {"item_id": item_id, "amount_cents": amount_cents}}
-
-
-# ---------------------- DEVIS ----------------------
 @app.post("/quote/from_monday")
 async def quote_from_monday_webhook(payload: dict = Body(...)):
     try:
@@ -221,8 +167,10 @@ async def quote_from_monday_webhook(payload: dict = Body(...)):
     info = get_item_columns(item_id)
     cols = info["columns"]
 
-    amount_txt = cols.get(settings.QUOTE_AMOUNT_FORMULA_ID, {}).get("text") or "0"
+    amount_txt = (cols.get(settings.QUOTE_AMOUNT_FORMULA_ID, {}) or {}).get("text") or "0"
     amount_ht = round(cents_from_str(amount_txt) / 100.0, 2)
+    if amount_ht <= 0:
+        raise HTTPException(400, f"Montant HT invalide (lu='{amount_txt}').")
     vat_rate = _read_vat_rate(cols)
     desc = (settings.DESCRIPTION_COLUMN_ID and get_formula_display_value(cols, settings.DESCRIPTION_COLUMN_ID)) or info["name"]
 
@@ -235,6 +183,7 @@ async def quote_from_monday_webhook(payload: dict = Body(...)):
         "name": info["name"], "client_type": client_type or "", "vat_number": vat_number or "", **addr
     })
     q = create_quote(token, client_id, {"description": desc, "amount_ht": amount_ht, "vat_rate": vat_rate})
+
     quote_id = q.get("documentid") or q.get("quoteid") or q.get("id")
     web_url = q.get("url") or q.get("portal_url") or ""
 
@@ -252,7 +201,8 @@ async def quote_from_monday_webhook(payload: dict = Body(...)):
     return {"status": "ok", "quote": {"id": quote_id, "url": web_url}}
 
 
-# ---------------------- FACTURES ----------------------
+# ------------------ Factures ------------------
+
 def _compute_invoice_amount(cols: Dict[str, Any], kind: str) -> float:
     total_txt = cols.get(settings.QUOTE_AMOUNT_FORMULA_ID, {}).get("text") or "0"
     ac1_txt = settings.FORMULA_COLUMN_IDS.get("1") and get_formula_display_value(cols, settings.FORMULA_COLUMN_IDS["1"]) or "0"
@@ -332,21 +282,3 @@ async def invoice_from_monday(payload: dict = Body(...)):
         upload_file_to_files_column(item_id, files_col, f"Facture_{invoice_id}.pdf", pdf)
 
     return {"status": "ok", "invoice": {"id": invoice_id, "url": web_url, "kind": kind}}
-
-
-# --- DEBUG PAYPLUG ---
-@app.get("/debug/payplug/{item_id}")
-def debug_payplug(item_id: int):
-    info = get_item_columns(item_id)
-    cols = info["columns"]
-    iban_formula = (settings.IBAN_FORMULA_COLUMN_ID and get_formula_display_value(cols, settings.IBAN_FORMULA_COLUMN_ID)) or ""
-    iban_fallback = _iban_from_status(cols)
-    mode = settings.PAYPLUG_MODE
-    return {
-        "item_id": item_id,
-        "iban_raw": iban_formula or iban_fallback,
-        "iban_formula": iban_formula,
-        "iban_from_status": iban_fallback,
-        "mode": mode,
-        "keys_available": list((settings.PAYPLUG_KEYS_LIVE if mode == "live" else settings.PAYPLUG_KEYS_TEST).keys())
-    }
