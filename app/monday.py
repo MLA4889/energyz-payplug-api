@@ -24,7 +24,6 @@ def _gql(query: str, variables: dict | None = None) -> dict:
 
 
 def get_item_columns(item_id: int) -> Dict[str, Any]:
-    # IMPORTANT: type ID! (sinon erreur)
     q = """
     query($item_id: ID!) {
       items(ids: [$item_id]) {
@@ -39,52 +38,61 @@ def get_item_columns(item_id: int) -> Dict[str, Any]:
     if not items:
         raise RuntimeError(f"Item {item_id} introuvable.")
     item = items[0]
-    return {
-        "item_id": int(item["id"]),
-        "name": item["name"],
-        "columns": {cv["id"]: cv for cv in (item.get("column_values") or [])},
-    }
+    colmap = {cv["id"]: cv for cv in item["column_values"]}
+    return {"item_id": int(item["id"]), "name": item["name"], "columns": colmap}
 
 
 def _cv_text(columns: Dict[str, Any], col_id: str) -> str:
     cv = columns.get(col_id)
-    if not cv:
+    return (cv.get("text") if cv else "") or ""
+
+
+def get_formula_display_value(columns: Dict[str, Any], formula_col_id: str) -> Optional[str]:
+    if not formula_col_id:
+        return None
+    txt = _cv_text(columns, formula_col_id)
+    return txt or None
+
+
+def get_status_text(columns: Dict[str, Any], status_col_id: str) -> str:
+    if not status_col_id:
         return ""
-    # 1) souvent ok
-    if cv.get("text"):
-        return str(cv["text"]).strip()
-    # 2) parfois Monday met le "text" dans value (JSON)
-    try:
-        if cv.get("value"):
-            v = cv["value"]
-            if isinstance(v, str):
-                v = json.loads(v)
-            if isinstance(v, dict):
-                t = v.get("text")
-                if t:
-                    return str(t).strip()
-    except Exception:
-        pass
+    return _cv_text(columns, status_col_id).strip()
+
+
+def get_iban_via_formula_or_status(columns: Dict[str, Any]) -> str:
+    # 1) essayer la colonne formula IBAN
+    if settings.IBAN_FORMULA_COLUMN_ID:
+        iban = get_formula_display_value(columns, settings.IBAN_FORMULA_COLUMN_ID)
+        if iban:
+            return iban.strip()
+
+    # 2) fallback : mapping par statut Business Line / Société
+    status_txt = get_status_text(columns, settings.BUSINESS_STATUS_COLUMN_ID)
+    if status_txt and status_txt in settings.PAYPLUG_IBAN_BY_STATUS:
+        return settings.PAYPLUG_IBAN_BY_STATUS[status_txt]
+
     return ""
 
 
-def get_formula_text(columns: Dict[str, Any], formula_col_id: str) -> Optional[str]:
-    if not formula_col_id:
-        return None
-    return _cv_text(columns, formula_col_id) or None
+def get_amount_from_formula_or_mapping(columns: Dict[str, Any], formula_col_id: str, acompten: int) -> float:
+    # 1) essai via colonne formula (si Monday renvoie quelque chose)
+    if formula_col_id:
+        txt = get_formula_display_value(columns, formula_col_id)
+        if txt:
+            try:
+                return float(str(txt).replace(",", "."))
+            except Exception:
+                pass
 
+    # 2) fallback : mapping par statut
+    status_txt = get_status_text(columns, settings.BUSINESS_STATUS_COLUMN_ID)
+    mapping = settings.ACOMPTE_AMOUNTS.get(str(acompten), {})
+    val = mapping.get(status_txt)
+    if val is not None:
+        return float(val)
 
-def get_formula_number(columns: Dict[str, Any], formula_col_id: str) -> float:
-    """Renvoie un nombre (float) à partir d'une colonne formula."""
-    txt = get_formula_text(columns, formula_col_id) or ""
-    if not txt:
-        return 0.0
-    # nettoyer €
-    txt = txt.replace("€", "").replace(" ", "").replace("\u00a0", "").replace(",", ".")
-    try:
-        return float(txt)
-    except Exception:
-        return 0.0
+    return 0.0
 
 
 def set_status(item_id: int, status_column_id: str, label: str) -> None:
@@ -140,7 +148,7 @@ def upload_file_to_files_column(item_id: int, column_id: str, filename: str, con
         "map": (None, json.dumps({"0": ["variables.file"]}), "application/json"),
         "0": (filename, content, mtype),
     }
-    url = f"{settings.MONDAY_API_URL}/file"  # /v2/file
+    url = f"{settings.MONDAY_API_URL}/file"
     r = requests.post(url, headers={"Authorization": settings.MONDAY_API_KEY}, files=files, timeout=90)
     if r.status_code >= 400:
         try:
