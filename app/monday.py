@@ -13,7 +13,7 @@ HEADERS = {
 def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
     """Retourne les valeurs texte des colonnes demandées"""
     query = """
-    query ($item_id: Int!) {
+    query ($item_id: ID!) {
         items (ids: [$item_id]) {
             column_values {
                 id
@@ -40,7 +40,7 @@ def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
 def get_formula_display_value(item_id: int, column_id: str) -> str:
     """Récupère le texte visible d'une formule Monday"""
     query = """
-    query ($item_id: Int!, $column_id: String!) {
+    query ($item_id: ID!, $column_id: String!) {
         items (ids: [$item_id]) {
             column_values(ids: [$column_id]) {
                 id
@@ -64,7 +64,7 @@ def get_formula_display_value(item_id: int, column_id: str) -> str:
 def set_link_in_column(item_id: int, board_id: int, column_id: str, url: str, text: str = "Payer"):
     """Écrit un lien cliquable dans Monday"""
     mutation = """
-    mutation ($item_id: Int!, $board_id: Int!, $column_id: String!, $value: JSON!) {
+    mutation ($item_id: ID!, $board_id: ID!, $column_id: String!, $value: JSON!) {
         change_simple_column_value(
             item_id: $item_id,
             board_id: $board_id,
@@ -85,7 +85,7 @@ def set_link_in_column(item_id: int, board_id: int, column_id: str, url: str, te
 # --- Change un statut ---
 def set_status(item_id: int, board_id: int, column_id: str, label: str):
     mutation = """
-    mutation ($item_id: Int!, $board_id: Int!, $column_id: String!, $value: String!) {
+    mutation ($item_id: ID!, $board_id: ID!, $column_id: String!, $value: String!) {
         change_simple_column_value(
             item_id: $item_id,
             board_id: $board_id,
