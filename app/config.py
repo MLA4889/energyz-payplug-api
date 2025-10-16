@@ -23,8 +23,9 @@ class Settings(BaseModel):
     STATUS_AFTER_PAY: dict = _loads_env_json("STATUS_AFTER_PAY_JSON", {})
     STATUS_COLUMN_ID: str = os.getenv("STATUS_COLUMN_ID", "")
     IBAN_FORMULA_COLUMN_ID: str = os.getenv("IBAN_FORMULA_COLUMN_ID", "")
-    BUSINESS_STATUS_COLUMN_ID: str = os.getenv("BUSINESS_STATUS_COLUMN_ID", "")  # ex: color_mkwnxf1h
-    BUSINESS_TO_IBAN: dict = _loads_env_json("BUSINESS_TO_IBAN_JSON", {})  # {"Energyz MAR":"FR76 ...", ...}
+
+    # Statut "Business Line / Société"
+    BUSINESS_STATUS_COLUMN_ID: str = os.getenv("BUSINESS_STATUS_COLUMN_ID", "")
 
     # ===== Devis depuis Monday =====
     CLIENT_TYPE_COLUMN_ID: str = os.getenv("CLIENT_TYPE_COLUMN_ID", "")
@@ -32,7 +33,7 @@ class Settings(BaseModel):
     QUOTE_AMOUNT_FORMULA_ID: str = os.getenv("QUOTE_AMOUNT_FORMULA_ID", "")
     QUOTE_LINK_COLUMN_ID: str = os.getenv("QUOTE_LINK_COLUMN_ID", "")
 
-    # Une seule colonne Files pour tout (optionnelle)
+    # Une seule colonne Files si tu veux centraliser (sinon laisse vide)
     DOC_FILES_COLUMN_ID: str = os.getenv("DOC_FILES_COLUMN_ID", "")
     QUOTE_FILES_COLUMN_ID: str = os.getenv("QUOTE_FILES_COLUMN_ID", "")
     INVOICE_FILES_COLUMN_ID: str = os.getenv("INVOICE_FILES_COLUMN_ID", "")
@@ -65,6 +66,10 @@ class Settings(BaseModel):
     PAYPLUG_MODE: str = os.getenv("PAYPLUG_MODE", "live")
     PAYPLUG_KEYS_LIVE: dict = _loads_env_json("PAYPLUG_KEYS_LIVE_JSON", {})
     PAYPLUG_KEYS_TEST: dict = _loads_env_json("PAYPLUG_KEYS_TEST_JSON", {})
+
+    # Mappings de secours (quand Monday formula renvoie vide)
+    PAYPLUG_IBAN_BY_STATUS: dict = _loads_env_json("PAYPLUG_IBAN_BY_STATUS_JSON", {})
+    ACOMPTE_AMOUNTS: dict = _loads_env_json("ACOMPTE_AMOUNTS_JSON", {})
 
     # ===== Divers =====
     PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
