@@ -19,6 +19,9 @@ def _post(query: str, variables: dict):
 
 
 def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
+    """
+    Récupère text + value (raw) pour les colonnes demandées.
+    """
     query = """
     query ($item_id: ID!) {
       items (ids: [$item_id]) {
@@ -38,7 +41,6 @@ def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
         cid = col["id"]
         if cid in column_ids:
             result[cid] = col.get("text") or ""
-        # On expose systématiquement le raw JSON (utile pour formulas / location)
         result[f"{cid}__raw"] = col.get("value") or ""
     return result
 
@@ -73,41 +75,3 @@ def set_status(item_id: int, column_id: str, label: str):
         "value": value,
     }
     _post(mutation, variables)
-
-
-# -------- Upload fichier PDF dans une colonne File --------
-def upload_file_to_column(item_id: int, column_id: str, filename: str, file_bytes: bytes):
-    """
-    add_file_to_column via /v2/file (multipart).
-    """
-    url = f"{MONDAY_API_URL}/file"
-
-    query = """
-    mutation ($board_id: ID!, $item_id: ID!, $column_id: String!, $file: File!) {
-      add_file_to_column (board_id: $board_id, item_id: $item_id, column_id: $column_id, file: $file) {
-        id
-      }
-    }
-    """
-
-    operations = json.dumps({
-        "query": query,
-        "variables": {
-            "board_id": settings.MONDAY_BOARD_ID,
-            "item_id": item_id,
-            "column_id": column_id,
-            "file": None
-        }
-    })
-    file_map = json.dumps({"0": ["variables.file"]})
-
-    files = {"0": (filename, file_bytes, "application/pdf")}
-    data = {"operations": operations, "map": file_map}
-    headers = {"Authorization": settings.MONDAY_API_KEY}
-
-    r = requests.post(url, headers=headers, data=data, files=files, timeout=60)
-    r.raise_for_status()
-    resp = r.json()
-    if "errors" in resp:
-        raise Exception(f"Erreur Monday (file upload): {resp['errors']}")
-    return True
