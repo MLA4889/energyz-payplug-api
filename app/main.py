@@ -10,10 +10,11 @@ from .monday import (
     set_status,
     compute_formula_value_for_item,
 )
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("energyz")
 
-app = FastAPI(title="Energyz PayPlug API", version="1.7 (formula-eval)")
+app = FastAPI(title="Energyz PayPlug API", version="1.8 (formula-1&2)")
 
 def _safe_json_loads(s, default=None):
     if s is None:
@@ -46,7 +47,7 @@ def _extract_status_label(value_json: dict) -> str:
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "Energyz PayPlug API (formula-eval) is live 🚀"}
+    return {"status": "ok", "message": "Energyz PayPlug API (formula-1&2) is live 🚀"}
 
 @app.post("/quote/from_monday")
 async def quote_from_monday(request: Request):
@@ -60,6 +61,7 @@ async def quote_from_monday(request: Request):
         if not item_id:
             raise HTTPException(status_code=400, detail="Item ID manquant (pulseId/itemId).")
 
+        # Détection acompte via la colonne status déclencheur
         trigger_col = event.get("columnId")
         trigger_status_col = getattr(settings, "TRIGGER_STATUS_COLUMN_ID", "status")
         trigger_labels = _safe_json_loads(
@@ -81,6 +83,7 @@ async def quote_from_monday(request: Request):
         if acompte_num not in ("1","2"):
             raise HTTPException(status_code=400, detail="Label status non reconnu pour acompte 1/2.")
 
+        # Colonnes & mapping
         formula_cols = _safe_json_loads(settings.FORMULA_COLUMN_IDS_JSON, default={}) or {}
         link_columns = _safe_json_loads(settings.LINK_COLUMN_IDS_JSON, default={}) or {}
         if acompte_num not in formula_cols or acompte_num not in link_columns:
@@ -90,9 +93,9 @@ async def quote_from_monday(request: Request):
             settings.EMAIL_COLUMN_ID,
             settings.ADDRESS_COLUMN_ID,
             settings.DESCRIPTION_COLUMN_ID,
-            settings.IBAN_FORMULA_COLUMN_ID,
-            settings.QUOTE_AMOUNT_FORMULA_ID,               # Total HT (utile si la formula y fait référence)
-            formula_cols[acompte_num],                      # Formula Acompte n
+            settings.IBAN_FORMULA_COLUMN_ID,           # IBAN (formula éventuelle)
+            settings.QUOTE_AMOUNT_FORMULA_ID,          # Total HT (utile si référencé)
+            formula_cols[acompte_num],                 # Formula Acompte n
             getattr(settings, "BUSINESS_STATUS_COLUMN_ID", "color_mkwnxf1h"),
         ]
         cols = get_item_columns(item_id, needed_cols)
@@ -103,18 +106,18 @@ async def quote_from_monday(request: Request):
         description = cols.get(settings.DESCRIPTION_COLUMN_ID, "") or ""
         iban = cols.get(settings.IBAN_FORMULA_COLUMN_ID, "") or ""
 
-        # 1) Essayer d'utiliser le texte/valeur renvoyé par Monday
+        # --- MONTANT ACOMPTE (1 ou 2) ---
         formula_id = formula_cols[acompte_num]
-        acompte_txt = _clean_number_text(cols.get(formula_id, ""))
+        acompte_txt = _clean_number_text(cols.get(formula_id, ""))  # 1) ce que Monday donne
 
-        # 2) Si vide -> recalcul local de l'expression de la Formula (settings_str)
         if float(acompte_txt or "0") <= 0:
+            # 2) Recalcul local de la formula (récursif) si Monday renvoie null
             computed = compute_formula_value_for_item(formula_id, int(item_id))
             if computed is not None and computed > 0:
                 acompte_txt = str(computed)
 
-        # 3) Si toujours vide -> dernier recours: Total HT / 2
         if float(acompte_txt or "0") <= 0:
+            # 3) Dernier recours pour ne pas planter
             total_ht_txt = _clean_number_text(cols.get(settings.QUOTE_AMOUNT_FORMULA_ID, "0"))
             if float(total_ht_txt) > 0:
                 acompte_txt = str(float(total_ht_txt) / 2.0)
@@ -125,7 +128,7 @@ async def quote_from_monday(request: Request):
         if amount_cents <= 0:
             raise HTTPException(status_code=400, detail=f"Montant invalide après parsing: '{acompte_txt}'.")
 
-        # Fallback IBAN via Business Line si formula IBAN vide
+        # IBAN : formula ou fallback Business Line
         if not iban:
             iban_by_status = _safe_json_loads(getattr(settings, "IBAN_BY_STATUS_JSON", None), default={}) or {}
             business_status_label = cols.get(getattr(settings, "BUSINESS_STATUS_COLUMN_ID", "color_mkwnxf1h"), "")
