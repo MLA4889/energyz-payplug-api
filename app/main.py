@@ -1,26 +1,85 @@
+import json
+import re
 from fastapi import FastAPI, Request, HTTPException
-import json, re
 
 from .config import settings
 from .payments import _choose_api_key, cents_from_str, create_payment
 from .monday import get_item_columns, set_link_in_column, set_status
-from .evoliz import create_quote, extract_public_link, extract_identifiers, build_app_quote_url
+from .evoliz import (
+    create_quote,
+    extract_identifiers,
+    get_or_create_public_link,
+    build_app_quote_url,
+)
 
-app = FastAPI(title="Energyz Payment Automation", version="2.5.0")
+app = FastAPI(title="Energyz Payment Automation", version="2.6.0")
+
 
 @app.get("/")
 def root():
     return {"status": "ok", "message": "Energyz Payment Automation is live 🚀"}
 
+
+# -------------- Helpers --------------
+
 def _clean_number_text(s: str) -> str:
-    if not s: return "0"
+    if not s:
+        return "0"
     s = s.replace("\u202f", "").replace(" ", "").replace("€", "").strip().replace(",", ".")
     m = re.search(r"[-+]?\d*\.?\d+", s)
     return m.group(0) if m else "0"
 
+
 def _to_float(s: str, default: float = 0.0) -> float:
-    try: return float(_clean_number_text(s))
-    except Exception: return default
+    try:
+        return float(_clean_number_text(s))
+    except Exception:
+        return default
+
+
+def _best_description(cols: dict) -> str:
+    """
+    Retourne la description presta, même si la colonne est une Formula.
+    Ordre:
+      1) text (colonne Formula si Monday la fournit)
+      2) value RAW (si JSON encodé -> essaye d'extraire "text" ou une chaîne)
+      3) fallback colonne texte (DESCRIPTION_FALLBACK_COLUMN_ID)
+      4) chaîne vide
+    """
+    # 1) direct (text)
+    desc = cols.get(settings.DESCRIPTION_COLUMN_ID, "") or ""
+    if desc:
+        return desc.strip()
+
+    # 2) RAW
+    raw = cols.get(f"{settings.DESCRIPTION_COLUMN_ID}__raw", "")
+    if raw:
+        # cas: c'est déjà une chaîne JSON (ex: "\"Ma description\"")
+        try:
+            j = json.loads(raw)
+            if isinstance(j, str) and j.strip():
+                return j.strip()
+            if isinstance(j, dict):
+                # certains renvoient {"text": "..."} / {"value": "..."}
+                if isinstance(j.get("text"), str) and j["text"].strip():
+                    return j["text"].strip()
+                if isinstance(j.get("value"), str) and j["value"].strip():
+                    return j["value"].strip()
+        except Exception:
+            # si ce n'est pas du JSON, tenter brut
+            if isinstance(raw, str) and raw.strip():
+                return raw.strip()
+
+    # 3) fallback texte
+    if settings.DESCRIPTION_FALLBACK_COLUMN_ID:
+        fb = cols.get(settings.DESCRIPTION_FALLBACK_COLUMN_ID, "")
+        if fb:
+            return fb.strip()
+
+    return ""
+
+
+# -------------- Webhook --------------
 
 @app.post("/quote/from_monday")
 async def quote_from_monday(request: Request):
@@ -38,14 +97,14 @@ async def quote_from_monday(request: Request):
         status_after = json.loads(settings.STATUS_AFTER_PAY_JSON)
 
         acompte_num = next((k for k, v in formula_columns.items() if v == column_id), None)
-        is_create_quote = (column_id == settings.CREATE_QUOTE_STATUS_COLUMN_ID)
+        is_create_quote = column_id == settings.CREATE_QUOTE_STATUS_COLUMN_ID
         if not acompte_num and not is_create_quote:
             raise HTTPException(status_code=400, detail=f"Colonne déclenchante inconnue: {column_id}")
 
         wanted = [
             settings.EMAIL_COLUMN_ID,
             settings.ADDRESS_COLUMN_ID,
-            settings.DESCRIPTION_COLUMN_ID,        # Formula
+            settings.DESCRIPTION_COLUMN_ID,  # Formula
             settings.IBAN_FORMULA_COLUMN_ID,
             settings.QUOTE_AMOUNT_FORMULA_ID,
             settings.VAT_RATE_COLUMN_ID,
@@ -57,44 +116,42 @@ async def quote_from_monday(request: Request):
 
         cols = get_item_columns(item_id, wanted)
 
-        # Adresse RAW
+        # Adresse RAW (structurée)
         address_raw_json = cols.get(f"{settings.ADDRESS_COLUMN_ID}__raw")
-        address_raw = None
         try:
             address_raw = json.loads(address_raw_json) if address_raw_json else None
         except Exception:
-            pass
+            address_raw = None
 
-        name        = cols.get("name", "Client Energyz")
-        email       = cols.get(settings.EMAIL_COLUMN_ID, "")
+        # Données
+        name = cols.get("name", "Client Energyz")
+        email = cols.get(settings.EMAIL_COLUMN_ID, "")
         address_txt = cols.get(settings.ADDRESS_COLUMN_ID, "")
-        # Description: on prend la Formula; si vide (API Monday…), on tente le fallback texte
-        description = cols.get(settings.DESCRIPTION_COLUMN_ID, "") or \
-                      (cols.get(settings.DESCRIPTION_FALLBACK_COLUMN_ID, "") if settings.DESCRIPTION_FALLBACK_COLUMN_ID else "")
-        iban        = cols.get(settings.IBAN_FORMULA_COLUMN_ID, "")
-        total_ht    = cols.get(settings.TOTAL_HT_COLUMN_ID) or cols.get(settings.QUOTE_AMOUNT_FORMULA_ID) or "0"
-        vat_rate    = cols.get(settings.VAT_RATE_COLUMN_ID, "") or "20"
+        description = _best_description(cols)  # <- désignation à partir de la Formula (robuste)
+        iban = cols.get(settings.IBAN_FORMULA_COLUMN_ID, "")
+        total_ht = cols.get(settings.TOTAL_HT_COLUMN_ID) or cols.get(settings.QUOTE_AMOUNT_FORMULA_ID) or "0"
+        vat_rate = cols.get(settings.VAT_RATE_COLUMN_ID, "") or "20"
 
-        # ===== Acomptes =====
+        # -------- Acomptes --------
         if acompte_num:
             api_key = _choose_api_key(iban)
             amount_cents = cents_from_str(total_ht)
             if acompte_num == "2":
-                amount_cents //= 2
+                amount_cents //= 2  # règle actuelle (50% pour acompte 2)
             metadata = {"item_id": item_id, "acompte": acompte_num}
             payment_url = create_payment(api_key, amount_cents, email, address_txt, description, metadata)
             set_link_in_column(item_id, link_columns[acompte_num], payment_url, f"Payer acompte {acompte_num}")
             set_status(item_id, settings.STATUS_COLUMN_ID, status_after[acompte_num])
             return {"status": "ok", "type": "acompte", "acompte": acompte_num, "payment_url": payment_url}
 
-        # ===== Devis Evoliz =====
+        # -------- Devis Evoliz --------
         unit_price_ht = _to_float(total_ht, 0.0)
         vr = _to_float(vat_rate, 20.0)
         label = name or description or "Devis"
 
         quote = create_quote(
             label=label,
-            description=description,            # ← désignation = description
+            description=description,  # <- utilisé comme désignation Evoliz
             unit_price_ht=unit_price_ht,
             vat_rate=vr,
             recipient_name=name,
@@ -103,16 +160,18 @@ async def quote_from_monday(request: Request):
         )
 
         qid, qnumber = extract_identifiers(quote)
-        public_url = extract_public_link(quote)
+
+        # Lien public (création/lecture automatique)
+        public_url = get_or_create_public_link(qid, recipient_email=email)
         deep_link = build_app_quote_url(qid)
 
         link_text = "Devis Evoliz"
-        if qnumber: link_text += f" #{qnumber}"
-        if qid:     link_text += f" (ID:{qid})"
+        if qnumber:
+            link_text += f" #{qnumber}"
+        if qid:
+            link_text += f" (ID:{qid})"
 
-        # URL prioritaire: public > deep-link tenant > base
         url_to_set = public_url or deep_link or settings.EVOLIZ_BASE_URL
-
         set_link_in_column(item_id, settings.QUOTE_LINK_COLUMN_ID, url_to_set, link_text)
 
         return {
@@ -123,6 +182,7 @@ async def quote_from_monday(request: Request):
             "public_url": public_url,
             "deep_link": deep_link,
             "link_used": url_to_set,
+            "designation_used": description,
         }
 
     except HTTPException:
@@ -130,3 +190,16 @@ async def quote_from_monday(request: Request):
     except Exception as e:
         print(f"[ERROR] Evoliz quote error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# petit endpoint de test PayPlug
+@app.post("/pay/acompte/{n}")
+async def create_acompte_link(n: int):
+    try:
+        api_key = _choose_api_key("FR76 1695 8000 0130 5670 5696 366")
+        amount_cents = cents_from_str("1250.00") // (2 if n == 2 else 1)
+        metadata = {"client": "Jean Dupont", "acompte": str(n)}
+        url = create_payment(api_key, amount_cents, "jean@mail.com", "12 rue de Paris", "Installation solaire", metadata)
+        return {"status": "ok", "acompte": n, "payment_url": url}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
