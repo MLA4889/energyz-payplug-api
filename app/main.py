@@ -3,9 +3,9 @@ import json, re
 from .config import settings
 from .payments import _choose_api_key, cents_from_str, create_payment
 from .monday import get_item_columns, set_link_in_column, set_status
-from .evoliz import create_quote, extract_public_link
+from .evoliz import create_quote, extract_public_link, extract_identifiers
 
-app = FastAPI(title="Energyz Payment Automation", version="2.1.1")
+app = FastAPI(title="Energyz Payment Automation", version="2.2.0")
 
 @app.get("/")
 def root():
@@ -39,7 +39,7 @@ async def quote_from_monday(request: Request):
         if not acompte_num and not is_create_quote:
             raise HTTPException(status_code=400, detail=f"Colonne déclenchante inconnue: {column_id}")
 
-        # Lecture des colonnes utiles (+ RAW pour l'adresse)
+        # Lecture colonnes utiles
         wanted = [
             settings.EMAIL_COLUMN_ID,
             settings.ADDRESS_COLUMN_ID,
@@ -80,8 +80,14 @@ async def quote_from_monday(request: Request):
             return {"status": "ok", "type": "acompte", "acompte": acompte_num, "payment_url": payment_url}
 
         # ===== DEVIS EVOLIZ =====
-        unit_price_ht = float(_clean_number_text(total_ht))
-        vr = float(_clean_number_text(vat_rate)) if str(vat_rate).strip() != "" else 20.0
+        def to_float(s: str, default: float = 0.0) -> float:
+            try:
+                return float(_clean_number_text(s))
+            except Exception:
+                return default
+
+        unit_price_ht = to_float(total_ht, 0.0)
+        vr = to_float(vat_rate, 20.0)
         label = name or description or "Devis"
 
         quote = create_quote(
@@ -91,12 +97,26 @@ async def quote_from_monday(request: Request):
             vat_rate=vr,
             recipient_name=name,
             recipient_email=email,
-            recipient_address_json=address_raw  # <<< IMPORTANT : bon nom d’argument
+            recipient_address_json=address_raw
         )
-        public_url = extract_public_link(quote) or settings.EVOLIZ_BASE_URL
-        set_link_in_column(item_id, settings.QUOTE_LINK_COLUMN_ID, public_url, "Devis Evoliz")
 
-        return {"status": "ok", "type": "devis", "public_url": public_url, "evoliz": quote}
+        # on tente d'obtenir un lien partageable
+        public_url = extract_public_link(quote)
+        qid, qnumber = extract_identifiers(quote)
+
+        # Texte propre pour Monday quoi qu'il arrive
+        link_text = f"Devis Evoliz"
+        if qnumber:
+            link_text += f" #{qnumber}"
+        if qid:
+            link_text += f" (ID:{qid})"
+
+        # Si pas de lien public, on met l’URL Evoliz (racine) pour ouvrir le compte
+        url_to_set = public_url or settings.EVOLIZ_BASE_URL
+
+        set_link_in_column(item_id, settings.QUOTE_LINK_COLUMN_ID, url_to_set, link_text)
+
+        return {"status": "ok", "type": "devis", "public_url": public_url, "quote_id": qid, "quote_number": qnumber}
 
     except HTTPException:
         raise
