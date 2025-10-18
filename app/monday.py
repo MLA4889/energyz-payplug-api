@@ -16,6 +16,38 @@ def _post(query: str, variables: dict):
         raise Exception(f"Erreur Monday: {data['errors']}")
     return data
 
+def _extract_text_from_column(col: dict) -> str:
+    """
+    Monday renvoie pour chaque colonne:
+      - col['text'] (parfois vide pour les FORMULA)
+      - col['value'] (JSON string ou dict) pouvant contenir 'text' ou 'value'
+    On tente dans l’ordre: text -> value.text -> value.value -> str(value)
+    """
+    # 1) essayer 'text' direct
+    if col.get("text"):
+        return str(col["text"])
+
+    # 2) sinon parser 'value'
+    raw_val = col.get("value")
+    if raw_val is None or raw_val == "":
+        return ""
+
+    try:
+        parsed = json.loads(raw_val) if isinstance(raw_val, str) else raw_val
+    except Exception:
+        # parfois value est un plain string
+        return str(raw_val)
+
+    if isinstance(parsed, dict):
+        if parsed.get("text"):
+            return str(parsed["text"])
+        if parsed.get("value"):
+            return str(parsed["value"])
+        # sinon on tente de retransformer en string lisible
+        return json.dumps(parsed, ensure_ascii=False)
+    else:
+        return str(parsed)
+
 def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
     query = """
     query ($item_id: ID!) {
@@ -34,13 +66,10 @@ def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
     result = {"name": item["name"]}
     for col in item["column_values"]:
         if col["id"] in column_ids:
-            result[col["id"]] = col.get("text") or ""
+            result[col["id"]] = _extract_text_from_column(col)
     return result
 
 def set_link_in_column(item_id: int, column_id: str, url: str, text: str):
-    """
-    For LINK columns, use change_column_value with board_id and a JSON-stringified value.
-    """
     mutation = """
     mutation ($board_id: ID!, $item_id: ID!, $column_id: String!, $value: JSON!) {
       change_column_value(board_id: $board_id, item_id: $item_id, column_id: $column_id, value: $value) {
@@ -57,9 +86,6 @@ def set_link_in_column(item_id: int, column_id: str, url: str, text: str):
     })
 
 def set_status(item_id: int, column_id: str, label: str):
-    """
-    Status update with board_id for compatibility.
-    """
     mutation = """
     mutation ($board_id: ID!, $item_id: ID!, $column_id: String!, $value: String!) {
       change_simple_column_value(board_id: $board_id, item_id: $item_id, column_id: $column_id, value: $value) {
