@@ -5,8 +5,9 @@ from .config import settings
 MONDAY_API_URL = "https://api.monday.com/v2"
 HEADERS = {
     "Authorization": settings.MONDAY_API_KEY,
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
 }
+
 
 def _post(query: str, variables: dict):
     r = requests.post(MONDAY_API_URL, headers=HEADERS, json={"query": query, "variables": variables})
@@ -16,8 +17,12 @@ def _post(query: str, variables: dict):
         raise Exception(f"Erreur Monday: {data['errors']}")
     return data
 
+
 def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
-    # On ramène name + column_values (id, text, value) puis on expose aussi __raw
+    """
+    Ramène le name + toutes les colonnes,
+    expose `text` et le JSON brut en suffixe `__raw`.
+    """
     query = """
     query ($item_id: ID!) {
       items (ids: [$item_id]) {
@@ -37,23 +42,48 @@ def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
         cid = col["id"]
         if cid in column_ids:
             result[cid] = col.get("text") or ""
-        # on expose toujours le RAW (JSON) si on en a besoin
         result[f"{cid}__raw"] = col.get("value") or ""
     return result
 
+
 def set_link_in_column(item_id: int, column_id: str, url: str, text: str):
+    """
+    Utilise change_column_value (avec board_id) et envoie une CHAÎNE JSON.
+    """
     mutation = """
-    mutation ($item_id: ID!, $column_id: String!, $value: JSON!) {
-      change_simple_column_value(item_id: $item_id, column_id: $column_id, value: $value) { id }
+    mutation ($board_id: ID!, $item_id: ID!, $column_id: String!, $value: JSON!) {
+      change_column_value(board_id: $board_id, item_id: $item_id, column_id: $column_id, value: $value) {
+        id
+      }
     }
     """
+    # IMPORTANT : value doit être une chaîne JSON
     value = json.dumps({"url": url, "text": text})
-    _post(mutation, {"item_id": item_id, "column_id": column_id, "value": value})
+    variables = {
+        "board_id": settings.MONDAY_BOARD_ID,
+        "item_id": item_id,
+        "column_id": column_id,
+        "value": value,
+    }
+    _post(mutation, variables)
+
 
 def set_status(item_id: int, column_id: str, label: str):
+    """
+    Pour un Status, change_column_value attend aussi une CHAÎNE JSON : {"label": "Mon statut"}.
+    """
     mutation = """
-    mutation ($item_id: ID!, $column_id: String!, $value: String!) {
-      change_simple_column_value(item_id: $item_id, column_id: $column_id, value: $value) { id }
+    mutation ($board_id: ID!, $item_id: ID!, $column_id: String!, $value: JSON!) {
+      change_column_value(board_id: $board_id, item_id: $item_id, column_id: $column_id, value: $value) {
+        id
+      }
     }
     """
-    _post(mutation, {"item_id": item_id, "column_id": column_id, "value": label})
+    value = json.dumps({"label": label})
+    variables = {
+        "board_id": settings.MONDAY_BOARD_ID,
+        "item_id": item_id,
+        "column_id": column_id,
+        "value": value,
+    }
+    _post(mutation, variables)
