@@ -5,9 +5,9 @@ from .config import settings
 
 def _choose_api_key(iban: str) -> str:
     """Sélectionne la clé PayPlug selon l’IBAN et le mode (test/live)."""
-    mode = settings.PAYPLUG_MODE.lower()
+    mode = (settings.PAYPLUG_MODE or "").lower()
     key_dict = json.loads(settings.PAYPLUG_KEYS_TEST_JSON if mode == "test" else settings.PAYPLUG_KEYS_LIVE_JSON)
-    return key_dict.get(iban.strip())
+    return key_dict.get((iban or "").strip())
 
 
 def cents_from_str(amount_str: str) -> int:
@@ -15,7 +15,7 @@ def cents_from_str(amount_str: str) -> int:
     try:
         if not amount_str:
             return 0
-        cleaned = str(amount_str).replace("€", "").replace(" ", "").replace(",", ".")
+        cleaned = str(amount_str).replace("€", "").replace("\u202f", "").replace(" ", "").replace(",", ".")
         return int(round(float(cleaned) * 100))
     except Exception:
         return 0
@@ -39,7 +39,7 @@ def create_payment(api_key: str, amount_cents: int, email: str, address: str, cl
         },
         "metadata": metadata,
         "hosted_payment": {
-            "return_url": settings.PUBLIC_BASE_URL  # Redirigé ici après paiement
+            "return_url": settings.PUBLIC_BASE_URL  # Redirection après paiement
         },
         "description": metadata.get("description", "Paiement acompte Energyz")
     }
