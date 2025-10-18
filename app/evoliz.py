@@ -7,10 +7,12 @@ SESSION = {"token": None}
 
 def _login() -> str:
     url = f"{settings.EVOLIZ_BASE_URL}/api/login"
-    r = requests.post(url, json={
-        "public_key": settings.EVOLIZ_PUBLIC_KEY,
-        "secret_key": settings.EVOLIZ_SECRET_KEY
-    }, headers={"Content-Type": "application/json"}, timeout=25)
+    r = requests.post(
+        url,
+        json={"public_key": settings.EVOLIZ_PUBLIC_KEY, "secret_key": settings.EVOLIZ_SECRET_KEY},
+        headers={"Content-Type": "application/json"},
+        timeout=25,
+    )
     r.raise_for_status()
     data = r.json()
     token = data.get("access_token") or data.get("token")
@@ -22,10 +24,7 @@ def _login() -> str:
 def _headers() -> dict:
     if not SESSION["token"]:
         _login()
-    return {
-        "Authorization": f"Bearer {SESSION['token']}",
-        "Content-Type": "application/json"
-    }
+    return {"Authorization": f"Bearer {SESSION['token']}", "Content-Type": "application/json"}
 
 def _get(path: str, params: dict | None = None):
     url = f"{settings.EVOLIZ_BASE_URL}{path}"
@@ -36,25 +35,20 @@ def _get(path: str, params: dict | None = None):
     r.raise_for_status()
     return r.json()
 
-def _post(path: str, payload: dict | None = None, method: str = "POST"):
+def _request(method: str, path: str, payload: dict | None = None):
     url = f"{settings.EVOLIZ_BASE_URL}{path}"
-    if method == "POST":
-        r = requests.post(url, headers=_headers(), json=payload or {}, timeout=25)
-    else:
-        r = requests.request(method, url, headers=_headers(), json=payload or {}, timeout=25)
-
+    r = requests.request(method, url, headers=_headers(), json=payload or {}, timeout=25)
     if r.status_code == 401:
         _login()
-        if method == "POST":
-            r = requests.post(url, headers=_headers(), json=payload or {}, timeout=25)
-        else:
-            r = requests.request(method, url, headers=_headers(), json=payload or {}, timeout=25)
-
+        r = requests.request(method, url, headers=_headers(), json=payload or {}, timeout=25)
     if not r.ok:
         raise Exception(f"Evoliz API error {r.status_code}: {r.text}")
     return r.json()
 
-# -----------------------  Recherches client/prospect  -----------------------
+def _post(path: str, payload: dict | None = None):
+    return _request("POST", path, payload)
+
+# ---------- LOOKUPS ----------
 
 def _find_client_by_email(email: str) -> Optional[str]:
     if not email:
@@ -95,7 +89,7 @@ def _find_prospect_by_name(name: str) -> Optional[str]:
         pass
     return None
 
-# -----------------------  Adresse Monday → Evoliz  -----------------------
+# ---------- ADDRESS (Monday → Evoliz) ----------
 
 def _normalize_address(addr: Dict[str, Any] | None) -> Dict[str, str]:
     addr = addr or {}
@@ -110,14 +104,14 @@ def _normalize_address(addr: Dict[str, Any] | None) -> Dict[str, str]:
 
     return {"street": street, "town": town, "postcode": postcode, "iso2": iso2}
 
-# -----------------------  Prospect robuste  -----------------------
+# ---------- PROSPECT ----------
 
 def _create_prospect(name: str, email: str, address_json: Dict[str, Any] | None) -> Optional[str]:
     address = _normalize_address(address_json)
     payload = {
         "name": name or (email.split("@")[0] if email else "Prospect"),
         "email": email or "",
-        "address": address
+        "address": address,
     }
     try:
         data = _post(f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/prospects", payload)
@@ -149,7 +143,7 @@ def ensure_recipient(name: str, email: str, address_json: Dict[str, Any] | None)
     pid = _create_prospect(name, email, address_json)
     return (None, pid)
 
-# -----------------------  Devis  -----------------------
+# ---------- QUOTES ----------
 
 def create_quote(
     label: str,
@@ -161,27 +155,28 @@ def create_quote(
     recipient_address_json: Dict[str, Any] | None
 ) -> dict:
     """
-    Crée un devis Evoliz :
-      - documentdate (YYYY-MM-DD)
-      - clientid OU prospectid
+    Crée un devis :
       - term.paytermid (1 = comptant)
-      - items[{designation, quantity, unit_price, vat_rate}]
+      - items[designation=DESCRIPTION PRESTA !, quantity=1, unit_price, vat_rate]
     """
     clientid, prospectid = ensure_recipient(recipient_name, recipient_email, recipient_address_json)
 
+    # IMPORTANT : on force la désignation à la description (pas le nom)
+    designation = (description or "").strip() or (label or "Prestation")
+
     payload = {
-        "label": label or description or "Devis",
+        "label": label or designation or "Devis",
         "documentdate": dt.date.today().isoformat(),
         "status": "draft",
         "term": {"paytermid": 1},
         "items": [
             {
-                "designation": description or label or "Prestation",
+                "designation": designation,
                 "quantity": 1,
                 "unit_price": round(float(unit_price_ht), 2),
-                "vat_rate": round(float(vat_rate), 2)
+                "vat_rate": round(float(vat_rate), 2),
             }
-        ]
+        ],
     }
     if clientid:
         payload["clientid"] = clientid
@@ -194,17 +189,14 @@ def get_quote(quote_id: str) -> dict:
     return _get(f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes/{quote_id}")
 
 def _try_create_share_link(quote_id: str) -> Optional[str]:
-    """
-    Essaye différentes routes possibles pour générer un lien partageable.
-    """
+    # Essais de routes “classiques” si ton compte permet de générer un lien public
     candidates = [
         (f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes/{quote_id}/share", "POST"),
         (f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes/{quote_id}/public-link", "POST"),
     ]
     for path, method in candidates:
         try:
-            data = _post(path, {}, method=method)
-            # on tente d'extraire un lien dans la réponse
+            data = _request(method, path, {})
             for k in ["public_link", "public_url", "share_link", "url"]:
                 if isinstance(data, dict) and (val := data.get(k)):
                     return str(val)
@@ -216,11 +208,6 @@ def _try_create_share_link(quote_id: str) -> Optional[str]:
     return None
 
 def extract_public_link(quote_response: dict) -> Optional[str]:
-    """
-    Cherche un lien public dans la réponse de création,
-    sinon relit le devis, puis tente de créer un lien partageable.
-    """
-    # 1) direct
     for key in ["public_link", "public_url", "portal_url", "share_link", "url", "download_url", "pdf_url"]:
         v = quote_response.get(key)
         if v:
@@ -231,12 +218,10 @@ def extract_public_link(quote_response: dict) -> Optional[str]:
         if v:
             return str(v)
 
-    # 2) recharge / création
     qid = str(quote_response.get("id") or nested.get("id") or "")
     if not qid:
         return None
 
-    # relire le devis
     try:
         full = get_quote(qid)
         for key in ["public_link", "public_url", "portal_url", "share_link", "url", "download_url", "pdf_url"]:
@@ -246,11 +231,9 @@ def extract_public_link(quote_response: dict) -> Optional[str]:
     except Exception:
         pass
 
-    # tenter de créer un lien partageable via endpoints possibles
     created = _try_create_share_link(qid)
     if created:
         return created
-
     return None
 
 def extract_identifiers(quote_response: dict) -> Tuple[Optional[str], Optional[str]]:
@@ -258,3 +241,20 @@ def extract_identifiers(quote_response: dict) -> Tuple[Optional[str], Optional[s
     qid = str(data.get("id") or data.get("quoteid") or "")
     number = str(data.get("number") or data.get("quotenumber") or "")
     return (qid or None, number or None)
+
+def build_app_quote_url(quote_id: str) -> Optional[str]:
+    """
+    Construit un deep-link vers l’app Evoliz.
+    Renseigne EVOLIZ_APP_BASE_URL (ex: https://app.evoliz.com).
+    On tente plusieurs chemins usuels.
+    """
+    base = getattr(settings, "EVOLIZ_APP_BASE_URL", None)
+    if not base:
+        return None
+    base = base.rstrip("/")
+    paths = [
+        f"/quotes/{quote_id}",
+        f"/documents/quotes/{quote_id}",
+        f"/app/quotes/{quote_id}",
+    ]
+    return base + paths[0]  # le premier est le plus probable
