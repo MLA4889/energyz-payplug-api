@@ -7,7 +7,11 @@ from .payments import _choose_api_key, cents_from_str, create_payment
 from .monday import get_item_columns, set_link_in_column, set_status
 
 # Evoliz est optionnel : on ne casse JAMAIS les acomptes
-ENABLE_EVOLIZ = bool(settings.ENABLE_EVOLIZ)
+# AVANT (fragile) :
+# ENABLE_EVOLIZ = bool(settings.ENABLE_EVOLIZ)
+
+# APRÈS (robuste, même si la variable n’existe pas) :
+ENABLE_EVOLIZ = bool(getattr(settings, "ENABLE_EVOLIZ", False))
 
 if ENABLE_EVOLIZ:
     # imports "souples" pour éviter tout crash si non configuré
