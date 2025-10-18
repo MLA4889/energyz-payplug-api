@@ -5,7 +5,7 @@ from .payments import _choose_api_key, cents_from_str, create_payment
 from .monday import get_item_columns, set_link_in_column, set_status
 from .evoliz import create_quote, extract_public_link
 
-app = FastAPI(title="Energyz Payment Automation", version="2.1")
+app = FastAPI(title="Energyz Payment Automation", version="2.1.1")
 
 @app.get("/")
 def root():
@@ -29,7 +29,7 @@ async def quote_from_monday(request: Request):
         if not item_id:
             raise HTTPException(status_code=400, detail="Item ID manquant.")
 
-        # Détections
+        # Détecteurs
         formula_columns = json.loads(settings.FORMULA_COLUMN_IDS_JSON)
         link_columns = json.loads(settings.LINK_COLUMN_IDS_JSON)
         status_after = json.loads(settings.STATUS_AFTER_PAY_JSON)
@@ -39,7 +39,7 @@ async def quote_from_monday(request: Request):
         if not acompte_num and not is_create_quote:
             raise HTTPException(status_code=400, detail=f"Colonne déclenchante inconnue: {column_id}")
 
-        # Lecture colonnes (on veut aussi le RAW de l'adresse)
+        # Lecture des colonnes utiles (+ RAW pour l'adresse)
         wanted = [
             settings.EMAIL_COLUMN_ID,
             settings.ADDRESS_COLUMN_ID,
@@ -51,7 +51,8 @@ async def quote_from_monday(request: Request):
             settings.TOTAL_TTC_COLUMN_ID
         ]
         cols = get_item_columns(item_id, wanted)
-        # Récup RAW adresse si présent
+
+        # Adresse RAW (json de la colonne Location Monday)
         address_raw_json = cols.get(f"{settings.ADDRESS_COLUMN_ID}__raw")
         try:
             address_raw = json.loads(address_raw_json) if address_raw_json else None
@@ -90,7 +91,7 @@ async def quote_from_monday(request: Request):
             vat_rate=vr,
             recipient_name=name,
             recipient_email=email,
-            recipient_address_json=address_raw   # <-- adresse structurée (street, town, postcode, iso2)
+            recipient_address_json=address_raw  # <<< IMPORTANT : bon nom d’argument
         )
         public_url = extract_public_link(quote) or settings.EVOLIZ_BASE_URL
         set_link_in_column(item_id, settings.QUOTE_LINK_COLUMN_ID, public_url, "Devis Evoliz")
