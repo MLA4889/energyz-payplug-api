@@ -4,23 +4,22 @@ from fastapi import FastAPI, Request, HTTPException
 
 from .config import settings
 from .payments import _choose_api_key, cents_from_str, create_payment
-from .monday import get_item_columns, set_link_in_column, set_status
+from .monday import get_item_columns, set_link_in_column, set_status, upload_file_to_column
 from .evoliz import (
     create_quote,
     extract_identifiers,
-    get_or_create_public_link,   # ← présent dans evoliz.py ci-dessus
+    get_or_create_public_link,
     build_app_quote_url,
+    download_quote_pdf,                   # ⬅️ nouveau
 )
 
-app = FastAPI(title="Energyz Payment Automation", version="2.6.1")
+app = FastAPI(title="Energyz Payment Automation", version="2.7.0")
 
 
 @app.get("/")
 def root():
     return {"status": "ok", "message": "Energyz Payment Automation is live 🚀"}
 
-
-# -------------- Helpers --------------
 
 def _clean_number_text(s: str) -> str:
     if not s:
@@ -38,17 +37,9 @@ def _to_float(s: str, default: float = 0.0) -> float:
 
 
 def _best_description(cols: dict) -> str:
-    """
-    Retourne la description presta, même si la colonne est une Formula.
-    Ordre:
-      1) text (Formula si Monday la fournit)
-      2) value RAW JSON (extrait "text"/"value" ou chaîne)
-      3) fallback colonne texte (DESCRIPTION_FALLBACK_COLUMN_ID)
-    """
     desc = cols.get(settings.DESCRIPTION_COLUMN_ID, "") or ""
     if desc:
         return desc.strip()
-
     raw = cols.get(f"{settings.DESCRIPTION_COLUMN_ID}__raw", "")
     if raw:
         try:
@@ -63,16 +54,12 @@ def _best_description(cols: dict) -> str:
         except Exception:
             if isinstance(raw, str) and raw.strip():
                 return raw.strip()
-
     if settings.DESCRIPTION_FALLBACK_COLUMN_ID:
         fb = cols.get(settings.DESCRIPTION_FALLBACK_COLUMN_ID, "")
         if fb:
             return fb.strip()
-
     return ""
 
-
-# -------------- Webhook --------------
 
 @app.post("/quote/from_monday")
 async def quote_from_monday(request: Request):
@@ -109,18 +96,16 @@ async def quote_from_monday(request: Request):
 
         cols = get_item_columns(item_id, wanted)
 
-        # Adresse RAW (structurée)
         address_raw_json = cols.get(f"{settings.ADDRESS_COLUMN_ID}__raw")
         try:
             address_raw = json.loads(address_raw_json) if address_raw_json else None
         except Exception:
             address_raw = None
 
-        # Données
         name = cols.get("name", "Client Energyz")
         email = cols.get(settings.EMAIL_COLUMN_ID, "")
         address_txt = cols.get(settings.ADDRESS_COLUMN_ID, "")
-        description = _best_description(cols)           # ← Désignation = Description presta
+        description = _best_description(cols)
         iban = cols.get(settings.IBAN_FORMULA_COLUMN_ID, "")
         total_ht = cols.get(settings.TOTAL_HT_COLUMN_ID) or cols.get(settings.QUOTE_AMOUNT_FORMULA_ID) or "0"
         vat_rate = cols.get(settings.VAT_RATE_COLUMN_ID, "") or "20"
@@ -144,7 +129,7 @@ async def quote_from_monday(request: Request):
 
         quote = create_quote(
             label=label,
-            description=description,  # ← utilisé comme désignation Evoliz
+            description=description,
             unit_price_ht=unit_price_ht,
             vat_rate=vr,
             recipient_name=name,
@@ -154,7 +139,6 @@ async def quote_from_monday(request: Request):
 
         qid, qnumber = extract_identifiers(quote)
 
-        # Lien public (création/lecture automatique)
         public_url = get_or_create_public_link(qid, recipient_email=email)
         deep_link = build_app_quote_url(qid)
 
@@ -164,8 +148,18 @@ async def quote_from_monday(request: Request):
         if qid:
             link_text += f" (ID:{qid})"
 
+        # 1) On met quand même quelque chose dans la colonne Lien
         url_to_set = public_url or deep_link or settings.EVOLIZ_BASE_URL
         set_link_in_column(item_id, settings.QUOTE_LINK_COLUMN_ID, url_to_set, link_text)
+
+        # 2) Si PAS de lien public -> on attache le PDF dans la colonne Fichier
+        if not public_url and settings.QUOTE_FILES_COLUMN_ID:
+            pdf_bytes, filename = download_quote_pdf(qid)
+            try:
+                upload_file_to_column(item_id, settings.QUOTE_FILES_COLUMN_ID, filename, pdf_bytes)
+            except Exception as up_err:
+                # On loggue mais on n'empêche pas la réponse HTTP 200 si le reste est OK
+                print(f"[WARN] Upload PDF Monday: {up_err}")
 
         return {
             "status": "ok",
@@ -175,6 +169,7 @@ async def quote_from_monday(request: Request):
             "public_url": public_url,
             "deep_link": deep_link,
             "link_used": url_to_set,
+            "pdf_attached": bool(not public_url and settings.QUOTE_FILES_COLUMN_ID),
             "designation_used": description,
         }
 
