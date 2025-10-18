@@ -10,7 +10,6 @@ from .config import settings
 SESSION = {"token": None}
 
 def _login() -> str:
-    """Authenticate to Evoliz and cache the bearer token."""
     url = f"{settings.EVOLIZ_BASE_URL}/api/login"
     r = requests.post(
         url,
@@ -61,10 +60,7 @@ def _find_client_by_email(email: str) -> Optional[str]:
     if not email:
         return None
     try:
-        data = _get(
-            f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/clients",
-            params={"search": email},
-        )
+        data = _get(f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/clients", params={"search": email})
         items = data if isinstance(data, list) else data.get("data") or []
         for it in items:
             if str(it.get("email", "")).lower() == email.lower():
@@ -77,10 +73,7 @@ def _find_prospect_by_email(email: str) -> Optional[str]:
     if not email:
         return None
     try:
-        data = _get(
-            f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/prospects",
-            params={"search": email},
-        )
+        data = _get(f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/prospects", params={"search": email})
         items = data if isinstance(data, list) else data.get("data") or []
         for it in items:
             if str(it.get("email", "")).lower() == email.lower():
@@ -93,10 +86,7 @@ def _find_prospect_by_name(name: str) -> Optional[str]:
     if not name:
         return None
     try:
-        data = _get(
-            f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/prospects",
-            params={"search": name},
-        )
+        data = _get(f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/prospects", params={"search": name})
         items = data if isinstance(data, list) else data.get("data") or []
         for it in items:
             if str(it.get("name", "")).strip().lower() == name.strip().lower():
@@ -110,13 +100,6 @@ def _find_prospect_by_name(name: str) -> Optional[str]:
 # --------------------------------------------------------------------------------------
 
 def _normalize_address(addr: Dict[str, Any] | None) -> Dict[str, str]:
-    """
-    Mappe la valeur brute de la colonne Location Monday vers le format Evoliz.
-    - street: street.long_name ou address
-    - town: city.long_name
-    - postcode: postalCode/postcode (fallback "00000")
-    - iso2: country.short_name (fallback "FR")
-    """
     addr = addr or {}
     street_obj = addr.get("street") or {}
     city_obj   = addr.get("city") or {}
@@ -152,35 +135,21 @@ def _create_prospect(name: str, email: str, address_json: Dict[str, Any] | None)
         raise
 
 def ensure_recipient(name: str, email: str, address_json: Dict[str, Any] | None) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Retourne (clientid, prospectid). Un seul des deux sera renseigné.
-    Ordre:
-      1) client par défaut (ENV)
-      2) client par email
-      3) prospect par email
-      4) prospect par nom
-      5) création prospect
-    """
-    # 1) client forcé
     if settings.EVOLIZ_DEFAULT_CLIENT_ID:
         return (str(settings.EVOLIZ_DEFAULT_CLIENT_ID), None)
 
-    # 2) client existant par email
     cid = _find_client_by_email(email)
     if cid:
         return (cid, None)
 
-    # 3) prospect existant par email
     pid = _find_prospect_by_email(email)
     if pid:
         return (None, pid)
 
-    # 4) prospect existant par nom
     pid = _find_prospect_by_name(name)
     if pid:
         return (None, pid)
 
-    # 5) sinon: création
     pid = _create_prospect(name, email, address_json)
     return (None, pid)
 
@@ -198,11 +167,11 @@ def create_quote(
     recipient_address_json: Dict[str, Any] | None
 ) -> dict:
     """
-    Crée un devis Evoliz conforme:
+    Crée un devis Evoliz :
       - documentdate (YYYY-MM-DD)
       - clientid OU prospectid
-      - term.paytermid (1 = comptant/immédiat)
-      - items: [{designation, quantity, unit_price, vat_rate}]
+      - term.paytermid (1 = comptant)
+      - items[{designation, quantity, unit_price, vat_rate}]
     """
     clientid, prospectid = ensure_recipient(recipient_name, recipient_email, recipient_address_json)
 
@@ -210,7 +179,7 @@ def create_quote(
         "label": label or description or "Devis",
         "documentdate": dt.date.today().isoformat(),
         "status": "draft",
-        "term": {"paytermid": 1},  # <- IMPORTANT (anciennement paymentid)
+        "term": {"paytermid": 1},  # IMPORTANT: 'paytermid' (pas 'paymentid')
         "items": [
             {
                 "designation": description or label or "Prestation",
@@ -227,8 +196,13 @@ def create_quote(
 
     return _post(f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes", payload)
 
+def get_quote(quote_id: str) -> dict:
+    """Relit un devis par ID pour récupérer number/links éventuels."""
+    return _get(f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes/{quote_id}")
+
 def extract_public_link(quote_response: dict) -> Optional[str]:
-    """Essaie de récupérer un lien public téléchargeable/partageable du devis."""
+    """Tente d'extraire un lien partageable depuis la création ou la consultation."""
+    # 1) test direct
     for key in ["public_link", "public_url", "portal_url", "share_link", "url", "download_url", "pdf_url"]:
         v = quote_response.get(key)
         if v:
@@ -238,4 +212,24 @@ def extract_public_link(quote_response: dict) -> Optional[str]:
         v = nested.get(key)
         if v:
             return v
+
+    # 2) si on a un id, on relit le devis et on réessaie
+    qid = str(quote_response.get("id") or nested.get("id") or "")
+    if qid:
+        try:
+            full = get_quote(qid)
+            for key in ["public_link", "public_url", "portal_url", "share_link", "url", "download_url", "pdf_url"]:
+                v = full.get(key) or (full.get("data") or {}).get(key)
+                if v:
+                    return v
+        except Exception:
+            pass
+
     return None
+
+def extract_identifiers(quote_response: dict) -> Tuple[Optional[str], Optional[str]]:
+    """Retourne (id, number) si dispo pour afficher un libellé utile dans Monday."""
+    data = quote_response.get("data") or quote_response
+    qid = str(data.get("id") or data.get("quoteid") or "")
+    number = str(data.get("number") or data.get("quotenumber") or "")
+    return (qid or None, number or None)
