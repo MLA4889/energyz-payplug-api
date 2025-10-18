@@ -1,4 +1,5 @@
 from pydantic_settings import BaseSettings
+from typing import Optional
 
 class Settings(BaseSettings):
     # Monday
@@ -6,36 +7,41 @@ class Settings(BaseSettings):
     MONDAY_BOARD_ID: int
 
     # Evoliz
-    EVOLIZ_BASE_URL: str          # ex: https://www.evoliz.io
-    EVOLIZ_COMPANY_ID: str        # ex: 101457-128860
-    EVOLIZ_PUBLIC_KEY: str
-    EVOLIZ_SECRET_KEY: str
+    EVOLIZ_BASE_URL: str = "https://www.evoliz.io"
+    EVOLIZ_COMPANY_ID: str = ""
+    EVOLIZ_PUBLIC_KEY: str = ""
+    EVOLIZ_SECRET_KEY: str = ""
 
-    # Payplug
+    # PayPlug
     PAYPLUG_KEYS_TEST_JSON: str
     PAYPLUG_KEYS_LIVE_JSON: str
-    PAYPLUG_MODE: str
+    PAYPLUG_MODE: str = "test"
 
-    # Monday Column IDs
-    EMAIL_COLUMN_ID: str
-    ADDRESS_COLUMN_ID: str
-    DESCRIPTION_COLUMN_ID: str
-    IBAN_FORMULA_COLUMN_ID: str
-    QUOTE_AMOUNT_FORMULA_ID: str
-    LINK_COLUMN_IDS_JSON: str
-    FORMULA_COLUMN_IDS_JSON: str
-    STATUS_AFTER_PAY_JSON: str
-    STATUS_COLUMN_ID: str
+    # Monday Column IDs (existants)
+    EMAIL_COLUMN_ID: str = "email_mkwn72p4"
+    ADDRESS_COLUMN_ID: str = "location_mkwnm6xb"
+    DESCRIPTION_COLUMN_ID: str = "formula_mkwqeyt4"
+    IBAN_FORMULA_COLUMN_ID: str = "formula_mkwnb561"
+    QUOTE_AMOUNT_FORMULA_ID: str = "numeric_mkwq2s74"  # Total HT (déjà chez toi)
+    STATUS_COLUMN_ID: str = "color_mkwnsdd6"
+    BUSINESS_STATUS_COLUMN_ID: str = "color_mkwnxf1h"
 
-    # Devis (NEW)
-    CREATE_QUOTE_STATUS_COLUMN_ID: str   # colonne “Créer devis” (status)
-    QUOTE_LINK_COLUMN_ID: str            # colonne “Devis” (link)
-    VAT_RATE_COLUMN_ID: str              # TVA (numbers)
-    VAT_NUMBER_COLUMN_ID: str            # TVA intracom (text) - optionnel
-    TOTAL_HT_COLUMN_ID: str              # Montant total HT (numbers)
-    TOTAL_TTC_COLUMN_ID: str             # Montant total TTC (numbers) - utilisé en secours
+    # Acomptes
+    FORMULA_COLUMN_IDS_JSON: str = '{"1":"formula_mkwnberr","2":"formula_mkwnntn2"}'
+    LINK_COLUMN_IDS_JSON: str = '{"1":"link_mkwnz493","2":"link_mkwn3ph9"}'
+    STATUS_AFTER_PAY_JSON: str = '{"1":"Payé acompte 1","2":"Payé acompte 2"}'
 
+    # Devis (NOUVEAU) — valeurs par défaut = tes IDs
+    CREATE_QUOTE_STATUS_COLUMN_ID: str = "color_mkwphad9"  # "Créer devis"
+    QUOTE_LINK_COLUMN_ID: str = "link_mkwqahhx"           # "Devis"
+    VAT_RATE_COLUMN_ID: str = "numeric_mkwqdrn3"          # "TVA"
+    VAT_NUMBER_COLUMN_ID: str = "text_mkwqjydy"           # (optionnel)
+    TOTAL_HT_COLUMN_ID: str = "numeric_mkwq2s74"          # "Montant total HT"
+    TOTAL_TTC_COLUMN_ID: str = "numeric_mkwns793"         # "Montant total TTC"
+
+    # Divers
     PUBLIC_BASE_URL: str = "https://energyz-payplug-api-1.onrender.com"
+    IBAN_BY_STATUS_JSON: Optional[str] = '{"Enerlux":"FR76 1695 8000 0130 5670 5696 366","Energyz MAR":"FR76 1695 8000 0130 5670 5696 366","Energyz Divers":"FR76 1695 8000 0100 0571 1982 492"}'
 
     class Config:
         env_file = ".env"
