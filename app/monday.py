@@ -17,25 +17,17 @@ def _post(query: str, variables: dict):
     return data
 
 def _extract_text_from_column(col: dict) -> str:
-    """
-    Monday renvoie pour chaque colonne:
-      - col['text'] (parfois vide pour les FORMULA)
-      - col['value'] (JSON string ou dict) pouvant contenir 'text' ou 'value'
-    On tente dans l’ordre: text -> value.text -> value.value -> str(value)
-    """
-    # 1) essayer 'text' direct
+    # 1) text direct si dispo
     if col.get("text"):
         return str(col["text"])
 
-    # 2) sinon parser 'value'
+    # 2) sinon parser value
     raw_val = col.get("value")
     if raw_val is None or raw_val == "":
         return ""
-
     try:
         parsed = json.loads(raw_val) if isinstance(raw_val, str) else raw_val
     except Exception:
-        # parfois value est un plain string
         return str(raw_val)
 
     if isinstance(parsed, dict):
@@ -43,12 +35,15 @@ def _extract_text_from_column(col: dict) -> str:
             return str(parsed["text"])
         if parsed.get("value"):
             return str(parsed["value"])
-        # sinon on tente de retransformer en string lisible
         return json.dumps(parsed, ensure_ascii=False)
-    else:
-        return str(parsed)
+    return str(parsed)
 
 def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
+    """
+    Renvoie:
+      - <col_id>: texte lisible (text ou value.text/value)
+      - <col_id>__raw: la valeur 'value' brute (JSON string)
+    """
     query = """
     query ($item_id: ID!) {
       items (ids: [$item_id]) {
@@ -67,6 +62,7 @@ def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
     for col in item["column_values"]:
         if col["id"] in column_ids:
             result[col["id"]] = _extract_text_from_column(col)
+            result[col["id"] + "__raw"] = col.get("value") or ""
     return result
 
 def set_link_in_column(item_id: int, column_id: str, url: str, text: str):
