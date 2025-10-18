@@ -46,10 +46,6 @@ def _request(method: str, path: str, payload: dict | None = None):
     return r.json()
 
 
-def _get(path: str, params: dict | None = None):
-    return _request("GET", path, params)
-
-
 def _post(path: str, payload: dict | None = None):
     return _request("POST", path, payload)
 
