@@ -1,25 +1,58 @@
 import json
 import re
+import requests
 from fastapi import FastAPI, Request, HTTPException
 
 from .config import settings
 from .payments import _choose_api_key, cents_from_str, create_payment
-from .monday import get_item_columns, set_link_in_column, set_status, upload_file_to_column
+from .monday import get_item_columns, set_link_in_column, set_status
+
+# --- IMPORT SÉCURISÉ : upload_file_to_column ---
+try:
+    from .monday import upload_file_to_column  # doit exister dans monday.py
+except ImportError:
+    # Fallback local (même implémentation) pour éviter l'ImportError en prod
+    MONDAY_API_URL = "https://api.monday.com/v2"
+    def upload_file_to_column(item_id: int, column_id: str, filename: str, file_bytes: bytes):
+        url = f"{MONDAY_API_URL}/file"
+        query = """
+        mutation ($board_id: ID!, $item_id: ID!, $column_id: String!, $file: File!) {
+          add_file_to_column (board_id: $board_id, item_id: $item_id, column_id: $column_id, file: $file) { id }
+        }
+        """
+        operations = json.dumps({
+            "query": query,
+            "variables": {
+                "board_id": settings.MONDAY_BOARD_ID,
+                "item_id": item_id,
+                "column_id": column_id,
+                "file": None
+            }
+        })
+        file_map = json.dumps({"0": ["variables.file"]})
+        files = {"0": (filename, file_bytes, "application/pdf")}
+        data = {"operations": operations, "map": file_map}
+        headers = {"Authorization": settings.MONDAY_API_KEY}
+        r = requests.post(url, headers=headers, data=data, files=files, timeout=60)
+        r.raise_for_status()
+        resp = r.json()
+        if "errors" in resp:
+            raise Exception(f"Erreur Monday (file upload): {resp['errors']}")
+        return True
+
 from .evoliz import (
     create_quote,
     extract_identifiers,
     get_or_create_public_link,
     build_app_quote_url,
-    download_quote_pdf,                   # ⬅️ nouveau
+    download_quote_pdf,
 )
 
-app = FastAPI(title="Energyz Payment Automation", version="2.7.0")
-
+app = FastAPI(title="Energyz Payment Automation", version="2.7.1")
 
 @app.get("/")
 def root():
     return {"status": "ok", "message": "Energyz Payment Automation is live 🚀"}
-
 
 def _clean_number_text(s: str) -> str:
     if not s:
@@ -28,13 +61,11 @@ def _clean_number_text(s: str) -> str:
     m = re.search(r"[-+]?\d*\.?\d+", s)
     return m.group(0) if m else "0"
 
-
 def _to_float(s: str, default: float = 0.0) -> float:
     try:
         return float(_clean_number_text(s))
     except Exception:
         return default
-
 
 def _best_description(cols: dict) -> str:
     desc = cols.get(settings.DESCRIPTION_COLUMN_ID, "") or ""
@@ -59,7 +90,6 @@ def _best_description(cols: dict) -> str:
         if fb:
             return fb.strip()
     return ""
-
 
 @app.post("/quote/from_monday")
 async def quote_from_monday(request: Request):
@@ -148,17 +178,16 @@ async def quote_from_monday(request: Request):
         if qid:
             link_text += f" (ID:{qid})"
 
-        # 1) On met quand même quelque chose dans la colonne Lien
+        # (1) on met un lien (public si dispo, sinon deep-link)
         url_to_set = public_url or deep_link or settings.EVOLIZ_BASE_URL
         set_link_in_column(item_id, settings.QUOTE_LINK_COLUMN_ID, url_to_set, link_text)
 
-        # 2) Si PAS de lien public -> on attache le PDF dans la colonne Fichier
+        # (2) fallback PDF si pas de lien public
         if not public_url and settings.QUOTE_FILES_COLUMN_ID:
             pdf_bytes, filename = download_quote_pdf(qid)
             try:
                 upload_file_to_column(item_id, settings.QUOTE_FILES_COLUMN_ID, filename, pdf_bytes)
             except Exception as up_err:
-                # On loggue mais on n'empêche pas la réponse HTTP 200 si le reste est OK
                 print(f"[WARN] Upload PDF Monday: {up_err}")
 
         return {
