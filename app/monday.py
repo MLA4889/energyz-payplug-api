@@ -127,18 +127,14 @@ def get_formula_expression(column_id: str) -> str | None:
 # ------------------ Traduction Monday -> Python sûr ----------------------
 def _translate_monday_expr(expr: str) -> str:
     """
-    Transforme l'expression Formula de Monday en une expression Python sûre :
-      - ROUND( -> round(
-      - IF( -> if_(
-      - AND( -> and_(a,b,...)  / OR( -> or_(...) / NOT(x) -> not_(x)
+    Transforme l'expression Formula de Monday en Python sûr :
+      - ROUND, IF, AND, OR, NOT, MIN, MAX, ABS, FLOOR, CEILING
       - TRUE/FALSE -> True/False
-      - Comparateurs: "<>" -> "!=", "=" -> "==" (hors >=, <=, !=, ==)
+      - "<>" -> "!=" ; "=" (isolé) -> "==" (sans toucher >=, <=, !=, ==)
     """
     if expr is None:
         return ""
-
     out = expr
-
     # Fonctions
     out = re.sub(r"\bROUND\s*\(", "round(", out, flags=re.IGNORECASE)
     out = re.sub(r"\bIF\s*\(", "if_(", out, flags=re.IGNORECASE)
@@ -150,31 +146,24 @@ def _translate_monday_expr(expr: str) -> str:
     out = re.sub(r"\bABS\s*\(", "abs(", out, flags=re.IGNORECASE)
     out = re.sub(r"\bFLOOR\s*\(", "floor(", out, flags=re.IGNORECASE)
     out = re.sub(r"\bCEILING\s*\(", "ceil(", out, flags=re.IGNORECASE)
-
     # Booléens
     out = re.sub(r"\bTRUE\b", "True", out, flags=re.IGNORECASE)
     out = re.sub(r"\bFALSE\b", "False", out, flags=re.IGNORECASE)
-
     # Comparateurs
     out = out.replace("<>", "!=")
-    # "=" qui n'est pas déjà dans "==", ">=" ou "<=" ou "!="
-    out = re.sub(r"(?<![<>!=])=(?!=)", "==", out)
-
-    # Virgules décimales FR (par sécurité ; l'éval travaille en '.')
-    out = out.replace(",", ",")
-
+    out = re.sub(r"(?<![<>!=])=(?!=)", "==", out)  # '=' isolé -> '=='
     return out
 
 # ------------------ Évaluation sûre (arith + bool + IF) ------------------
 def _safe_eval_arith_bool(expr: str) -> float:
     """
     Évalue une expression Python en environnement restreint :
-    - opérations + - * / % **, comparateurs, booléens
-    - fonctions: round, if_, min, max, abs, floor, ceil
+    - + - * / % **, comparateurs, booléens
+    - fonctions: round, if_, min, max, abs, floor, ceil, and_, or_, not_
+    Retourne un float (montant).
     """
     import ast, operator as op
 
-    # Ops autorisées
     allowed_binops = {
         ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul, ast.Div: op.truediv,
         ast.Pow: op.pow, ast.Mod: op.mod
@@ -185,7 +174,6 @@ def _safe_eval_arith_bool(expr: str) -> float:
     }
 
     def if_(*args):
-        # IF(condition, a, b) -> if_(cond, a, b)
         if len(args) < 2:
             raise ValueError("IF() requiert au moins 2 arguments")
         cond = bool(args[0])
@@ -193,38 +181,26 @@ def _safe_eval_arith_bool(expr: str) -> float:
         b = args[2] if len(args) >= 3 else 0
         return a if cond else b
 
-    def and_(*args):
-        return float(all(bool(x) for x in args))
-
-    def or_(*args):
-        return float(any(bool(x) for x in args))
-
-    def not_(x):
-        return float(not bool(x))
+    def and_(*args): return float(all(bool(x) for x in args))
+    def or_(*args):  return float(any(bool(x) for x in args))
+    def not_(x):     return float(not bool(x))
 
     safe_funcs = {
-        'round': round,
-        'if_': if_,
-        'min': min,
-        'max': max,
-        'abs': abs,
-        'floor': math.floor,
-        'ceil': math.ceil,
-        'and_': and_,
-        'or_': or_,
-        'not_': not_,
-        'True': True,
-        'False': False,
+        'round': round, 'if_': if_, 'min': min, 'max': max,
+        'abs': abs, 'floor': math.floor, 'ceil': math.ceil,
+        'and_': and_, 'or_': or_, 'not_': not_,
+        'True': True, 'False': False,
     }
 
     def _eval(node):
         if isinstance(node, ast.Expression):
             return _eval(node.body)
         if hasattr(ast, "Constant") and isinstance(node, ast.Constant):
-            # nombre ou bool
-            if isinstance(node.value, (int, float, bool)):
+            if isinstance(node.value, (int, float, bool, str)):
                 return node.value
             raise ValueError("Constante non autorisée")
+        if isinstance(node, ast.Str):  # py<3.8
+            return node.s
         if isinstance(node, ast.Num):
             return node.n
         if isinstance(node, ast.BinOp):
@@ -255,7 +231,6 @@ def _safe_eval_arith_bool(expr: str) -> float:
             args = [_eval(a) for a in node.args]
             return safe_funcs[fname](*args)
         if isinstance(node, ast.Name):
-            # True/False / noms de fonctions déjà dans safe_funcs
             if node.id in safe_funcs:
                 return safe_funcs[node.id]
             raise ValueError(f"Nom non autorisé: {node.id}")
@@ -263,19 +238,18 @@ def _safe_eval_arith_bool(expr: str) -> float:
 
     tree = ast.parse(expr, mode='eval')
     val = _eval(tree)
-    # Retourne un float (cohérent pour montants)
-    return float(val)
+    return float(val) if isinstance(val, (int, float, bool)) else 0.0
 
-# ---------------- Calcul de formula (récursif + conditions) --------------
+# ---------------- Calcul de formula (récursif + strings) -----------------
 def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float | None:
     """
-    Recalcule la valeur d'une colonne FORMULA pour un item, de façon récursive,
-    en gérant IF/AND/OR/NOT/ROUND/MIN/MAX/ABS/FLOOR/CEILING et comparateurs.
+    Recalcule la valeur d'une FORMULA pour un item, de façon récursive,
+    en gérant nombres **et textes** (comparaisons).
     """
     # Maps du board
     _, id_to_title, title_to_id, formulas, col_types = get_board_columns_map()
 
-    # Valeurs de l’item
+    # Valeurs de l’item (text + value)
     query = """
     query ($item_id: ID!) {
       items (ids: [$item_id]) {
@@ -291,47 +265,47 @@ def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float |
     data = _post(query, {"item_id": item_id})
     item_cols = data["data"]["items"][0]["column_values"]
 
-    # id -> valeur numérique (non-formula)
+    # Deux mappings : numériques ET textuels
     id_to_numeric: dict[str, float] = {}
+    id_to_string: dict[str, str] = {}
     for col in item_cols:
-        if col_types.get(col["id"]) == "formula":
-            continue
-        val_txt = None
-        if col.get("text"):
-            val_txt = col["text"]
+        ctype = col_types.get(col["id"], col.get("type"))
+        # récupérer un "texte" brut exploitable
+        val_txt = _extract_text_from_column(col)
+
+        if ctype == "numbers":
+            id_to_numeric[col["id"]] = float(_clean_num(val_txt))
         else:
-            rv = col.get("value")
-            if rv:
-                try:
-                    j = json.loads(rv) if isinstance(rv, str) else rv
-                    if isinstance(j, dict):
-                        val_txt = j.get("text") or j.get("value")
-                    else:
-                        val_txt = str(j)
-                except Exception:
-                    val_txt = str(rv)
-        num = float(_clean_num(val_txt or "0"))
-        id_to_numeric[col["id"]] = num
-        # aussi access par titre (utilisé lors du remplacement)
-        # (si duplicata de titres, Monday déconseille — on prend le premier)
+            # pour status/text/email/dropdown/location/link etc. => on garde la chaîne
+            id_to_string[col["id"]] = val_txt
 
+    # Résolution récursive
     seen: set[str] = set()
-    cache: dict[str, float] = {}
+    cache_num: dict[str, float] = {}  # mémo formules numériques
 
-    def resolve_token(token: str) -> float:
-        # token peut être id ("numeric_xxx") ou titre ("Montant total HT")
+    def resolve_token(token: str):
+        """
+        Retourne soit un float, soit une string (avec guillemets) selon le type de colonne.
+        """
+        # token peut être un id ("numeric_xxx") ou un titre ("Montant total HT")
         col_id = token
         if col_id not in col_types and token in title_to_id:
             col_id = title_to_id[token]
 
+        # 1) Non-formula: number ?
         if col_id in id_to_numeric:
             return id_to_numeric[col_id]
+        # 2) Non-formula: string ?
+        if col_id in id_to_string:
+            # injecter une vraie chaîne Python avec quotes échappées
+            return json.dumps(id_to_string[col_id], ensure_ascii=False)
 
+        # 3) Formula -> calcul récursif numérique
         if col_types.get(col_id) == "formula":
-            if col_id in cache:
-                return cache[col_id]
+            if col_id in cache_num:
+                return cache_num[col_id]
             if col_id in seen:
-                return 0.0  # boucle
+                return 0.0
             seen.add(col_id)
             child_expr = formulas.get(col_id)
             if not child_expr:
@@ -342,17 +316,19 @@ def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float |
 
             def repl_child(m: re.Match) -> str:
                 tk = m.group(1)
-                return str(resolve_token(tk))
+                val = resolve_token(tk)
+                # val peut être string (déjà json.dumps) ou float
+                return str(val)
             child_expr = re.sub(r"\{([^}]+)\}", repl_child, child_expr)
-            child_expr = child_expr.replace(",", ".")
             try:
                 val = _safe_eval_arith_bool(child_expr)
             except Exception:
                 val = 0.0
-            cache[col_id] = val
+            cache_num[col_id] = val
             seen.discard(col_id)
             return val
 
+        # Colonne inconnue -> 0
         return 0.0
 
     root = formulas.get(formula_col_id)
@@ -363,10 +339,10 @@ def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float |
 
     def repl_root(m: re.Match) -> str:
         tk = m.group(1)
-        return str(resolve_token(tk))
+        val = resolve_token(tk)
+        return str(val)
 
     root_expr = re.sub(r"\{([^}]+)\}", repl_root, root_expr)
-    root_expr = root_expr.replace(",", ".")
     try:
         return _safe_eval_arith_bool(root_expr)
     except Exception:
