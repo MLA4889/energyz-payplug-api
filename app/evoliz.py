@@ -35,8 +35,8 @@ def _headers() -> dict:
     return {"Authorization": f"Bearer {SESSION['token']}", "Content-Type": "application/json"}
 
 
-def _request(method: str, path: str, payload: dict | None = None):
-    url = f"{settings.EVOLIZ_BASE_URL}{path}"
+def _request(method: str, base: str, path: str, payload: dict | None = None):
+    url = f"{base}{path}"
     r = requests.request(method, url, headers=_headers(), json=payload or {}, timeout=25)
     if r.status_code == 401:
         _login()
@@ -47,13 +47,16 @@ def _request(method: str, path: str, payload: dict | None = None):
 
 
 def _post(path: str, payload: dict | None = None):
-    return _request("POST", path, payload)
+    return _request("POST", settings.EVOLIZ_BASE_URL, path, payload)
 
 
-def _get_bytes(path: str) -> tuple[bytes, str | None]:
-    url = f"{settings.EVOLIZ_BASE_URL}{path}"
+def _get_bytes(base: str, path: str) -> tuple[bytes, str | None]:
+    """
+    GET binaire (PDF) avec hôte paramétrable (www.evoliz.io OU app.evoliz.com).
+    """
+    url = f"{base}{path}"
     h = _headers()
-    h.pop("Content-Type", None)  # binaire
+    h.pop("Content-Type", None)  # IMPORTANT pour binaire
     r = requests.get(url, headers=h, timeout=60)
     if r.status_code == 401:
         _login()
@@ -79,7 +82,7 @@ def _find_by_email(endpoint: str, email: str) -> Optional[str]:
     if not email:
         return None
     try:
-        data = _request("GET", f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/{endpoint}", {"search": email})
+        data = _request("GET", settings.EVOLIZ_BASE_URL, f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/{endpoint}", {"search": email})
         items = data if isinstance(data, list) else data.get("data") or []
         for it in items:
             if str(it.get("email", "")).lower() == email.lower():
@@ -93,7 +96,7 @@ def _find_prospect_by_name(name: str) -> Optional[str]:
     if not name:
         return None
     try:
-        data = _request("GET", f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/prospects", {"search": name})
+        data = _request("GET", settings.EVOLIZ_BASE_URL, f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/prospects", {"search": name})
         items = data if isinstance(data, list) else data.get("data") or []
         for it in items:
             if str(it.get("name", "")).strip().lower() == name.strip().lower():
@@ -182,7 +185,7 @@ def create_quote(
 
 
 def get_quote(qid: str) -> dict:
-    return _request("GET", f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes/{qid}")
+    return _request("GET", settings.EVOLIZ_BASE_URL, f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes/{qid}")
 
 
 def extract_identifiers(quote_response: dict) -> Tuple[Optional[str], Optional[str]]:
@@ -209,7 +212,6 @@ def _extract_link_from_dict(d: dict | None) -> Optional[str]:
 def get_or_create_public_link(quote_id: str, recipient_email: str | None = None) -> Optional[str]:
     if not quote_id:
         return None
-
     try:
         current = get_quote(quote_id)
         link = _extract_link_from_dict(current)
@@ -250,7 +252,7 @@ def get_or_create_public_link(quote_id: str, recipient_email: str | None = None)
 
 def _issue_quote_if_needed(qid: str) -> None:
     """
-    Tente d'émettre / valider le devis pour rendre le PDF téléchargeable.
+    Émet / valide le devis pour rendre le PDF téléchargeable.
     """
     paths = [
         f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes/{qid}/validate",
@@ -269,6 +271,7 @@ def _issue_quote_if_needed(qid: str) -> None:
     try:
         _request(
             "POST",
+            settings.EVOLIZ_BASE_URL,
             f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes/{qid}",
             {"status": "issued"},
         )
@@ -278,23 +281,25 @@ def _issue_quote_if_needed(qid: str) -> None:
 
 def download_quote_pdf(qid: str) -> tuple[bytes, str]:
     """
-    Télécharge le PDF :
-    - essaie d’abord
+    Télécharge le PDF du devis.
+    - essaie plusieurs endpoints
     - si 404 → émet le devis → réessaie
-    - couvre plusieurs endpoints PDF
+    - bascule automatiquement sur EVOLIZ_APP_BASE_URL si nécessaire
     """
-    def _try_download() -> tuple[bytes, str] | None:
+    def _try_download_one_host(base: str) -> tuple[bytes, str] | None:
+        # liste étendue d’endpoints possibles
         candidates = [
             f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes/{qid}/pdf",
             f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes/{qid}/download",
+            f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes/{qid}/export/pdf",
+            f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes/{qid}/print",
             f"/api/v1/quotes/{qid}/pdf",
             f"/api/quotes/{qid}/pdf",
-            f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes/{qid}/export/pdf",
         ]
         last = None
         for path in candidates:
             try:
-                content, cd = _get_bytes(path)
+                content, cd = _get_bytes(base, path)
                 filename = f"devis_{qid}.pdf"
                 if cd:
                     m = re.search(r'filename="?([^"]+)"?', cd)
@@ -308,24 +313,51 @@ def download_quote_pdf(qid: str) -> tuple[bytes, str]:
             raise last
         return None
 
+    # 1) tentative directe sur EVOLIZ_BASE_URL
     try:
-        got = _try_download()
+        got = _try_download_one_host(settings.EVOLIZ_BASE_URL)
         if got:
             return got
     except requests.HTTPError as e:
         if e.response is not None and e.response.status_code == 404:
             _issue_quote_if_needed(qid)
-            got2 = _try_download()
+            # retry sur base + app
+            for host in [settings.EVOLIZ_BASE_URL, settings.EVOLIZ_APP_BASE_URL or ""]:
+                if not host:
+                    continue
+                try:
+                    again = _try_download_one_host(host)
+                    if again:
+                        return again
+                except Exception:
+                    continue
+        else:
+            raise
+
+    # 2) tentatives supplémentaires (host alternatif d’abord)
+    for host in [settings.EVOLIZ_APP_BASE_URL or ""]:
+        if not host:
+            continue
+        try:
+            got2 = _try_download_one_host(host)
             if got2:
                 return got2
-        raise
+        except Exception:
+            pass
 
+    # 3) dernière chance : émission + retry sur les 2 hôtes
     _issue_quote_if_needed(qid)
-    got3 = _try_download()
-    if got3:
-        return got3
+    for host in [settings.EVOLIZ_BASE_URL, settings.EVOLIZ_APP_BASE_URL or ""]:
+        if not host:
+            continue
+        try:
+            got3 = _try_download_one_host(host)
+            if got3:
+                return got3
+        except Exception:
+            pass
 
-    raise Exception(f"PDF non disponible pour le devis {qid} (après tentative d'émission).")
+    raise Exception(f"PDF non disponible pour le devis {qid} (après émissions et bascule d’hôte).")
 
 
 def build_app_quote_url(qid: str | None) -> Optional[str]:
