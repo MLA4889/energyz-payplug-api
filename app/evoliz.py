@@ -3,20 +3,16 @@ import re
 from typing import Optional, Tuple, Dict, Any
 
 import requests
-
 from .config import settings
 
 # ============================================================
-#  Auth Evoliz (Bearer)
+# Auth Evoliz (Bearer)
 # ============================================================
 
 SESSION: dict[str, Optional[str]] = {"token": None}
 
 
 def _login() -> str:
-    """
-    POST /api/login { public_key, secret_key } -> access_token
-    """
     url = f"{settings.EVOLIZ_BASE_URL}/api/login"
     r = requests.post(
         url,
@@ -55,12 +51,9 @@ def _post(path: str, payload: dict | None = None):
 
 
 def _get_bytes(path: str) -> tuple[bytes, str | None]:
-    """
-    GET d’un binaire (PDF). Retourne (content, content-disposition).
-    """
     url = f"{settings.EVOLIZ_BASE_URL}{path}"
     h = _headers()
-    h.pop("Content-Type", None)  # important pour le binaire
+    h.pop("Content-Type", None)  # binaire
     r = requests.get(url, headers=h, timeout=60)
     if r.status_code == 401:
         _login()
@@ -79,14 +72,10 @@ def _post_ignore_errors(path: str, payload: dict | None = None) -> Optional[dict
 
 
 # ============================================================
-#  Helpers Clients / Prospects
+# Helpers Clients / Prospects
 # ============================================================
 
 def _find_by_email(endpoint: str, email: str) -> Optional[str]:
-    """
-    GET /api/v1/companies/{company_id}/{endpoint}?search=<email>
-    Retourne l'id si exact match sur email.
-    """
     if not email:
         return None
     try:
@@ -142,9 +131,6 @@ def _create_prospect(name: str, email: str, address_json: Dict[str, Any] | None)
 
 
 def ensure_recipient(name: str, email: str, address_json: Dict[str, Any] | None) -> tuple[Optional[str], Optional[str]]:
-    """
-    Retourne (clientid, prospectid) — exactement un des deux sera rempli.
-    """
     cid = _find_by_email("clients", email)
     if cid:
         return (cid, None)
@@ -158,7 +144,7 @@ def ensure_recipient(name: str, email: str, address_json: Dict[str, Any] | None)
 
 
 # ============================================================
-#  Devis
+# Devis
 # ============================================================
 
 def create_quote(
@@ -170,12 +156,6 @@ def create_quote(
     recipient_email: str,
     recipient_address_json: Dict[str, Any] | None,
 ) -> dict:
-    """
-    Crée un devis :
-      - designation = description (et pas le nom)
-      - 1 ligne, quantité 1, prix unitaire HT + TVA
-      - clientid OU prospectid selon ensure_recipient()
-    """
     designation = (description or "").strip() or (label or "Prestation")
     clientid, prospectid = ensure_recipient(recipient_name, recipient_email, recipient_address_json)
 
@@ -206,10 +186,6 @@ def get_quote(qid: str) -> dict:
 
 
 def extract_identifiers(quote_response: dict) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Retourne (quote_id, quote_number).
-    Accepte aussi la forme enveloppée {"data": {...}}.
-    """
     data = quote_response.get("data") or quote_response
     qid = str(data.get("id") or data.get("quoteid") or "")
     number = str(data.get("number") or data.get("quotenumber") or "")
@@ -231,12 +207,6 @@ def _extract_link_from_dict(d: dict | None) -> Optional[str]:
 
 
 def get_or_create_public_link(quote_id: str, recipient_email: str | None = None) -> Optional[str]:
-    """
-    Essaie de récupérer/générer un lien public.
-    1) lecture quote
-    2) POST /share, /public-link, /send (plusieurs variantes)
-    3) relecture quote
-    """
     if not quote_id:
         return None
 
@@ -278,35 +248,87 @@ def get_or_create_public_link(quote_id: str, recipient_email: str | None = None)
     return None
 
 
+def _issue_quote_if_needed(qid: str) -> None:
+    """
+    Tente d'émettre / valider le devis pour rendre le PDF téléchargeable.
+    """
+    paths = [
+        f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes/{qid}/validate",
+        f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes/{qid}/finalize",
+        f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes/{qid}/confirm",
+        f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes/{qid}/issue",
+    ]
+    for p in paths:
+        try:
+            _post(p, {})
+            return
+        except Exception:
+            continue
+
+    # dernière chance via update status
+    try:
+        _request(
+            "POST",
+            f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes/{qid}",
+            {"status": "issued"},
+        )
+    except Exception:
+        pass
+
+
 def download_quote_pdf(qid: str) -> tuple[bytes, str]:
     """
-    Télécharge le PDF du devis via endpoints connus.
-    Retourne (pdf_bytes, filename).
+    Télécharge le PDF :
+    - essaie d’abord
+    - si 404 → émet le devis → réessaie
+    - couvre plusieurs endpoints PDF
     """
-    candidates = [
-        f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes/{qid}/pdf",
-        f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes/{qid}/download",
-    ]
-    last_err = None
-    for path in candidates:
-        try:
-            content, cd = _get_bytes(path)
-            filename = f"devis_{qid}.pdf"
-            if cd:
-                m = re.search(r'filename="?([^"]+)"?', cd)
-                if m:
-                    filename = m.group(1)
-            return content, filename
-        except Exception as e:
-            last_err = e
-    raise Exception(f"Impossible de récupérer le PDF du devis {qid}: {last_err}")
+    def _try_download() -> tuple[bytes, str] | None:
+        candidates = [
+            f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes/{qid}/pdf",
+            f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes/{qid}/download",
+            f"/api/v1/quotes/{qid}/pdf",
+            f"/api/quotes/{qid}/pdf",
+            f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes/{qid}/export/pdf",
+        ]
+        last = None
+        for path in candidates:
+            try:
+                content, cd = _get_bytes(path)
+                filename = f"devis_{qid}.pdf"
+                if cd:
+                    m = re.search(r'filename="?([^"]+)"?', cd)
+                    if m:
+                        filename = m.group(1)
+                return content, filename
+            except Exception as e:
+                last = e
+                continue
+        if last:
+            raise last
+        return None
+
+    try:
+        got = _try_download()
+        if got:
+            return got
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            _issue_quote_if_needed(qid)
+            got2 = _try_download()
+            if got2:
+                return got2
+        raise
+
+    _issue_quote_if_needed(qid)
+    got3 = _try_download()
+    if got3:
+        return got3
+
+    raise Exception(f"PDF non disponible pour le devis {qid} (après tentative d'émission).")
 
 
 def build_app_quote_url(qid: str | None) -> Optional[str]:
-    """
-    Construit un deep-link locataire si pas de lien public.
-    ex: https://evoliz.com/<slug>/quote/display.php?QUOTEID=<id>
-    """
     if not qid:
         return None
     if settings.EVOLIZ_TENANT_SLUG:
