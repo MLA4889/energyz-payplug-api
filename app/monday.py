@@ -17,12 +17,12 @@ def _post(query: str, variables: dict):
         raise Exception(f"Erreur Monday: {data['errors']}")
     return data
 
-# ---------- LECTURE DE BASE (inchangé sauf extraction text/value) ----------
+# ---------- LECTURE DE BASE ----------
 def _extract_text_from_column(col: dict) -> str:
-    # 1) text direct si dispo
+    # 1) text
     if col.get("text"):
         return str(col["text"])
-    # 2) sinon parser value
+    # 2) value (JSON)
     raw_val = col.get("value")
     if raw_val is None or raw_val == "":
         return ""
@@ -48,6 +48,7 @@ def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
         name
         column_values {
           id
+          type
           text
           value
         }
@@ -63,11 +64,14 @@ def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
             result[col["id"] + "__raw"] = col.get("value") or ""
     return result
 
-# ---------- NOUVEAU : lire l'expression d'une colonne Formula ----------
-def get_formula_expression(column_id: str) -> str | None:
+# ---------- Board columns map (id <-> title) + formula expr ----------
+def get_board_columns_map():
     """
-    Récupère l'expression (string) d'une colonne Formula à partir du board settings_str.
-    Ex: settings_str -> {"formula":"({numeric_mkwq2s74} * 0.6667)"}
+    Retourne:
+      - columns: liste de colonnes {id, title, type, settings_str}
+      - id_to_title: dict
+      - title_to_id: dict
+      - formulas: dict {column_id: formula_expression}
     """
     query = """
     query ($board_id: [ID!]) {
@@ -75,6 +79,7 @@ def get_formula_expression(column_id: str) -> str | None:
         id
         columns {
           id
+          title
           type
           settings_str
         }
@@ -84,20 +89,29 @@ def get_formula_expression(column_id: str) -> str | None:
     data = _post(query, {"board_id": settings.MONDAY_BOARD_ID})
     boards = data["data"]["boards"]
     if not boards:
-        return None
-    for col in boards[0]["columns"]:
-        if col["id"] == column_id and col["type"] == "formula":
+        return [], {}, {}, {}
+    cols = boards[0]["columns"]
+    id_to_title, title_to_id, formulas = {}, {}, {}
+    for c in cols:
+        cid = c["id"]
+        ct = c.get("title") or ""
+        id_to_title[cid] = ct
+        title_to_id[ct] = cid
+        if c.get("type") == "formula":
             try:
-                s = col.get("settings_str")
-                if not s:
-                    return None
-                j = json.loads(s)
-                return j.get("formula")
+                s = c.get("settings_str") or ""
+                j = json.loads(s) if s else {}
+                if isinstance(j, dict) and "formula" in j:
+                    formulas[cid] = j["formula"]
             except Exception:
-                return None
-    return None
+                pass
+    return cols, id_to_title, title_to_id, formulas
 
-# ---------- NOUVEAU : calculer la valeur d'une Formula pour un item ----------
+def get_formula_expression(column_id: str) -> str | None:
+    _, _, _, formulas = get_board_columns_map()
+    return formulas.get(column_id)
+
+# ---------- Calcul local d'une formula ----------
 def _clean_num(text: str) -> str:
     if not text:
         return "0"
@@ -107,19 +121,15 @@ def _clean_num(text: str) -> str:
     return m.group(0) if m else "0"
 
 def _safe_eval_arith(expr: str) -> float:
-    """
-    Évalue une expression arithmétique simple en Python en autorisant seulement
-    chiffres, + - * / ( ) et la fonction round(x, n).
-    """
     import ast, operator as op
     allowed_ops = {ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul, ast.Div: op.truediv, ast.USub: op.neg, ast.UAdd: op.pos, ast.Pow: op.pow}
     def _eval(node):
-        if isinstance(node, ast.Num):  # py<3.8
-            return node.n
-        if isinstance(node, ast.Constant):  # py>=3.8
+        if hasattr(ast, "Constant") and isinstance(node, ast.Constant):
             if isinstance(node.value, (int, float)):
                 return node.value
             raise ValueError("Constante non numérique")
+        if isinstance(node, ast.Num):
+            return node.n
         if isinstance(node, ast.BinOp):
             return allowed_ops[type(node.op)](_eval(node.left), _eval(node.right))
         if isinstance(node, ast.UnaryOp):
@@ -144,52 +154,37 @@ def _safe_eval_arith(expr: str) -> float:
 
 def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float | None:
     """
-    1) Récupère l'expression de la Formula (settings_str.formula)
-    2) Remplace chaque {<col_id_ou_nom>} par la valeur numérique de la ligne
-    3) Supporte ROUND(x, n)
-    4) Évalue l'expression et retourne un float
+    1) Lit l'expression de la formula (board.settings_str)
+    2) Remplace chaque {token} par la valeur de l'item
+       - token peut être un id de colonne ou un titre de colonne
+    3) Support ROUND()
     """
     expr = get_formula_expression(formula_col_id)
     if not expr:
         return None
 
-    # Trouver tous les tokens { ... }
-    tokens = re.findall(r"\{([^}]+)\}", expr)
+    # Map colonnes id <-> titre pour interpréter les tokens
+    _, id_to_title, title_to_id, _ = get_board_columns_map()
 
-    # Récupérer toutes les colonnes nécessaires de l'item
-    # On tente d'abord les IDs vus dans l'expression ; si l'auteur a mis des noms de colonnes
-    # (rare dans settings_str), on récupèrera tout et on fera au mieux.
-    needed_ids = set()
-    for t in tokens:
-        # si l'auteur a mis un id "numeric_..." on l'utilise tel quel
-        if re.match(r"^[a-z_0-9]+$", t):
-            needed_ids.add(t)
-    needed_list = list(needed_ids) if needed_ids else []  # si vide, on prendra tout et on construira un mapping nom->val plus bas
-
-    # Lire l'item
+    # Lire toutes les valeurs de l'item (sans 'title', l'API ne le supporte pas ici)
     query = """
     query ($item_id: ID!) {
       items (ids: [$item_id]) {
-        name
         column_values {
           id
+          type
           text
           value
-          title
         }
       }
     }
     """
     data = _post(query, {"item_id": item_id})
-    item = data["data"]["items"][0]
-    # Construire mapping id -> valeur numérique
+    item_cols = data["data"]["items"][0]["column_values"]
+
+    # Construire id -> nombre
     id_to_num: dict[str, float] = {}
-    title_to_num: dict[str, float] = {}
-    for col in item["column_values"]:
-        # on ne filtre pas si needed_list vide (on veut tout)
-        if needed_list and col["id"] not in needed_list:
-            continue
-        # try text/value -> number
+    for col in item_cols:
         val_txt = None
         if col.get("text"):
             val_txt = col["text"]
@@ -206,30 +201,24 @@ def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float |
                     val_txt = str(rv)
         num = float(_clean_num(val_txt or "0"))
         id_to_num[col["id"]] = num
-        if col.get("title"):
-            title_to_num[col["title"]] = num
 
-    # Remplacer tokens dans l'expression
-    expr_py = expr
-    # remapper ROUND -> round
-    expr_py = re.sub(r"\bROUND\s*\(", "round(", expr_py, flags=re.IGNORECASE)
+    # Tokens { ... }
+    tokens = re.findall(r"\{([^}]+)\}", expr)
 
-    def repl_token(m: re.Match) -> str:
-        key = m.group(1)
-        # essai par id exact
-        if key in id_to_num:
-            return str(id_to_num[key])
-        # essai par titre (entre accolades dans expr peu probable, mais on tente)
-        if key in title_to_num:
-            return str(title_to_num[key])
-        # sinon 0
-        return "0"
+    # Remplacement tokens par valeurs
+    def repl(m: re.Match) -> str:
+        token = m.group(1)  # peut être id ou titre
+        # Si titre → map vers id
+        col_id = token
+        if token not in id_to_num and token in title_to_id:
+            col_id = title_to_id[token]
+        value = id_to_num.get(col_id, 0.0)
+        return str(value)
 
-    expr_py = re.sub(r"\{([^}]+)\}", repl_token, expr_py)
-
-    # nettoyer éventuels séparateurs français
+    expr_py = re.sub(r"\bROUND\s*\(", "round(", expr, flags=re.IGNORECASE)
+    expr_py = re.sub(r"\{([^}]+)\}", repl, expr_py)
     expr_py = expr_py.replace(",", ".")
-    # Eval sécurisé
+
     try:
         return _safe_eval_arith(expr_py)
     except Exception:
