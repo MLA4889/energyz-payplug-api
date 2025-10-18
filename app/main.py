@@ -8,11 +8,11 @@ from .monday import get_item_columns, set_link_in_column, set_status
 from .evoliz import (
     create_quote,
     extract_identifiers,
-    get_or_create_public_link,
+    get_or_create_public_link,   # ← présent dans evoliz.py ci-dessus
     build_app_quote_url,
 )
 
-app = FastAPI(title="Energyz Payment Automation", version="2.6.0")
+app = FastAPI(title="Energyz Payment Automation", version="2.6.1")
 
 
 @app.get("/")
@@ -41,36 +41,29 @@ def _best_description(cols: dict) -> str:
     """
     Retourne la description presta, même si la colonne est une Formula.
     Ordre:
-      1) text (colonne Formula si Monday la fournit)
-      2) value RAW (si JSON encodé -> essaye d'extraire "text" ou une chaîne)
+      1) text (Formula si Monday la fournit)
+      2) value RAW JSON (extrait "text"/"value" ou chaîne)
       3) fallback colonne texte (DESCRIPTION_FALLBACK_COLUMN_ID)
-      4) chaîne vide
     """
-    # 1) direct (text)
     desc = cols.get(settings.DESCRIPTION_COLUMN_ID, "") or ""
     if desc:
         return desc.strip()
 
-    # 2) RAW
     raw = cols.get(f"{settings.DESCRIPTION_COLUMN_ID}__raw", "")
     if raw:
-        # cas: c'est déjà une chaîne JSON (ex: "\"Ma description\"")
         try:
             j = json.loads(raw)
             if isinstance(j, str) and j.strip():
                 return j.strip()
             if isinstance(j, dict):
-                # certains renvoient {"text": "..."} / {"value": "..."}
                 if isinstance(j.get("text"), str) and j["text"].strip():
                     return j["text"].strip()
                 if isinstance(j.get("value"), str) and j["value"].strip():
                     return j["value"].strip()
         except Exception:
-            # si ce n'est pas du JSON, tenter brut
             if isinstance(raw, str) and raw.strip():
                 return raw.strip()
 
-    # 3) fallback texte
     if settings.DESCRIPTION_FALLBACK_COLUMN_ID:
         fb = cols.get(settings.DESCRIPTION_FALLBACK_COLUMN_ID, "")
         if fb:
@@ -104,7 +97,7 @@ async def quote_from_monday(request: Request):
         wanted = [
             settings.EMAIL_COLUMN_ID,
             settings.ADDRESS_COLUMN_ID,
-            settings.DESCRIPTION_COLUMN_ID,  # Formula
+            settings.DESCRIPTION_COLUMN_ID,
             settings.IBAN_FORMULA_COLUMN_ID,
             settings.QUOTE_AMOUNT_FORMULA_ID,
             settings.VAT_RATE_COLUMN_ID,
@@ -127,7 +120,7 @@ async def quote_from_monday(request: Request):
         name = cols.get("name", "Client Energyz")
         email = cols.get(settings.EMAIL_COLUMN_ID, "")
         address_txt = cols.get(settings.ADDRESS_COLUMN_ID, "")
-        description = _best_description(cols)  # <- désignation à partir de la Formula (robuste)
+        description = _best_description(cols)           # ← Désignation = Description presta
         iban = cols.get(settings.IBAN_FORMULA_COLUMN_ID, "")
         total_ht = cols.get(settings.TOTAL_HT_COLUMN_ID) or cols.get(settings.QUOTE_AMOUNT_FORMULA_ID) or "0"
         vat_rate = cols.get(settings.VAT_RATE_COLUMN_ID, "") or "20"
@@ -137,7 +130,7 @@ async def quote_from_monday(request: Request):
             api_key = _choose_api_key(iban)
             amount_cents = cents_from_str(total_ht)
             if acompte_num == "2":
-                amount_cents //= 2  # règle actuelle (50% pour acompte 2)
+                amount_cents //= 2
             metadata = {"item_id": item_id, "acompte": acompte_num}
             payment_url = create_payment(api_key, amount_cents, email, address_txt, description, metadata)
             set_link_in_column(item_id, link_columns[acompte_num], payment_url, f"Payer acompte {acompte_num}")
@@ -151,7 +144,7 @@ async def quote_from_monday(request: Request):
 
         quote = create_quote(
             label=label,
-            description=description,  # <- utilisé comme désignation Evoliz
+            description=description,  # ← utilisé comme désignation Evoliz
             unit_price_ht=unit_price_ht,
             vat_rate=vr,
             recipient_name=name,
@@ -190,16 +183,3 @@ async def quote_from_monday(request: Request):
     except Exception as e:
         print(f"[ERROR] Evoliz quote error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-
-# petit endpoint de test PayPlug
-@app.post("/pay/acompte/{n}")
-async def create_acompte_link(n: int):
-    try:
-        api_key = _choose_api_key("FR76 1695 8000 0130 5670 5696 366")
-        amount_cents = cents_from_str("1250.00") // (2 if n == 2 else 1)
-        metadata = {"client": "Jean Dupont", "acompte": str(n)}
-        url = create_payment(api_key, amount_cents, "jean@mail.com", "12 rue de Paris", "Installation solaire", metadata)
-        return {"status": "ok", "acompte": n, "payment_url": url}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
