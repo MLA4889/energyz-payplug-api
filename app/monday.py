@@ -8,7 +8,6 @@ HEADERS = {
     "Content-Type": "application/json",
 }
 
-
 def _post(query: str, variables: dict):
     r = requests.post(MONDAY_API_URL, headers=HEADERS, json={"query": query, "variables": variables})
     r.raise_for_status()
@@ -16,7 +15,6 @@ def _post(query: str, variables: dict):
     if "errors" in data:
         raise Exception(f"Erreur Monday: {data['errors']}")
     return data
-
 
 def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
     query = """
@@ -41,7 +39,6 @@ def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
         result[f"{cid}__raw"] = col.get("value") or ""
     return result
 
-
 def set_link_in_column(item_id: int, column_id: str, url: str, text: str):
     mutation = """
     mutation ($board_id: ID!, $item_id: ID!, $column_id: String!, $value: JSON!) {
@@ -56,7 +53,6 @@ def set_link_in_column(item_id: int, column_id: str, url: str, text: str):
         "value": value,
     }
     _post(mutation, variables)
-
 
 def set_status(item_id: int, column_id: str, label: str):
     mutation = """
@@ -73,11 +69,10 @@ def set_status(item_id: int, column_id: str, label: str):
     }
     _post(mutation, variables)
 
-
-# ---------- NOUVEAU : upload de fichier PDF dans une colonne File ----------
+# ---------- UPLOAD FICHIER (PDF) ----------
 def upload_file_to_column(item_id: int, column_id: str, filename: str, file_bytes: bytes):
     """
-    Utilise l'endpoint multipart /v2/file pour add_file_to_column.
+    add_file_to_column via /v2/file (multipart).
     """
     url = f"{MONDAY_API_URL}/file"
 
@@ -100,16 +95,10 @@ def upload_file_to_column(item_id: int, column_id: str, filename: str, file_byte
     })
     file_map = json.dumps({"0": ["variables.file"]})
 
-    files = {
-        "0": (filename, file_bytes, "application/pdf")
-    }
-    data = {
-        "operations": operations,
-        "map": file_map
-    }
-    headers = {
-        "Authorization": settings.MONDAY_API_KEY
-    }
+    files = {"0": (filename, file_bytes, "application/pdf")}
+    data = {"operations": operations, "map": file_map}
+    headers = {"Authorization": settings.MONDAY_API_KEY}
+
     r = requests.post(url, headers=headers, data=data, files=files, timeout=60)
     r.raise_for_status()
     resp = r.json()
