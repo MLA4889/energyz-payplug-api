@@ -1,50 +1,59 @@
-from pydantic_settings import BaseSettings
-from typing import Optional
+import json
+import requests
+from .config import settings
 
-class Settings(BaseSettings):
-    # Monday
-    MONDAY_API_KEY: str
-    MONDAY_BOARD_ID: int
+MONDAY_API_URL = "https://api.monday.com/v2"
+HEADERS = {
+    "Authorization": settings.MONDAY_API_KEY,
+    "Content-Type": "application/json"
+}
 
-    # Evoliz
-    EVOLIZ_BASE_URL: str = "https://www.evoliz.io"
-    EVOLIZ_COMPANY_ID: str = ""
-    EVOLIZ_PUBLIC_KEY: str = ""
-    EVOLIZ_SECRET_KEY: str = ""
-    # Optionnel : si tu as déjà un client dans Evoliz, mets son ID ici
-    EVOLIZ_DEFAULT_CLIENT_ID: Optional[str] = None
+def _post(query: str, variables: dict):
+    r = requests.post(MONDAY_API_URL, headers=HEADERS, json={"query": query, "variables": variables})
+    r.raise_for_status()
+    data = r.json()
+    if "errors" in data:
+        raise Exception(f"Erreur Monday: {data['errors']}")
+    return data
 
-    # PayPlug
-    PAYPLUG_KEYS_TEST_JSON: str
-    PAYPLUG_KEYS_LIVE_JSON: str
-    PAYPLUG_MODE: str = "test"
+def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
+    # On ramène name + column_values (id, text, value) puis on expose aussi __raw
+    query = """
+    query ($item_id: ID!) {
+      items (ids: [$item_id]) {
+        name
+        column_values {
+          id
+          text
+          value
+        }
+      }
+    }
+    """
+    data = _post(query, {"item_id": item_id})
+    item = data["data"]["items"][0]
+    result = {"name": item["name"]}
+    for col in item["column_values"]:
+        cid = col["id"]
+        if cid in column_ids:
+            result[cid] = col.get("text") or ""
+        # on expose toujours le RAW (JSON) si on en a besoin
+        result[f"{cid}__raw"] = col.get("value") or ""
+    return result
 
-    # Monday Columns
-    EMAIL_COLUMN_ID: str = "email_mkwn72p4"
-    ADDRESS_COLUMN_ID: str = "location_mkwnm6xb"
-    DESCRIPTION_COLUMN_ID: str = "formula_mkwqeyt4"
-    IBAN_FORMULA_COLUMN_ID: str = "formula_mkwnb561"
-    QUOTE_AMOUNT_FORMULA_ID: str = "numeric_mkwq2s74"
-    STATUS_COLUMN_ID: str = "color_mkwnsdd6"
-    BUSINESS_STATUS_COLUMN_ID: str = "color_mkwnxf1h"
+def set_link_in_column(item_id: int, column_id: str, url: str, text: str):
+    mutation = """
+    mutation ($item_id: ID!, $column_id: String!, $value: JSON!) {
+      change_simple_column_value(item_id: $item_id, column_id: $column_id, value: $value) { id }
+    }
+    """
+    value = json.dumps({"url": url, "text": text})
+    _post(mutation, {"item_id": item_id, "column_id": column_id, "value": value})
 
-    # Acomptes
-    FORMULA_COLUMN_IDS_JSON: str = '{"1":"formula_mkwnberr","2":"formula_mkwnntn2"}'
-    LINK_COLUMN_IDS_JSON: str = '{"1":"link_mkwnz493","2":"link_mkwn3ph9"}'
-    STATUS_AFTER_PAY_JSON: str = '{"1":"Payé acompte 1","2":"Payé acompte 2"}'
-
-    # Devis
-    CREATE_QUOTE_STATUS_COLUMN_ID: str = "color_mkwphad9"  # "Créer devis"
-    QUOTE_LINK_COLUMN_ID: str = "link_mkwqahhx"           # "Devis"
-    VAT_RATE_COLUMN_ID: str = "numeric_mkwqdrn3"          # "TVA"
-    VAT_NUMBER_COLUMN_ID: str = "text_mkwqjydy"
-    TOTAL_HT_COLUMN_ID: str = "numeric_mkwq2s74"
-    TOTAL_TTC_COLUMN_ID: str = "numeric_mkwns793"
-
-    PUBLIC_BASE_URL: str = "https://energyz-payplug-api-1.onrender.com"
-    IBAN_BY_STATUS_JSON: Optional[str] = '{"Enerlux":"FR76 1695 8000 0130 5670 5696 366","Energyz MAR":"FR76 1695 8000 0130 5670 5696 366","Energyz Divers":"FR76 1695 8000 0100 0571 1982 492"}'
-
-    class Config:
-        env_file = ".env"
-
-settings = Settings()
+def set_status(item_id: int, column_id: str, label: str):
+    mutation = """
+    mutation ($item_id: ID!, $column_id: String!, $value: String!) {
+      change_simple_column_value(item_id: $item_id, column_id: $column_id, value: $value) { id }
+    }
+    """
+    _post(mutation, {"item_id": item_id, "column_id": column_id, "value": label})
