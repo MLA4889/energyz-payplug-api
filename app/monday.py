@@ -19,10 +19,8 @@ def _post(query: str, variables: dict):
 
 # ---------- LECTURE DE BASE ----------
 def _extract_text_from_column(col: dict) -> str:
-    # 1) text
     if col.get("text"):
         return str(col["text"])
-    # 2) value (JSON)
     raw_val = col.get("value")
     if raw_val is None or raw_val == "":
         return ""
@@ -64,14 +62,14 @@ def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
             result[col["id"] + "__raw"] = col.get("value") or ""
     return result
 
-# ---------- Board columns map (id <-> title) + formula expr ----------
+# ---------- Board columns map + formules ----------
 def get_board_columns_map():
     """
     Retourne:
-      - columns: liste de colonnes {id, title, type, settings_str}
-      - id_to_title: dict
-      - title_to_id: dict
+      - cols: liste {id,title,type,settings_str}
+      - id_to_title / title_to_id
       - formulas: dict {column_id: formula_expression}
+      - col_types: dict {column_id: type}
     """
     query = """
     query ($board_id: [ID!]) {
@@ -89,15 +87,17 @@ def get_board_columns_map():
     data = _post(query, {"board_id": settings.MONDAY_BOARD_ID})
     boards = data["data"]["boards"]
     if not boards:
-        return [], {}, {}, {}
+        return [], {}, {}, {}, {}
     cols = boards[0]["columns"]
-    id_to_title, title_to_id, formulas = {}, {}, {}
+    id_to_title, title_to_id, formulas, col_types = {}, {}, {}, {}
     for c in cols:
         cid = c["id"]
-        ct = c.get("title") or ""
-        id_to_title[cid] = ct
-        title_to_id[ct] = cid
-        if c.get("type") == "formula":
+        title = c.get("title") or ""
+        ctype = c.get("type") or ""
+        id_to_title[cid] = title
+        title_to_id[title] = cid
+        col_types[cid] = ctype
+        if ctype == "formula":
             try:
                 s = c.get("settings_str") or ""
                 j = json.loads(s) if s else {}
@@ -105,13 +105,13 @@ def get_board_columns_map():
                     formulas[cid] = j["formula"]
             except Exception:
                 pass
-    return cols, id_to_title, title_to_id, formulas
+    return cols, id_to_title, title_to_id, formulas, col_types
 
 def get_formula_expression(column_id: str) -> str | None:
-    _, _, _, formulas = get_board_columns_map()
+    _, _, _, formulas, _ = get_board_columns_map()
     return formulas.get(column_id)
 
-# ---------- Calcul local d'une formula ----------
+# ---------- Évaluation sûre et récursive des formules ----------
 def _clean_num(text: str) -> str:
     if not text:
         return "0"
@@ -122,7 +122,8 @@ def _clean_num(text: str) -> str:
 
 def _safe_eval_arith(expr: str) -> float:
     import ast, operator as op
-    allowed_ops = {ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul, ast.Div: op.truediv, ast.USub: op.neg, ast.UAdd: op.pos, ast.Pow: op.pow}
+    allowed_ops = {ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul, ast.Div: op.truediv,
+                   ast.USub: op.neg, ast.UAdd: op.pos, ast.Pow: op.pow, ast.Mod: op.mod}
     def _eval(node):
         if hasattr(ast, "Constant") and isinstance(node, ast.Constant):
             if isinstance(node.value, (int, float)):
@@ -154,19 +155,13 @@ def _safe_eval_arith(expr: str) -> float:
 
 def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float | None:
     """
-    1) Lit l'expression de la formula (board.settings_str)
-    2) Remplace chaque {token} par la valeur de l'item
-       - token peut être un id de colonne ou un titre de colonne
-    3) Support ROUND()
+    Recalcule la valeur d'une colonne FORMULA pour un item, de façon récursive.
+    Gère ROUND(), + - * /, %, et références à d'autres colonnes Formula.
     """
-    expr = get_formula_expression(formula_col_id)
-    if not expr:
-        return None
+    # Maps du board
+    _, id_to_title, title_to_id, formulas, col_types = get_board_columns_map()
 
-    # Map colonnes id <-> titre pour interpréter les tokens
-    _, id_to_title, title_to_id, _ = get_board_columns_map()
-
-    # Lire toutes les valeurs de l'item (sans 'title', l'API ne le supporte pas ici)
+    # Valeurs de l’item
     query = """
     query ($item_id: ID!) {
       items (ids: [$item_id]) {
@@ -182,9 +177,11 @@ def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float |
     data = _post(query, {"item_id": item_id})
     item_cols = data["data"]["items"][0]["column_values"]
 
-    # Construire id -> nombre
-    id_to_num: dict[str, float] = {}
+    # id -> valeur numérique (pour non-formula)
+    id_to_numeric: dict[str, float] = {}
     for col in item_cols:
+        if col_types.get(col["id"]) == "formula":
+            continue
         val_txt = None
         if col.get("text"):
             val_txt = col["text"]
@@ -200,31 +197,63 @@ def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float |
                 except Exception:
                     val_txt = str(rv)
         num = float(_clean_num(val_txt or "0"))
-        id_to_num[col["id"]] = num
+        id_to_numeric[col["id"]] = num
 
-    # Tokens { ... }
-    tokens = re.findall(r"\{([^}]+)\}", expr)
+    # Résolution récursive
+    seen: set[str] = set()
+    cache: dict[str, float] = {}
 
-    # Remplacement tokens par valeurs
-    def repl(m: re.Match) -> str:
-        token = m.group(1)  # peut être id ou titre
-        # Si titre → map vers id
+    def resolve_token(token: str) -> float:
         col_id = token
-        if token not in id_to_num and token in title_to_id:
+        if col_id not in col_types and token in title_to_id:
             col_id = title_to_id[token]
-        value = id_to_num.get(col_id, 0.0)
-        return str(value)
 
-    expr_py = re.sub(r"\bROUND\s*\(", "round(", expr, flags=re.IGNORECASE)
-    expr_py = re.sub(r"\{([^}]+)\}", repl, expr_py)
+        if col_id in id_to_numeric:
+            return id_to_numeric[col_id]
+
+        if col_types.get(col_id) == "formula":
+            if col_id in cache:
+                return cache[col_id]
+            if col_id in seen:
+                return 0.0
+            seen.add(col_id)
+            expr_child = formulas.get(col_id)
+            if not expr_child:
+                seen.discard(col_id)
+                return 0.0
+
+            expr_child_py = re.sub(r"\bROUND\s*\(", "round(", expr_child, flags=re.IGNORECASE)
+            def repl_child(m: re.Match) -> str:
+                tk = m.group(1)
+                return str(resolve_token(tk))
+            expr_child_py = re.sub(r"\{([^}]+)\}", repl_child, expr_child_py)
+            expr_child_py = expr_child_py.replace(",", ".")
+            try:
+                val = _safe_eval_arith(expr_child_py)
+            except Exception:
+                val = 0.0
+            cache[col_id] = val
+            seen.discard(col_id)
+            return val
+
+        return 0.0
+
+    expr_root = formulas.get(formula_col_id)
+    if not expr_root:
+        return None
+
+    expr_py = re.sub(r"\bROUND\s*\(", "round(", expr_root, flags=re.IGNORECASE)
+    def repl_root(m: re.Match) -> str:
+        tk = m.group(1)
+        return str(resolve_token(tk))
+    expr_py = re.sub(r"\{([^}]+)\}", repl_root, expr_py)
     expr_py = expr_py.replace(",", ".")
-
     try:
         return _safe_eval_arith(expr_py)
     except Exception:
         return None
 
-# ---------- Écritures ----------
+# ---------- ÉCRITURES ----------
 def set_link_in_column(item_id: int, column_id: str, url: str, text: str):
     mutation = """
     mutation ($board_id: ID!, $item_id: ID!, $column_id: String!, $value: JSON!) {
