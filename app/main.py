@@ -1,168 +1,110 @@
-import json
-import logging
-import re
 from fastapi import FastAPI, Request, HTTPException
-from .config import settings
+import json
 from .payments import _choose_api_key, cents_from_str, create_payment
-from .monday import (
-    get_item_columns,
-    set_link_in_column,
-    set_status,
-    compute_formula_value_for_item,
-)
+from .monday import get_item_columns, set_link_in_column, set_status
+from .config import settings
+from .evoliz import create_quote, extract_public_link
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("energyz")
-
-app = FastAPI(title="Energyz PayPlug API", version="1.8 (formula-1&2)")
-
-def _safe_json_loads(s, default=None):
-    if s is None:
-        return default
-    if isinstance(s, dict):
-        return s
-    try:
-        return json.loads(s)
-    except Exception:
-        return default
-
-def _clean_number_text(s: str) -> str:
-    if not s:
-        return "0"
-    s = s.replace("\u202f", "").replace(" ", "").replace("€", "").strip()
-    s = s.replace(",", ".")
-    m = re.search(r"[-+]?\d*\.?\d+", s)
-    return m.group(0) if m else "0"
-
-def _extract_status_label(value_json: dict) -> str:
-    if not isinstance(value_json, dict):
-        return ""
-    lbl = value_json.get("label")
-    if isinstance(lbl, dict):
-        return str(lbl.get("text") or "").strip()
-    if isinstance(lbl, str):
-        return lbl.strip()
-    v = value_json.get("value")
-    return str(v or "").strip()
+app = FastAPI(title="Energyz PayPlug API", version="1.1")
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "Energyz PayPlug API (formula-1&2) is live 🚀"}
+    return {"status": "ok", "message": "Energyz Payment Automation is live 🚀"}
+
+def _safe_float(text_value: str, fallback: float = 0.0) -> float:
+    try:
+        return float(str(text_value).replace(",", "."))
+    except Exception:
+        return fallback
 
 @app.post("/quote/from_monday")
 async def quote_from_monday(request: Request):
     try:
-        raw = await request.body()
-        payload = _safe_json_loads(raw.decode("utf-8", errors="ignore"), default={}) or {}
-        logger.info(f"[WEBHOOK] payload={payload}")
-
-        event = payload.get("event") or {}
+        payload = await request.json()
+        print("[WEBHOOK] payload=", payload)
+        event = payload.get("event", {})
         item_id = event.get("pulseId") or event.get("itemId")
-        if not item_id:
-            raise HTTPException(status_code=400, detail="Item ID manquant (pulseId/itemId).")
+        column_id = event.get("columnId", "")
 
-        # Détection acompte via la colonne status déclencheur
-        trigger_col = event.get("columnId")
-        trigger_status_col = getattr(settings, "TRIGGER_STATUS_COLUMN_ID", "status")
-        trigger_labels = _safe_json_loads(
-            getattr(settings, "TRIGGER_LABELS_JSON", None),
-            default={"1":"Acompte 1","2":"Acompte 2"}
-        ) or {"1":"Acompte 1","2":"Acompte 2"}
+        # ===== Déclencheurs ACOMPTE (identique à ta version) =====
+        formula_columns = json.loads(settings.FORMULA_COLUMN_IDS_JSON)
+        link_columns = json.loads(settings.LINK_COLUMN_IDS_JSON)
+        status_after = json.loads(settings.STATUS_AFTER_PAY_JSON)
 
-        acompte_num = None
-        if trigger_col == trigger_status_col:
-            value_json = _safe_json_loads(event.get("value"), default={}) or {}
-            current_label = _extract_status_label(value_json).lower()
-            for k, label in trigger_labels.items():
-                if current_label == str(label).lower():
-                    acompte_num = k
-                    break
-            if acompte_num is None and "acompte" in current_label:
-                acompte_num = "1" if "1" in current_label else ("2" if "2" in current_label else None)
+        acompte_num = next((k for k, v in formula_columns.items() if v == column_id), None)
 
-        if acompte_num not in ("1","2"):
-            raise HTTPException(status_code=400, detail="Label status non reconnu pour acompte 1/2.")
+        # ===== Déclencheur DEVIS =====
+        is_create_quote = (column_id == settings.CREATE_QUOTE_STATUS_COLUMN_ID)
 
-        # Colonnes & mapping
-        formula_cols = _safe_json_loads(settings.FORMULA_COLUMN_IDS_JSON, default={}) or {}
-        link_columns = _safe_json_loads(settings.LINK_COLUMN_IDS_JSON, default={}) or {}
-        if acompte_num not in formula_cols or acompte_num not in link_columns:
-            raise HTTPException(status_code=500, detail=f"FORMULA_COLUMN_IDS_JSON/LINK_COLUMN_IDS_JSON sans clé '{acompte_num}'.")
+        # Rien à faire ?
+        if not acompte_num and not is_create_quote:
+            raise HTTPException(status_code=400, detail=f"Colonne déclenchante inconnue: {column_id}")
 
-        needed_cols = [
+        # Récup des colonnes utiles
+        cols = get_item_columns(item_id, [
             settings.EMAIL_COLUMN_ID,
             settings.ADDRESS_COLUMN_ID,
             settings.DESCRIPTION_COLUMN_ID,
-            settings.IBAN_FORMULA_COLUMN_ID,           # IBAN (formula éventuelle)
-            settings.QUOTE_AMOUNT_FORMULA_ID,          # Total HT (utile si référencé)
-            formula_cols[acompte_num],                 # Formula Acompte n
-            getattr(settings, "BUSINESS_STATUS_COLUMN_ID", "color_mkwnxf1h"),
-        ]
-        cols = get_item_columns(item_id, needed_cols)
-        logger.info(f"[MONDAY] item_id={item_id} values={cols}")
+            settings.IBAN_FORMULA_COLUMN_ID,
+            settings.QUOTE_AMOUNT_FORMULA_ID,
+            settings.VAT_RATE_COLUMN_ID,
+            settings.TOTAL_HT_COLUMN_ID,
+            settings.TOTAL_TTC_COLUMN_ID
+        ])
 
-        email = cols.get(settings.EMAIL_COLUMN_ID, "") or ""
-        address = cols.get(settings.ADDRESS_COLUMN_ID, "") or ""
-        description = cols.get(settings.DESCRIPTION_COLUMN_ID, "") or ""
-        iban = cols.get(settings.IBAN_FORMULA_COLUMN_ID, "") or ""
+        email       = cols.get(settings.EMAIL_COLUMN_ID, "")
+        address     = cols.get(settings.ADDRESS_COLUMN_ID, "")
+        description = cols.get(settings.DESCRIPTION_COLUMN_ID, "")
+        iban        = cols.get(settings.IBAN_FORMULA_COLUMN_ID, "")
+        amount_ht   = cols.get(settings.QUOTE_AMOUNT_FORMULA_ID, "")  # Montant total HT (utilisé aussi pour acomptes en %)
+        vat_rate    = cols.get(settings.VAT_RATE_COLUMN_ID, "") or "20"
 
-        # --- MONTANT ACOMPTE (1 ou 2) ---
-        formula_id = formula_cols[acompte_num]
-        acompte_txt = _clean_number_text(cols.get(formula_id, ""))  # 1) ce que Monday donne
+        # ====== ACOMPTE 1/2 ======
+        if acompte_num:
+            api_key = _choose_api_key(iban)
+            amount_cents = cents_from_str(amount_ht)
+            if acompte_num == "2":
+                amount_cents //= 2  # règle existante
 
-        if float(acompte_txt or "0") <= 0:
-            # 2) Recalcul local de la formula (récursif) si Monday renvoie null
-            computed = compute_formula_value_for_item(formula_id, int(item_id))
-            if computed is not None and computed > 0:
-                acompte_txt = str(computed)
+            metadata = {"item_id": item_id, "acompte": acompte_num}
+            payment_url = create_payment(api_key, amount_cents, email, address, description, metadata)
 
-        if float(acompte_txt or "0") <= 0:
-            # 3) Dernier recours pour ne pas planter
-            total_ht_txt = _clean_number_text(cols.get(settings.QUOTE_AMOUNT_FORMULA_ID, "0"))
-            if float(total_ht_txt) > 0:
-                acompte_txt = str(float(total_ht_txt) / 2.0)
-            else:
-                raise HTTPException(status_code=400, detail="Montant introuvable (formula + recalcul + total HT vides).")
+            set_link_in_column(item_id, link_columns[acompte_num], payment_url, f"Payer acompte {acompte_num}")
+            set_status(item_id, settings.STATUS_COLUMN_ID, status_after[acompte_num])
 
-        amount_cents = cents_from_str(acompte_txt)
-        if amount_cents <= 0:
-            raise HTTPException(status_code=400, detail=f"Montant invalide après parsing: '{acompte_txt}'.")
+            return {"status": "ok", "type": "acompte", "acompte": acompte_num, "payment_url": payment_url}
 
-        # IBAN : formula ou fallback Business Line
-        if not iban:
-            iban_by_status = _safe_json_loads(getattr(settings, "IBAN_BY_STATUS_JSON", None), default={}) or {}
-            business_status_label = cols.get(getattr(settings, "BUSINESS_STATUS_COLUMN_ID", "color_mkwnxf1h"), "")
-            if business_status_label and business_status_label in iban_by_status:
-                iban = iban_by_status[business_status_label]
-        if not iban:
-            raise HTTPException(status_code=400, detail="IBAN introuvable (formula vide + pas de fallback Business Line).")
+        # ====== CREATION DEVIS EVOLIZ ======
+        # On privilégie le HT depuis la colonne dédiée ; si vide, on reprend QUOTE_AMOUNT_FORMULA_ID.
+        unit_price_ht = _safe_float(cols.get(settings.TOTAL_HT_COLUMN_ID) or amount_ht, 0.0)
+        vr = _safe_float(vat_rate, 20.0)
 
-        api_key = _choose_api_key(iban)
-        if not api_key:
-            raise HTTPException(status_code=400, detail=f"Aucune clé PayPlug mappée pour IBAN '{iban}' (mode={settings.PAYPLUG_MODE}).")
+        # label = nom de l’item Monday, description = "Description presta"
+        label = cols.get("name", "") or description or "Devis"
 
-        metadata = {"item_id": str(item_id), "acompte": acompte_num, "description": description or f"Acompte {acompte_num}"}
+        quote = create_quote(label=label, description=description, unit_price_ht=unit_price_ht, vat_rate=vr)
+        public_url = extract_public_link(quote) or settings.EVOLIZ_BASE_URL  # secours
 
-        payment_url = create_payment(
-            api_key=api_key,
-            amount_cents=amount_cents,
-            email=email,
-            address=address,
-            client_name=cols.get("name", "Client Energyz"),
-            metadata=metadata
-        )
+        # Dépose le lien dans la colonne “Devis”
+        set_link_in_column(item_id, settings.QUOTE_LINK_COLUMN_ID, public_url, "Devis Evoliz")
 
-        set_link_in_column(item_id, link_columns[acompte_num], payment_url, f"Payer acompte {acompte_num}")
-        status_after = _safe_json_loads(settings.STATUS_AFTER_PAY_JSON, default={}) or {}
-        next_status = status_after.get(acompte_num, f"Payé acompte {acompte_num}")
-        set_status(item_id, settings.STATUS_COLUMN_ID, next_status)
+        return {"status": "ok", "type": "devis", "quote_response": quote, "public_url": public_url}
 
-        logger.info(f"[OK] item={item_id} acompte={acompte_num} amount_cents={amount_cents} url={payment_url}")
-        return {"status": "ok", "item_id": item_id, "acompte": acompte_num, "amount_cents": amount_cents, "payment_url": payment_url}
-
-    except HTTPException as e:
-        logger.error(f"[HTTP] {e.status_code} {e.detail}")
+    except HTTPException:
         raise
     except Exception as e:
-        logger.exception(f"[EXCEPTION] {e}")
-        raise HTTPException(status_code=500, detail=f"Erreur webhook Monday : {e}")
+        print(f"[ERROR] {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Petit endpoint de test manuel PayPlug existant
+@app.post("/pay/acompte/{n}")
+async def create_acompte_link(n: int):
+    try:
+        from_iban = "FR76 1695 8000 0130 5670 5696 366"
+        api_key = _choose_api_key(from_iban)
+        amount_cents = cents_from_str("1250.00") // (2 if n == 2 else 1)
+        metadata = {"client": "Jean Dupont", "acompte": str(n)}
+        url = create_payment(api_key, amount_cents, "jean@mail.com", "12 rue de Paris", "Installation solaire", metadata)
+        return {"status": "ok", "acompte": n, "payment_url": url}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
