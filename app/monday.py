@@ -8,6 +8,7 @@ HEADERS = {
     "Content-Type": "application/json",
 }
 
+
 def _post(query: str, variables: dict):
     r = requests.post(MONDAY_API_URL, headers=HEADERS, json={"query": query, "variables": variables})
     r.raise_for_status()
@@ -15,6 +16,7 @@ def _post(query: str, variables: dict):
     if "errors" in data:
         raise Exception(f"Erreur Monday: {data['errors']}")
     return data
+
 
 def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
     query = """
@@ -36,8 +38,10 @@ def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
         cid = col["id"]
         if cid in column_ids:
             result[cid] = col.get("text") or ""
+        # On expose systématiquement le raw JSON (utile pour formulas / location)
         result[f"{cid}__raw"] = col.get("value") or ""
     return result
+
 
 def set_link_in_column(item_id: int, column_id: str, url: str, text: str):
     mutation = """
@@ -54,6 +58,7 @@ def set_link_in_column(item_id: int, column_id: str, url: str, text: str):
     }
     _post(mutation, variables)
 
+
 def set_status(item_id: int, column_id: str, label: str):
     mutation = """
     mutation ($board_id: ID!, $item_id: ID!, $column_id: String!, $value: JSON!) {
@@ -69,7 +74,8 @@ def set_status(item_id: int, column_id: str, label: str):
     }
     _post(mutation, variables)
 
-# ---------- UPLOAD FICHIER (PDF) ----------
+
+# -------- Upload fichier PDF dans une colonne File --------
 def upload_file_to_column(item_id: int, column_id: str, filename: str, file_bytes: bytes):
     """
     add_file_to_column via /v2/file (multipart).
