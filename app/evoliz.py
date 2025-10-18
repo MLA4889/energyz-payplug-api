@@ -1,6 +1,6 @@
 import requests
 import datetime as dt
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 from .config import settings
 
 SESSION = {"token": None}
@@ -15,7 +15,7 @@ def _login() -> str:
     data = r.json()
     token = data.get("access_token") or data.get("token")
     if not token:
-        raise Exception(f"Evoliz login: token not found in response: {data}")
+        raise Exception(f"Evoliz login: token missing in response: {data}")
     SESSION["token"] = token
     return token
 
@@ -46,51 +46,69 @@ def _post(path: str, payload: dict):
         raise Exception(f"Evoliz API error {r.status_code}: {r.text}")
     return r.json()
 
-# ---------- Client/Prospect helpers ----------
+# ---------- Helpers client/prospect ----------
 
 def _find_client_by_email(email: str) -> Optional[str]:
-    """Essaie de retrouver un client existant via email (si l’API le permet)."""
     try:
         data = _get(f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/clients", params={"search": email})
-        # on tente plusieurs formes de réponse
         items = data if isinstance(data, list) else data.get("data") or []
         for it in items:
-            if str(it.get("email", "")).lower() == email.lower():
+            if str(it.get("email", "")).lower() == (email or "").lower():
                 return str(it.get("id") or it.get("clientid"))
     except Exception:
         pass
     return None
 
-def _create_prospect(name: str, email: str, address1: str = "") -> Optional[str]:
-    """Crée un prospect minimal (nom+email) et retourne son id."""
+def _normalize_address(addr: Dict[str, Any] | None) -> Dict[str, str]:
+    """
+    Transforme le JSON 'location' de Monday en adresse Evoliz:
+    - street: street.long_name (ou address)
+    - town: city.long_name
+    - postcode: '00000' si absent
+    - iso2: country.short_name (FR, MA, EG, …)
+    """
+    addr = addr or {}
+    street_obj = addr.get("street") or {}
+    city_obj   = addr.get("city") or {}
+    country    = addr.get("country") or {}
+
+    street  = (street_obj.get("long_name") or addr.get("address") or "").strip()
+    town    = (city_obj.get("long_name") or "").strip()
+    iso2    = (country.get("short_name") or country.get("shortName") or "").strip()  # 2 lettres
+    postcode = (addr.get("postalCode") or addr.get("postcode") or "").strip()
+
+    if not postcode:
+        postcode = "00000"           # fallback propre pour passer la validation Evoliz
+    if not town:
+        town = "N/A"                 # fallback
+    if not street:
+        street = "Adresse non précisée"
+    if not iso2:
+        iso2 = "FR"                  # fallback raisonnable (à adapter si besoin)
+
+    return {"street": street, "town": town, "postcode": postcode, "iso2": iso2}
+
+def _create_prospect(name: str, email: str, address_json: Dict[str, Any] | None) -> Optional[str]:
+    address = _normalize_address(address_json)
     payload = {
         "name": name or (email.split("@")[0] if email else "Prospect"),
         "email": email or "",
-        "address1": address1 or ""
+        "address": address
     }
     data = _post(f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/prospects", payload)
     return str(data.get("id") or data.get("prospectid") or data.get("data", {}).get("id"))
 
-def ensure_recipient(name: str, email: str, address1: str = "") -> Tuple[Optional[str], Optional[str]]:
-    """
-    Retourne (clientid, prospectid) — un seul des deux sera renseigné.
-    Priorité :
-      1) EVOLIZ_DEFAULT_CLIENT_ID si défini
-      2) client existant par email
-      3) création d’un prospect minimal
-    """
-    # 1) client par défaut (si fourni)
+def ensure_recipient(name: str, email: str, address_json: Dict[str, Any] | None) -> Tuple[Optional[str], Optional[str]]:
+    # 1) client forcé
     if settings.EVOLIZ_DEFAULT_CLIENT_ID:
         return (str(settings.EVOLIZ_DEFAULT_CLIENT_ID), None)
-
-    # 2) recherche d’un client existant
+    # 2) recherche client
     if email:
         cid = _find_client_by_email(email)
         if cid:
             return (cid, None)
-
-    # 3) création prospect
-    pid = _create_prospect(name, email, address1)
+    # 3) création prospect (avec adresse complète)
+    pid = _create_prospect(name, email, address_json)
     return (None, pid)
 
 # ---------- Quote ----------
@@ -102,22 +120,22 @@ def create_quote(
     vat_rate: float,
     recipient_name: str,
     recipient_email: str,
-    recipient_address: str = ""
+    recipient_address_json: Dict[str, Any] | None
 ) -> dict:
     """
-    Crée un devis conforme aux exigences Evoliz:
-      - documentdate (YYYY-MM-DD)
-      - clientid OU prospectid
-      - term.paymentid (1 = comptant / à adapter si besoin)
-      - items: [{ designation, quantity, unit_price, vat_rate }]
+    Crée un devis conforme aux exigences Evoliz.
+    - documentdate
+    - clientid OU prospectid (créé si nécessaire, avec adresse complète)
+    - term.paymentid
+    - items[]
     """
-    clientid, prospectid = ensure_recipient(recipient_name, recipient_email, recipient_address)
+    clientid, prospectid = ensure_recipient(recipient_name, recipient_email, recipient_address_json)
 
     payload = {
         "label": label or description or "Devis",
         "documentdate": dt.date.today().isoformat(),
         "status": "draft",
-        "term": {"paymentid": 1},  # 1 = comptant ; adapte si tu as une nomenclature différente
+        "term": {"paymentid": 1},  # 1 = comptant
         "items": [
             {
                 "designation": description or label or "Prestation",
@@ -132,11 +150,9 @@ def create_quote(
     elif prospectid:
         payload["prospectid"] = prospectid
 
-    data = _post(f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes", payload)
-    return data
+    return _post(f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes", payload)
 
 def extract_public_link(quote_response: dict) -> Optional[str]:
-    # essai de plusieurs clés possibles
     for key in ["public_link", "public_url", "portal_url", "share_link", "url", "download_url", "pdf_url"]:
         v = quote_response.get(key)
         if v:
