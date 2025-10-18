@@ -1,38 +1,47 @@
-from typing import Optional
-import payplug
+import requests
+import json
 from .config import settings
 
-def _choose_api_key(iban_display_value: str) -> Optional[str]:
-    keymap = settings.PAYPLUG_KEYS_LIVE if settings.PAYPLUG_MODE == "live" else settings.PAYPLUG_KEYS_TEST
-    if not iban_display_value:
-        return keymap.get("AUTRE_IBAN")
-    k = " ".join(iban_display_value.split())  # normaliser espaces
-    return keymap.get(k) or keymap.get("AUTRE_IBAN")
 
-def cents_from_str(s: str | None) -> int:
-    if not s:
-        return 0
-    s = s.replace("€", "").replace(" ", "").replace(",", ".")
+def _choose_api_key(iban: str) -> str:
+    """Sélectionne la clé PayPlug selon l’IBAN et le mode."""
+    mode = settings.PAYPLUG_MODE.lower()
+    key_dict = json.loads(settings.PAYPLUG_KEYS_TEST_JSON if mode == "test" else settings.PAYPLUG_KEYS_LIVE_JSON)
+    return key_dict.get(iban)
+
+
+def cents_from_str(amount_str: str) -> int:
+    """Convertit '1250.00' → 125000 (en centimes)."""
     try:
-        return int(round(float(s) * 100))
+        return int(round(float(amount_str) * 100))
     except Exception:
         return 0
 
-def create_payment(amount_cents: int, description: str, return_url: str, iban_display_value: str) -> dict:
-    api_key = _choose_api_key(iban_display_value)
-    if not api_key:
-        raise RuntimeError("Aucune clé PayPlug correspondante à l'IBAN sélectionné.")
 
-    # PayPlug SDK v2 : set_secret_key
-    payplug.set_secret_key(api_key)
+def create_payment(api_key: str, amount_cents: int, email: str, address: str, client_name: str, metadata: dict):
+    """Crée un lien de paiement PayPlug."""
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
 
-    payment = payplug.Payment.create(
-        amount=amount_cents,
-        currency='EUR',
-        hosted_payment={'return_url': return_url},
-        notification_url=None,
-        save_card=False,
-        metadata={"brand": settings.BRAND_NAME, "iban": iban_display_value, "mode": settings.PAYPLUG_MODE},
-        description=(description or "Acompte")[:255],
-    )
-    return {"id": payment.id, "url": payment.hosted_payment.payment_url, "status": payment.status}
+    payload = {
+        "amount": amount_cents,
+        "currency": "EUR",
+        "customer": {
+            "email": email,
+            "first_name": client_name.split(" ")[0],
+            "last_name": client_name.split(" ")[-1],
+            "address1": address
+        },
+        "metadata": metadata,
+        "hosted_payment": {"return_url": settings.PUBLIC_BASE_URL}
+    }
+
+    url = "https://api.payplug.com/v1/payments"
+    res = requests.post(url, headers=headers, json=payload)
+    if res.status_code not in [200, 201]:
+        raise Exception(f"Erreur PayPlug : {res.status_code} → {res.text}")
+
+    data = res.json()
+    return data.get("hosted_payment", {}).get("payment_url")
