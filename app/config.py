@@ -1,59 +1,53 @@
-import json
-import requests
-from .config import settings
+from pydantic_settings import BaseSettings
 
-MONDAY_API_URL = "https://api.monday.com/v2"
-HEADERS = {
-    "Authorization": settings.MONDAY_API_KEY,
-    "Content-Type": "application/json"
-}
 
-def _post(query: str, variables: dict):
-    r = requests.post(MONDAY_API_URL, headers=HEADERS, json={"query": query, "variables": variables})
-    r.raise_for_status()
-    data = r.json()
-    if "errors" in data:
-        raise Exception(f"Erreur Monday: {data['errors']}")
-    return data
+class Settings(BaseSettings):
+    # === Monday ===
+    MONDAY_API_KEY: str
+    MONDAY_BOARD_ID: int
 
-def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
-    # On ramène name + column_values (id, text, value) puis on expose aussi __raw
-    query = """
-    query ($item_id: ID!) {
-      items (ids: [$item_id]) {
-        name
-        column_values {
-          id
-          text
-          value
-        }
-      }
-    }
-    """
-    data = _post(query, {"item_id": item_id})
-    item = data["data"]["items"][0]
-    result = {"name": item["name"]}
-    for col in item["column_values"]:
-        cid = col["id"]
-        if cid in column_ids:
-            result[cid] = col.get("text") or ""
-        # on expose toujours le RAW (JSON) si on en a besoin
-        result[f"{cid}__raw"] = col.get("value") or ""
-    return result
+    # === Evoliz (API principale) ===
+    EVOLIZ_BASE_URL: str                 # ex: https://www.evoliz.io
+    EVOLIZ_COMPANY_ID: str
+    EVOLIZ_PUBLIC_KEY: str
+    EVOLIZ_SECRET_KEY: str
 
-def set_link_in_column(item_id: int, column_id: str, url: str, text: str):
-    mutation = """
-    mutation ($item_id: ID!, $column_id: String!, $value: JSON!) {
-      change_simple_column_value(item_id: $item_id, column_id: $column_id, value: $value) { id }
-    }
-    """
-    value = json.dumps({"url": url, "text": text})
-    _post(mutation, {"item_id": item_id, "column_id": column_id, "value": value})
+    # === Evoliz (Application / Lien public) ===
+    # Si ton compte Evoliz utilise une URL de type https://evoliz.com/energyz/quote/display.php?QUOTEID=xxxx
+    # alors tu dois définir EVOLIZ_TENANT_SLUG="energyz"
+    # L’API construira automatiquement : https://evoliz.com/energyz/quote/display.php?QUOTEID=<ID>
+    EVOLIZ_TENANT_SLUG: str | None = None
 
-def set_status(item_id: int, column_id: str, label: str):
-    mutation = """
-    mutation ($item_id: ID!, $column_id: String!, $value: String!) {
-      change_simple_column_value(item_id: $item_id, column_id: $column_id, value: $value) { id }
-    }
-    """
-    _post(mutation, {"item_id": item_id, "column_id": column_id, "value": label})
+    # Si ton compte utilise plutôt https://app.evoliz.com, garde cette variable :
+    EVOLIZ_APP_BASE_URL: str | None = None
+
+    # === PayPlug ===
+    PAYPLUG_KEYS_TEST_JSON: str
+    PAYPLUG_KEYS_LIVE_JSON: str
+    PAYPLUG_MODE: str                    # "test" ou "live"
+
+    # === Colonnes Monday ===
+    EMAIL_COLUMN_ID: str
+    ADDRESS_COLUMN_ID: str
+    DESCRIPTION_COLUMN_ID: str           # ta colonne Formula "Description presta"
+    DESCRIPTION_FALLBACK_COLUMN_ID: str | None = None  # colonne Texte de secours
+    IBAN_FORMULA_COLUMN_ID: str
+    QUOTE_AMOUNT_FORMULA_ID: str
+    LINK_COLUMN_IDS_JSON: str
+    FORMULA_COLUMN_IDS_JSON: str
+    STATUS_AFTER_PAY_JSON: str
+    STATUS_COLUMN_ID: str
+
+    # === Devis Evoliz ===
+    CREATE_QUOTE_STATUS_COLUMN_ID: str   # colonne Status "Créer devis"
+    QUOTE_LINK_COLUMN_ID: str            # colonne Lien "Devis"
+    VAT_RATE_COLUMN_ID: str
+    TOTAL_HT_COLUMN_ID: str
+    TOTAL_TTC_COLUMN_ID: str
+
+    class Config:
+        env_file = ".env"
+
+
+# Instance unique globale
+settings = Settings()
