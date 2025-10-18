@@ -3,20 +3,14 @@ import datetime as dt
 from typing import Optional, Tuple, Dict, Any
 from .config import settings
 
-# --------------------------------------------------------------------------------------
-# Auth session
-# --------------------------------------------------------------------------------------
-
 SESSION = {"token": None}
 
 def _login() -> str:
     url = f"{settings.EVOLIZ_BASE_URL}/api/login"
-    r = requests.post(
-        url,
-        json={"public_key": settings.EVOLIZ_PUBLIC_KEY, "secret_key": settings.EVOLIZ_SECRET_KEY},
-        headers={"Content-Type": "application/json"},
-        timeout=25,
-    )
+    r = requests.post(url, json={
+        "public_key": settings.EVOLIZ_PUBLIC_KEY,
+        "secret_key": settings.EVOLIZ_SECRET_KEY
+    }, headers={"Content-Type": "application/json"}, timeout=25)
     r.raise_for_status()
     data = r.json()
     token = data.get("access_token") or data.get("token")
@@ -30,7 +24,7 @@ def _headers() -> dict:
         _login()
     return {
         "Authorization": f"Bearer {SESSION['token']}",
-        "Content-Type": "application/json",
+        "Content-Type": "application/json"
     }
 
 def _get(path: str, params: dict | None = None):
@@ -42,19 +36,25 @@ def _get(path: str, params: dict | None = None):
     r.raise_for_status()
     return r.json()
 
-def _post(path: str, payload: dict):
+def _post(path: str, payload: dict | None = None, method: str = "POST"):
     url = f"{settings.EVOLIZ_BASE_URL}{path}"
-    r = requests.post(url, headers=_headers(), json=payload, timeout=25)
+    if method == "POST":
+        r = requests.post(url, headers=_headers(), json=payload or {}, timeout=25)
+    else:
+        r = requests.request(method, url, headers=_headers(), json=payload or {}, timeout=25)
+
     if r.status_code == 401:
         _login()
-        r = requests.post(url, headers=_headers(), json=payload, timeout=25)
+        if method == "POST":
+            r = requests.post(url, headers=_headers(), json=payload or {}, timeout=25)
+        else:
+            r = requests.request(method, url, headers=_headers(), json=payload or {}, timeout=25)
+
     if not r.ok:
         raise Exception(f"Evoliz API error {r.status_code}: {r.text}")
     return r.json()
 
-# --------------------------------------------------------------------------------------
-# Lookups (client/prospect)
-# --------------------------------------------------------------------------------------
+# -----------------------  Recherches client/prospect  -----------------------
 
 def _find_client_by_email(email: str) -> Optional[str]:
     if not email:
@@ -95,9 +95,7 @@ def _find_prospect_by_name(name: str) -> Optional[str]:
         pass
     return None
 
-# --------------------------------------------------------------------------------------
-# Address normalization (Monday "location" → Evoliz)
-# --------------------------------------------------------------------------------------
+# -----------------------  Adresse Monday → Evoliz  -----------------------
 
 def _normalize_address(addr: Dict[str, Any] | None) -> Dict[str, str]:
     addr = addr or {}
@@ -112,16 +110,14 @@ def _normalize_address(addr: Dict[str, Any] | None) -> Dict[str, str]:
 
     return {"street": street, "town": town, "postcode": postcode, "iso2": iso2}
 
-# --------------------------------------------------------------------------------------
-# Prospect creation (robuste, gère "name has already been taken")
-# --------------------------------------------------------------------------------------
+# -----------------------  Prospect robuste  -----------------------
 
 def _create_prospect(name: str, email: str, address_json: Dict[str, Any] | None) -> Optional[str]:
     address = _normalize_address(address_json)
     payload = {
         "name": name or (email.split("@")[0] if email else "Prospect"),
         "email": email or "",
-        "address": address,
+        "address": address
     }
     try:
         data = _post(f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/prospects", payload)
@@ -153,9 +149,7 @@ def ensure_recipient(name: str, email: str, address_json: Dict[str, Any] | None)
     pid = _create_prospect(name, email, address_json)
     return (None, pid)
 
-# --------------------------------------------------------------------------------------
-# Quotes
-# --------------------------------------------------------------------------------------
+# -----------------------  Devis  -----------------------
 
 def create_quote(
     label: str,
@@ -179,15 +173,15 @@ def create_quote(
         "label": label or description or "Devis",
         "documentdate": dt.date.today().isoformat(),
         "status": "draft",
-        "term": {"paytermid": 1},  # IMPORTANT: 'paytermid' (pas 'paymentid')
+        "term": {"paytermid": 1},
         "items": [
             {
                 "designation": description or label or "Prestation",
                 "quantity": 1,
                 "unit_price": round(float(unit_price_ht), 2),
-                "vat_rate": round(float(vat_rate), 2),
+                "vat_rate": round(float(vat_rate), 2)
             }
-        ],
+        ]
     }
     if clientid:
         payload["clientid"] = clientid
@@ -197,38 +191,69 @@ def create_quote(
     return _post(f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes", payload)
 
 def get_quote(quote_id: str) -> dict:
-    """Relit un devis par ID pour récupérer number/links éventuels."""
     return _get(f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes/{quote_id}")
 
+def _try_create_share_link(quote_id: str) -> Optional[str]:
+    """
+    Essaye différentes routes possibles pour générer un lien partageable.
+    """
+    candidates = [
+        (f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes/{quote_id}/share", "POST"),
+        (f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/quotes/{quote_id}/public-link", "POST"),
+    ]
+    for path, method in candidates:
+        try:
+            data = _post(path, {}, method=method)
+            # on tente d'extraire un lien dans la réponse
+            for k in ["public_link", "public_url", "share_link", "url"]:
+                if isinstance(data, dict) and (val := data.get(k)):
+                    return str(val)
+                nested = (data.get("data") if isinstance(data, dict) else None) or {}
+                if (val := nested.get(k)):
+                    return str(val)
+        except Exception:
+            continue
+    return None
+
 def extract_public_link(quote_response: dict) -> Optional[str]:
-    """Tente d'extraire un lien partageable depuis la création ou la consultation."""
-    # 1) test direct
+    """
+    Cherche un lien public dans la réponse de création,
+    sinon relit le devis, puis tente de créer un lien partageable.
+    """
+    # 1) direct
     for key in ["public_link", "public_url", "portal_url", "share_link", "url", "download_url", "pdf_url"]:
         v = quote_response.get(key)
         if v:
-            return v
+            return str(v)
     nested = (quote_response.get("data") or quote_response.get("quote") or {})
     for key in ["public_link", "public_url", "portal_url", "share_link", "url"]:
         v = nested.get(key)
         if v:
-            return v
+            return str(v)
 
-    # 2) si on a un id, on relit le devis et on réessaie
+    # 2) recharge / création
     qid = str(quote_response.get("id") or nested.get("id") or "")
-    if qid:
-        try:
-            full = get_quote(qid)
-            for key in ["public_link", "public_url", "portal_url", "share_link", "url", "download_url", "pdf_url"]:
-                v = full.get(key) or (full.get("data") or {}).get(key)
-                if v:
-                    return v
-        except Exception:
-            pass
+    if not qid:
+        return None
+
+    # relire le devis
+    try:
+        full = get_quote(qid)
+        for key in ["public_link", "public_url", "portal_url", "share_link", "url", "download_url", "pdf_url"]:
+            v = full.get(key) or (full.get("data") or {}).get(key)
+            if v:
+                return str(v)
+    except Exception:
+        pass
+
+    # tenter de créer un lien partageable via endpoints possibles
+    created = _try_create_share_link(qid)
+    if created:
+        return created
 
     return None
 
 def extract_identifiers(quote_response: dict) -> Tuple[Optional[str], Optional[str]]:
-    """Retourne (id, number) si dispo pour afficher un libellé utile dans Monday."""
     data = quote_response.get("data") or quote_response
     qid = str(data.get("id") or data.get("quoteid") or "")
     number = str(data.get("number") or data.get("quotenumber") or "")
