@@ -1,5 +1,6 @@
 import json
 import re
+import math
 import requests
 from .config import settings
 
@@ -9,6 +10,7 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
+# --------------------------------- HTTP ---------------------------------
 def _post(query: str, variables: dict):
     resp = requests.post(MONDAY_API_URL, headers=HEADERS, json={"query": query, "variables": variables})
     resp.raise_for_status()
@@ -17,10 +19,12 @@ def _post(query: str, variables: dict):
         raise Exception(f"Erreur Monday: {data['errors']}")
     return data
 
-# ---------- LECTURE DE BASE ----------
+# --------------------------- Helpers de parsing --------------------------
 def _extract_text_from_column(col: dict) -> str:
+    # 1) text lisible
     if col.get("text"):
         return str(col["text"])
+    # 2) value JSON
     raw_val = col.get("value")
     if raw_val is None or raw_val == "":
         return ""
@@ -36,6 +40,15 @@ def _extract_text_from_column(col: dict) -> str:
         return json.dumps(parsed, ensure_ascii=False)
     return str(parsed)
 
+def _clean_num(text: str) -> str:
+    if not text:
+        return "0"
+    t = str(text).replace("\u202f", "").replace(" ", "").replace("€", "")
+    t = t.replace(",", ".")
+    m = re.search(r"[-+]?\d*\.?\d+", t)
+    return m.group(0) if m else "0"
+
+# ----------------------------- Lecture item ------------------------------
 def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
     """
     Retourne un dict {col_id: texte_lisible, col_id+'__raw': value_brut_json}
@@ -62,7 +75,7 @@ def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
             result[col["id"] + "__raw"] = col.get("value") or ""
     return result
 
-# ---------- Board columns map + formules ----------
+# -------------------- Board map (titles, types, formules) ----------------
 def get_board_columns_map():
     """
     Retourne:
@@ -111,52 +124,153 @@ def get_formula_expression(column_id: str) -> str | None:
     _, _, _, formulas, _ = get_board_columns_map()
     return formulas.get(column_id)
 
-# ---------- Évaluation sûre et récursive des formules ----------
-def _clean_num(text: str) -> str:
-    if not text:
-        return "0"
-    t = str(text).replace("\u202f", "").replace(" ", "").replace("€", "")
-    t = t.replace(",", ".")
-    m = re.search(r"[-+]?\d*\.?\d+", t)
-    return m.group(0) if m else "0"
+# ------------------ Traduction Monday -> Python sûr ----------------------
+def _translate_monday_expr(expr: str) -> str:
+    """
+    Transforme l'expression Formula de Monday en une expression Python sûre :
+      - ROUND( -> round(
+      - IF( -> if_(
+      - AND( -> and_(a,b,...)  / OR( -> or_(...) / NOT(x) -> not_(x)
+      - TRUE/FALSE -> True/False
+      - Comparateurs: "<>" -> "!=", "=" -> "==" (hors >=, <=, !=, ==)
+    """
+    if expr is None:
+        return ""
 
-def _safe_eval_arith(expr: str) -> float:
+    out = expr
+
+    # Fonctions
+    out = re.sub(r"\bROUND\s*\(", "round(", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bIF\s*\(", "if_(", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bAND\s*\(", "and_(", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bOR\s*\(", "or_(", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bNOT\s*\(", "not_(", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bMIN\s*\(", "min(", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bMAX\s*\(", "max(", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bABS\s*\(", "abs(", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bFLOOR\s*\(", "floor(", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bCEILING\s*\(", "ceil(", out, flags=re.IGNORECASE)
+
+    # Booléens
+    out = re.sub(r"\bTRUE\b", "True", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bFALSE\b", "False", out, flags=re.IGNORECASE)
+
+    # Comparateurs
+    out = out.replace("<>", "!=")
+    # "=" qui n'est pas déjà dans "==", ">=" ou "<=" ou "!="
+    out = re.sub(r"(?<![<>!=])=(?!=)", "==", out)
+
+    # Virgules décimales FR (par sécurité ; l'éval travaille en '.')
+    out = out.replace(",", ",")
+
+    return out
+
+# ------------------ Évaluation sûre (arith + bool + IF) ------------------
+def _safe_eval_arith_bool(expr: str) -> float:
+    """
+    Évalue une expression Python en environnement restreint :
+    - opérations + - * / % **, comparateurs, booléens
+    - fonctions: round, if_, min, max, abs, floor, ceil
+    """
     import ast, operator as op
-    allowed_ops = {ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul, ast.Div: op.truediv,
-                   ast.USub: op.neg, ast.UAdd: op.pos, ast.Pow: op.pow, ast.Mod: op.mod}
+
+    # Ops autorisées
+    allowed_binops = {
+        ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul, ast.Div: op.truediv,
+        ast.Pow: op.pow, ast.Mod: op.mod
+    }
+    allowed_unary = {ast.UAdd: op.pos, ast.USub: op.neg, ast.Not: op.not_}
+    allowed_cmp = {
+        ast.Eq: op.eq, ast.NotEq: op.ne, ast.Gt: op.gt, ast.GtE: op.ge, ast.Lt: op.lt, ast.LtE: op.le
+    }
+
+    def if_(*args):
+        # IF(condition, a, b) -> if_(cond, a, b)
+        if len(args) < 2:
+            raise ValueError("IF() requiert au moins 2 arguments")
+        cond = bool(args[0])
+        a = args[1]
+        b = args[2] if len(args) >= 3 else 0
+        return a if cond else b
+
+    def and_(*args):
+        return float(all(bool(x) for x in args))
+
+    def or_(*args):
+        return float(any(bool(x) for x in args))
+
+    def not_(x):
+        return float(not bool(x))
+
+    safe_funcs = {
+        'round': round,
+        'if_': if_,
+        'min': min,
+        'max': max,
+        'abs': abs,
+        'floor': math.floor,
+        'ceil': math.ceil,
+        'and_': and_,
+        'or_': or_,
+        'not_': not_,
+        'True': True,
+        'False': False,
+    }
+
     def _eval(node):
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
         if hasattr(ast, "Constant") and isinstance(node, ast.Constant):
-            if isinstance(node.value, (int, float)):
+            # nombre ou bool
+            if isinstance(node.value, (int, float, bool)):
                 return node.value
-            raise ValueError("Constante non numérique")
+            raise ValueError("Constante non autorisée")
         if isinstance(node, ast.Num):
             return node.n
         if isinstance(node, ast.BinOp):
-            return allowed_ops[type(node.op)](_eval(node.left), _eval(node.right))
+            return allowed_binops[type(node.op)](_eval(node.left), _eval(node.right))
         if isinstance(node, ast.UnaryOp):
-            return allowed_ops[type(node.op)](_eval(node.operand))
+            return allowed_unary[type(node.op)](_eval(node.operand))
+        if isinstance(node, ast.BoolOp):
+            vals = [_eval(v) for v in node.values]
+            if isinstance(node.op, ast.And):
+                return all(bool(v) for v in vals)
+            if isinstance(node.op, ast.Or):
+                return any(bool(v) for v in vals)
+            raise ValueError("BoolOp non autorisé")
+        if isinstance(node, ast.Compare):
+            left = _eval(node.left)
+            for opnode, comp in zip(node.ops, node.comparators):
+                right = _eval(comp)
+                if not allowed_cmp[type(opnode)](left, right):
+                    return False
+                left = right
+            return True
         if isinstance(node, ast.Call):
             if not isinstance(node.func, ast.Name):
-                raise ValueError("Fonction non autorisée")
-            fname = node.func.id.lower()
-            if fname == "round":
-                args = [_eval(a) for a in node.args]
-                if len(args) == 1:
-                    return round(args[0])
-                if len(args) >= 2:
-                    return round(args[0], int(args[1]))
-                raise ValueError("Arguments round invalides")
-            raise ValueError("Fonction non autorisée")
-        if isinstance(node, ast.Expression):
-            return _eval(node.body)
+                raise ValueError("Appel non autorisé")
+            fname = node.func.id
+            if fname not in safe_funcs:
+                raise ValueError(f"Fonction non autorisée: {fname}")
+            args = [_eval(a) for a in node.args]
+            return safe_funcs[fname](*args)
+        if isinstance(node, ast.Name):
+            # True/False / noms de fonctions déjà dans safe_funcs
+            if node.id in safe_funcs:
+                return safe_funcs[node.id]
+            raise ValueError(f"Nom non autorisé: {node.id}")
         raise ValueError("Expression non autorisée")
-    tree = ast.parse(expr, mode='eval')
-    return float(_eval(tree))
 
+    tree = ast.parse(expr, mode='eval')
+    val = _eval(tree)
+    # Retourne un float (cohérent pour montants)
+    return float(val)
+
+# ---------------- Calcul de formula (récursif + conditions) --------------
 def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float | None:
     """
-    Recalcule la valeur d'une colonne FORMULA pour un item, de façon récursive.
-    Gère ROUND(), + - * /, %, et références à d'autres colonnes Formula.
+    Recalcule la valeur d'une colonne FORMULA pour un item, de façon récursive,
+    en gérant IF/AND/OR/NOT/ROUND/MIN/MAX/ABS/FLOOR/CEILING et comparateurs.
     """
     # Maps du board
     _, id_to_title, title_to_id, formulas, col_types = get_board_columns_map()
@@ -177,7 +291,7 @@ def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float |
     data = _post(query, {"item_id": item_id})
     item_cols = data["data"]["items"][0]["column_values"]
 
-    # id -> valeur numérique (pour non-formula)
+    # id -> valeur numérique (non-formula)
     id_to_numeric: dict[str, float] = {}
     for col in item_cols:
         if col_types.get(col["id"]) == "formula":
@@ -198,12 +312,14 @@ def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float |
                     val_txt = str(rv)
         num = float(_clean_num(val_txt or "0"))
         id_to_numeric[col["id"]] = num
+        # aussi access par titre (utilisé lors du remplacement)
+        # (si duplicata de titres, Monday déconseille — on prend le premier)
 
-    # Résolution récursive
     seen: set[str] = set()
     cache: dict[str, float] = {}
 
     def resolve_token(token: str) -> float:
+        # token peut être id ("numeric_xxx") ou titre ("Montant total HT")
         col_id = token
         if col_id not in col_types and token in title_to_id:
             col_id = title_to_id[token]
@@ -215,21 +331,22 @@ def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float |
             if col_id in cache:
                 return cache[col_id]
             if col_id in seen:
-                return 0.0
+                return 0.0  # boucle
             seen.add(col_id)
-            expr_child = formulas.get(col_id)
-            if not expr_child:
+            child_expr = formulas.get(col_id)
+            if not child_expr:
                 seen.discard(col_id)
                 return 0.0
 
-            expr_child_py = re.sub(r"\bROUND\s*\(", "round(", expr_child, flags=re.IGNORECASE)
+            child_expr = _translate_monday_expr(child_expr)
+
             def repl_child(m: re.Match) -> str:
                 tk = m.group(1)
                 return str(resolve_token(tk))
-            expr_child_py = re.sub(r"\{([^}]+)\}", repl_child, expr_child_py)
-            expr_child_py = expr_child_py.replace(",", ".")
+            child_expr = re.sub(r"\{([^}]+)\}", repl_child, child_expr)
+            child_expr = child_expr.replace(",", ".")
             try:
-                val = _safe_eval_arith(expr_child_py)
+                val = _safe_eval_arith_bool(child_expr)
             except Exception:
                 val = 0.0
             cache[col_id] = val
@@ -238,22 +355,24 @@ def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float |
 
         return 0.0
 
-    expr_root = formulas.get(formula_col_id)
-    if not expr_root:
+    root = formulas.get(formula_col_id)
+    if not root:
         return None
 
-    expr_py = re.sub(r"\bROUND\s*\(", "round(", expr_root, flags=re.IGNORECASE)
+    root_expr = _translate_monday_expr(root)
+
     def repl_root(m: re.Match) -> str:
         tk = m.group(1)
         return str(resolve_token(tk))
-    expr_py = re.sub(r"\{([^}]+)\}", repl_root, expr_py)
-    expr_py = expr_py.replace(",", ".")
+
+    root_expr = re.sub(r"\{([^}]+)\}", repl_root, root_expr)
+    root_expr = root_expr.replace(",", ".")
     try:
-        return _safe_eval_arith(expr_py)
+        return _safe_eval_arith_bool(root_expr)
     except Exception:
         return None
 
-# ---------- ÉCRITURES ----------
+# ----------------------------- Écritures ---------------------------------
 def set_link_in_column(item_id: int, column_id: str, url: str, text: str):
     mutation = """
     mutation ($board_id: ID!, $item_id: ID!, $column_id: String!, $value: JSON!) {
