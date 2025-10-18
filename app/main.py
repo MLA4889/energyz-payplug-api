@@ -7,11 +7,10 @@ from .config import settings
 from .payments import _choose_api_key, cents_from_str, create_payment
 from .monday import get_item_columns, set_link_in_column, set_status
 
-# --- IMPORT SÉCURISÉ : upload_file_to_column ---
+# Import robuste pour l'upload de fichier (fallback local si non trouvé)
 try:
-    from .monday import upload_file_to_column  # doit exister dans monday.py
+    from .monday import upload_file_to_column
 except ImportError:
-    # Fallback local (même implémentation) pour éviter l'ImportError en prod
     MONDAY_API_URL = "https://api.monday.com/v2"
     def upload_file_to_column(item_id: int, column_id: str, filename: str, file_bytes: bytes):
         url = f"{MONDAY_API_URL}/file"
@@ -48,11 +47,13 @@ from .evoliz import (
     download_quote_pdf,
 )
 
-app = FastAPI(title="Energyz Payment Automation", version="2.7.1")
+app = FastAPI(title="Energyz Payment Automation", version="2.8.0")
+
 
 @app.get("/")
 def root():
     return {"status": "ok", "message": "Energyz Payment Automation is live 🚀"}
+
 
 def _clean_number_text(s: str) -> str:
     if not s:
@@ -61,11 +62,13 @@ def _clean_number_text(s: str) -> str:
     m = re.search(r"[-+]?\d*\.?\d+", s)
     return m.group(0) if m else "0"
 
+
 def _to_float(s: str, default: float = 0.0) -> float:
     try:
         return float(_clean_number_text(s))
     except Exception:
         return default
+
 
 def _best_description(cols: dict) -> str:
     desc = cols.get(settings.DESCRIPTION_COLUMN_ID, "") or ""
@@ -90,6 +93,7 @@ def _best_description(cols: dict) -> str:
         if fb:
             return fb.strip()
     return ""
+
 
 @app.post("/quote/from_monday")
 async def quote_from_monday(request: Request):
@@ -178,11 +182,11 @@ async def quote_from_monday(request: Request):
         if qid:
             link_text += f" (ID:{qid})"
 
-        # (1) on met un lien (public si dispo, sinon deep-link)
+        # 1) colonne Lien (public si possible, sinon deep-link)
         url_to_set = public_url or deep_link or settings.EVOLIZ_BASE_URL
         set_link_in_column(item_id, settings.QUOTE_LINK_COLUMN_ID, url_to_set, link_text)
 
-        # (2) fallback PDF si pas de lien public
+        # 2) fallback PDF si pas de lien public
         if not public_url and settings.QUOTE_FILES_COLUMN_ID:
             pdf_bytes, filename = download_quote_pdf(qid)
             try:
