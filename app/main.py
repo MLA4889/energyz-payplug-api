@@ -4,35 +4,23 @@ import json, re
 from .config import settings
 from .payments import _choose_api_key, cents_from_str, create_payment
 from .monday import get_item_columns, set_link_in_column, set_status
-from .evoliz import (
-    create_quote,
-    extract_public_link,
-    extract_identifiers,
-    build_app_quote_url,
-)
+from .evoliz import create_quote, extract_public_link, extract_identifiers, build_app_quote_url
 
-app = FastAPI(title="Energyz Payment Automation", version="2.4.0")
-
+app = FastAPI(title="Energyz Payment Automation", version="2.5.0")
 
 @app.get("/")
 def root():
     return {"status": "ok", "message": "Energyz Payment Automation is live 🚀"}
 
-
 def _clean_number_text(s: str) -> str:
-    if not s:
-        return "0"
+    if not s: return "0"
     s = s.replace("\u202f", "").replace(" ", "").replace("€", "").strip().replace(",", ".")
     m = re.search(r"[-+]?\d*\.?\d+", s)
     return m.group(0) if m else "0"
 
-
 def _to_float(s: str, default: float = 0.0) -> float:
-    try:
-        return float(_clean_number_text(s))
-    except Exception:
-        return default
-
+    try: return float(_clean_number_text(s))
+    except Exception: return default
 
 @app.post("/quote/from_monday")
 async def quote_from_monday(request: Request):
@@ -51,37 +39,43 @@ async def quote_from_monday(request: Request):
 
         acompte_num = next((k for k, v in formula_columns.items() if v == column_id), None)
         is_create_quote = (column_id == settings.CREATE_QUOTE_STATUS_COLUMN_ID)
-
         if not acompte_num and not is_create_quote:
             raise HTTPException(status_code=400, detail=f"Colonne déclenchante inconnue: {column_id}")
 
         wanted = [
             settings.EMAIL_COLUMN_ID,
             settings.ADDRESS_COLUMN_ID,
-            settings.DESCRIPTION_COLUMN_ID,   # Description presta (FORMULA) ← on l’utilise en désignation
+            settings.DESCRIPTION_COLUMN_ID,        # Formula
             settings.IBAN_FORMULA_COLUMN_ID,
             settings.QUOTE_AMOUNT_FORMULA_ID,
             settings.VAT_RATE_COLUMN_ID,
             settings.TOTAL_HT_COLUMN_ID,
             settings.TOTAL_TTC_COLUMN_ID,
         ]
+        if settings.DESCRIPTION_FALLBACK_COLUMN_ID:
+            wanted.append(settings.DESCRIPTION_FALLBACK_COLUMN_ID)
+
         cols = get_item_columns(item_id, wanted)
 
+        # Adresse RAW
         address_raw_json = cols.get(f"{settings.ADDRESS_COLUMN_ID}__raw")
+        address_raw = None
         try:
             address_raw = json.loads(address_raw_json) if address_raw_json else None
         except Exception:
-            address_raw = None
+            pass
 
         name        = cols.get("name", "Client Energyz")
         email       = cols.get(settings.EMAIL_COLUMN_ID, "")
         address_txt = cols.get(settings.ADDRESS_COLUMN_ID, "")
-        description = cols.get(settings.DESCRIPTION_COLUMN_ID, "")  # <-- utilisé comme désignation
+        # Description: on prend la Formula; si vide (API Monday…), on tente le fallback texte
+        description = cols.get(settings.DESCRIPTION_COLUMN_ID, "") or \
+                      (cols.get(settings.DESCRIPTION_FALLBACK_COLUMN_ID, "") if settings.DESCRIPTION_FALLBACK_COLUMN_ID else "")
         iban        = cols.get(settings.IBAN_FORMULA_COLUMN_ID, "")
         total_ht    = cols.get(settings.TOTAL_HT_COLUMN_ID) or cols.get(settings.QUOTE_AMOUNT_FORMULA_ID) or "0"
         vat_rate    = cols.get(settings.VAT_RATE_COLUMN_ID, "") or "20"
 
-        # ====== ACOMPTES ======
+        # ===== Acomptes =====
         if acompte_num:
             api_key = _choose_api_key(iban)
             amount_cents = cents_from_str(total_ht)
@@ -93,14 +87,14 @@ async def quote_from_monday(request: Request):
             set_status(item_id, settings.STATUS_COLUMN_ID, status_after[acompte_num])
             return {"status": "ok", "type": "acompte", "acompte": acompte_num, "payment_url": payment_url}
 
-        # ====== DEVIS EVOLIZ ======
+        # ===== Devis Evoliz =====
         unit_price_ht = _to_float(total_ht, 0.0)
         vr = _to_float(vat_rate, 20.0)
         label = name or description or "Devis"
 
         quote = create_quote(
             label=label,
-            description=description,           # ← forcer la désignation sur la description presta
+            description=description,            # ← désignation = description
             unit_price_ht=unit_price_ht,
             vat_rate=vr,
             recipient_name=name,
@@ -110,16 +104,14 @@ async def quote_from_monday(request: Request):
 
         qid, qnumber = extract_identifiers(quote)
         public_url = extract_public_link(quote)
+        deep_link = build_app_quote_url(qid)
 
-        # Texte affiché
         link_text = "Devis Evoliz"
-        if qnumber:
-            link_text += f" #{qnumber}"
-        if qid:
-            link_text += f" (ID:{qid})"
+        if qnumber: link_text += f" #{qnumber}"
+        if qid:     link_text += f" (ID:{qid})"
 
-        # URL à poser dans Monday (vrai lien cliquable)
-        url_to_set = public_url or build_app_quote_url(qid) or settings.EVOLIZ_BASE_URL
+        # URL prioritaire: public > deep-link tenant > base
+        url_to_set = public_url or deep_link or settings.EVOLIZ_BASE_URL
 
         set_link_in_column(item_id, settings.QUOTE_LINK_COLUMN_ID, url_to_set, link_text)
 
@@ -129,6 +121,7 @@ async def quote_from_monday(request: Request):
             "quote_id": qid,
             "quote_number": qnumber,
             "public_url": public_url,
+            "deep_link": deep_link,
             "link_used": url_to_set,
         }
 
@@ -137,16 +130,3 @@ async def quote_from_monday(request: Request):
     except Exception as e:
         print(f"[ERROR] Evoliz quote error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-
-# Test manuel PayPlug
-@app.post("/pay/acompte/{n}")
-async def create_acompte_link(n: int):
-    try:
-        api_key = _choose_api_key("FR76 1695 8000 0130 5670 5696 366")
-        amount_cents = cents_from_str("1250.00") // (2 if n == 2 else 1)
-        metadata = {"client": "Jean Dupont", "acompte": str(n)}
-        url = create_payment(api_key, amount_cents, "jean@mail.com", "12 rue de Paris", "Installation solaire", metadata)
-        return {"status": "ok", "acompte": n, "payment_url": url}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
