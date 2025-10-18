@@ -7,7 +7,7 @@ from .config import settings
 from .payments import _choose_api_key, cents_from_str, create_payment
 from .monday import get_item_columns, set_link_in_column, set_status
 
-# Evoliz désactivé par défaut (et inoffensif)
+# Evoliz neutre par défaut
 ENABLE_EVOLIZ = bool(getattr(settings, "ENABLE_EVOLIZ", False))
 HAVE_EVOLIZ = False
 if ENABLE_EVOLIZ:
@@ -23,7 +23,7 @@ if ENABLE_EVOLIZ:
     except Exception:
         HAVE_EVOLIZ = False
 
-app = FastAPI(title="Energyz Payment Automation (stable)", version="3.1.0")
+app = FastAPI(title="Energyz Payment Automation (stable)", version="3.2.0")
 
 
 @app.get("/")
@@ -43,15 +43,12 @@ def _num(text: str, default: float = 0.0) -> float:
 
 
 def _from_formula(cols: dict, fid: str, fallback: float | None = None) -> float:
-    """
-    Lit un montant d'une colonne formula Monday.
-    Essaye .text, puis .value(JSON)->text/value/label/result, sinon fallback.
-    """
+    # 1) text
     txt = cols.get(fid, "")
     v = _num(txt, None if fallback is None else fallback)
     if v and v > 0:
         return v
-
+    # 2) value JSON
     raw = cols.get(f"{fid}__raw", "")
     if raw:
         try:
@@ -69,31 +66,58 @@ def _from_formula(cols: dict, fid: str, fallback: float | None = None) -> float:
     return fallback if fallback is not None else 0.0
 
 
+def _detect_acompte_num(event: dict, formula_columns: dict[str, str]) -> str | None:
+    """
+    Retourne "1" ou "2" si on détecte l'acompte demandé.
+    - Cas réel Monday: colonneId == "status" avec value.label.text = "Générer acompte 1/2"
+    - Fallback: si columnId == id d'une colonne formula connue (ancien mode)
+    """
+    col_id = event.get("columnId", "") or ""
+    # 1) Détection par libellé du statut
+    value = event.get("value")
+    val_json = None
+    if isinstance(value, dict):
+        val_json = value
+    elif isinstance(value, str):
+        try:
+            val_json = json.loads(value)
+        except Exception:
+            val_json = None
+    label_text = ""
+    if isinstance(val_json, dict):
+        label = val_json.get("label") or {}
+        label_text = (label.get("text") or "").lower().strip()
+    if "générer acompte 1" in label_text:
+        return "1"
+    if "générer acompte 2" in label_text:
+        return "2"
+
+    # 2) Fallback: si la colonne déclenchante EST une des colonnes formula
+    for k, fid in formula_columns.items():
+        if fid == col_id:
+            return k
+
+    return None
+
+
 @app.post("/quote/from_monday")
 async def quote_from_monday(request: Request):
-    """
-    Webhook Monday :
-    - si colonne = FORMULA_COLUMN_IDS_JSON['1'|'2'] → génère lien PayPlug, met le statut.
-    - si colonne = CREATE_QUOTE_STATUS_COLUMN_ID et Evoliz activé → essaie de créer un devis (n'influence JAMAIS les paiements).
-    """
     try:
         payload = await request.json()
         event = payload.get("event", {})
         item_id = event.get("pulseId") or event.get("itemId")
-        column_id = event.get("columnId", "")
-
         if not item_id:
             raise HTTPException(status_code=400, detail="Item ID manquant.")
 
-        formula_columns = json.loads(settings.FORMULA_COLUMN_IDS_JSON)   # {"1":"formula_xxx","2":"formula_yyy"}
-        link_columns = json.loads(settings.LINK_COLUMN_IDS_JSON)         # {"1":"link_xxx","2":"link_yyy"}
+        formula_columns = json.loads(settings.FORMULA_COLUMN_IDS_JSON)   # {"1":"formula_ac1","2":"formula_ac2"}
+        link_columns = json.loads(settings.LINK_COLUMN_IDS_JSON)         # {"1":"link_ac1","2":"link_ac2"}
         status_after = json.loads(settings.STATUS_AFTER_PAY_JSON)        # {"1":"Payé acompte 1","2":"Payé acompte 2"}
 
-        acompte_num = next((k for k, v in formula_columns.items() if v == column_id), None)
+        acompte_num = _detect_acompte_num(event, formula_columns)
         is_quote_trigger = bool(getattr(settings, "CREATE_QUOTE_STATUS_COLUMN_ID", None)) and \
-            (column_id == settings.CREATE_QUOTE_STATUS_COLUMN_ID)
+            (event.get("columnId") == settings.CREATE_QUOTE_STATUS_COLUMN_ID)
 
-        # Colonnes nécessaires
+        # Colonnes à lire
         wanted = [
             settings.EMAIL_COLUMN_ID,
             settings.ADDRESS_COLUMN_ID,
@@ -112,11 +136,11 @@ async def quote_from_monday(request: Request):
         # Données de base
         name = cols.get("name", "")
         email = cols.get(settings.EMAIL_COLUMN_ID, "")
-        address_txt = cols.get(settings.ADDRESS_COLUMN_ID, "")  # on prend le texte visible dans Monday
+        address_txt = cols.get(settings.ADDRESS_COLUMN_ID, "")
         description = cols.get(settings.DESCRIPTION_COLUMN_ID, "") or name
 
         # ====== Paiements acompte 1/2 ======
-        if acompte_num:
+        if acompte_num in ("1", "2"):
             iban = cols.get(settings.IBAN_FORMULA_COLUMN_ID, "")
             api_key = _choose_api_key(iban)
 
@@ -125,23 +149,29 @@ async def quote_from_monday(request: Request):
             base_total = _num(base_total_txt, 0.0)
 
             if acompte_num == "1":
-                amount = _from_formula(cols, amount_formula_id, fallback=base_total)  # acompte 1 = formule sinon 100% HT
+                amount = _from_formula(cols, amount_formula_id, fallback=base_total)  # 100% si formule vide
             else:
-                amount = _from_formula(cols, amount_formula_id, fallback=(base_total / 2.0 if base_total else 0.0))  # acompte 2
+                amount = _from_formula(cols, amount_formula_id, fallback=(base_total / 2.0 if base_total else 0.0))  # 50%
 
             amount_cents = cents_from_str(str(amount))
             if amount_cents <= 0:
                 raise HTTPException(status_code=400, detail=f"Montant invalide pour l'acompte {acompte_num}")
 
-            metadata = {"item_id": item_id, "acompte": acompte_num}
-            pay_url = create_payment(api_key, amount_cents, email, address_txt, description, metadata)
+            pay_url = create_payment(
+                api_key,
+                amount_cents,
+                email,
+                address_txt,
+                description,
+                {"item_id": item_id, "acompte": acompte_num},
+            )
 
             set_link_in_column(item_id, link_columns[acompte_num], pay_url, f"Payer acompte {acompte_num}")
             set_status(item_id, settings.STATUS_COLUMN_ID, status_after[acompte_num])
 
             return {"status": "ok", "type": "acompte", "acompte": acompte_num, "amount": amount, "payment_url": pay_url}
 
-        # ====== Devis Evoliz (optionnel, n'influence jamais les paiements) ======
+        # ====== Devis Evoliz (optionnel) ======
         if is_quote_trigger and HAVE_EVOLIZ:
             try:
                 total_ht = cols.get(getattr(settings, "TOTAL_HT_COLUMN_ID", None) or settings.QUOTE_AMOUNT_FORMULA_ID, "0")
@@ -178,7 +208,6 @@ async def quote_from_monday(request: Request):
                 if getattr(settings, "QUOTE_LINK_COLUMN_ID", None):
                     set_link_in_column(item_id, settings.QUOTE_LINK_COLUMN_ID, url_to_set, link_text)
 
-                # essai d'upload PDF si pas de lien public et colonne fichiers configurée
                 if not public_url and getattr(settings, "QUOTE_FILES_COLUMN_ID", None):
                     try:
                         pdf_bytes, filename = download_quote_pdf(qid)
@@ -189,10 +218,9 @@ async def quote_from_monday(request: Request):
 
                 return {"status": "ok", "type": "devis", "quote_id": qid, "link_used": url_to_set}
             except Exception as e:
-                # ne bloque pas le flux
                 return {"status": "ok", "type": "devis", "warning": str(e)}
 
-        return {"status": "ignored", "detail": f"Colonne {column_id} non gérée."}
+        return {"status": "ignored", "detail": f"Colonne {event.get('columnId')} non gérée."}
 
     except HTTPException:
         raise
@@ -200,16 +228,10 @@ async def quote_from_monday(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ===== Endpoint de TEST PayPlug (remis) =====
+# ===== Test PayPlug sans Monday =====
 @app.post("/pay/acompte/{n}")
 def pay_acompte_test(n: int):
-    """
-    Génère un lien PayPlug sans Monday (simple test).
-    Montant : 1250€ (ou 625€ si n==2). Adresse/email/description factices.
-    Choix de clé : on prend l'IBAN de ton env (ou la 1ère clé).
-    """
     try:
-        # essaie de prendre un IBAN connu; sinon le _choose_api_key() prendra la 1ère clé du JSON
         test_iban = "FR76 1695 8000 0130 5670 5696 366"
         api_key = _choose_api_key(test_iban)
         amount_cents = cents_from_str("1250") // (2 if n == 2 else 1)
@@ -219,7 +241,7 @@ def pay_acompte_test(n: int):
             "testo@test.fr",
             "Adresse de test",
             f"Test acompte {n}",
-            {"acompte": str(n), "mode": "test-endpoint"}
+            {"acompte": str(n), "mode": "test-endpoint"},
         )
         return {"status": "ok", "acompte": n, "payment_url": url}
     except Exception as e:
