@@ -4,50 +4,34 @@ import re
 from fastapi import FastAPI, Request, HTTPException
 from .config import settings
 from .payments import _choose_api_key, cents_from_str, create_payment
-from .monday import get_item_columns, set_link_in_column, set_status
-
+from .monday import (
+    get_item_columns,
+    set_link_in_column,
+    set_status,
+    compute_formula_value_for_item,
+)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("energyz")
 
-app = FastAPI(title="Energyz PayPlug API", version="1.4")
+app = FastAPI(title="Energyz PayPlug API", version="1.7 (formula-eval)")
 
 def _safe_json_loads(s, default=None):
     if s is None:
         return default
     if isinstance(s, dict):
-            return s
+        return s
     try:
         return json.loads(s)
     except Exception:
         return default
 
-def _clean_amount_text(s: str) -> str:
+def _clean_number_text(s: str) -> str:
     if not s:
         return "0"
     s = s.replace("\u202f", "").replace(" ", "").replace("€", "").strip()
     s = s.replace(",", ".")
     m = re.search(r"[-+]?\d*\.?\d+", s)
     return m.group(0) if m else "0"
-
-def _prefer_numeric_from_raw(raw_json_str: str) -> str:
-    """
-    Essaie d'extraire un nombre depuis value RAW:
-      - {"text":"1000","value":"1000"} -> 1000
-      - {"value":"1000.00"} -> 1000.00
-      - sinon, tente d'extraire un nombre dans le JSON sérialisé
-    """
-    if not raw_json_str:
-        return ""
-    try:
-        j = json.loads(raw_json_str)
-        if isinstance(j, dict):
-            for k in ("value", "text", "amount", "number"):
-                if k in j and j[k] not in (None, ""):
-                    return _clean_amount_text(str(j[k]))
-        # fallback: chercher un nombre dans la string brute
-        return _clean_amount_text(raw_json_str)
-    except Exception:
-        return _clean_amount_text(raw_json_str)
 
 def _extract_status_label(value_json: dict) -> str:
     if not isinstance(value_json, dict):
@@ -62,7 +46,7 @@ def _extract_status_label(value_json: dict) -> str:
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "Energyz PayPlug API is live 🚀"}
+    return {"status": "ok", "message": "Energyz PayPlug API (formula-eval) is live 🚀"}
 
 @app.post("/quote/from_monday")
 async def quote_from_monday(request: Request):
@@ -97,18 +81,18 @@ async def quote_from_monday(request: Request):
         if acompte_num not in ("1","2"):
             raise HTTPException(status_code=400, detail="Label status non reconnu pour acompte 1/2.")
 
-        formula_cols = _safe_json_loads(settings.FORMULA_COLUMN_IDS_JSON, default={})
-        link_columns = _safe_json_loads(settings.LINK_COLUMN_IDS_JSON, default={})
+        formula_cols = _safe_json_loads(settings.FORMULA_COLUMN_IDS_JSON, default={}) or {}
+        link_columns = _safe_json_loads(settings.LINK_COLUMN_IDS_JSON, default={}) or {}
         if acompte_num not in formula_cols or acompte_num not in link_columns:
-            raise HTTPException(status_code=500, detail=f"FORMULA/LINK JSON sans clé '{acompte_num}'.")
+            raise HTTPException(status_code=500, detail=f"FORMULA_COLUMN_IDS_JSON/LINK_COLUMN_IDS_JSON sans clé '{acompte_num}'.")
 
         needed_cols = [
             settings.EMAIL_COLUMN_ID,
             settings.ADDRESS_COLUMN_ID,
             settings.DESCRIPTION_COLUMN_ID,
             settings.IBAN_FORMULA_COLUMN_ID,
-            settings.QUOTE_AMOUNT_FORMULA_ID,
-            formula_cols[acompte_num],
+            settings.QUOTE_AMOUNT_FORMULA_ID,               # Total HT (utile si la formula y fait référence)
+            formula_cols[acompte_num],                      # Formula Acompte n
             getattr(settings, "BUSINESS_STATUS_COLUMN_ID", "color_mkwnxf1h"),
         ]
         cols = get_item_columns(item_id, needed_cols)
@@ -119,29 +103,36 @@ async def quote_from_monday(request: Request):
         description = cols.get(settings.DESCRIPTION_COLUMN_ID, "") or ""
         iban = cols.get(settings.IBAN_FORMULA_COLUMN_ID, "") or ""
 
-        # --- Montant acompte : 1) texte formule, 2) numeric depuis RAW, 3) fallback total/2
+        # 1) Essayer d'utiliser le texte/valeur renvoyé par Monday
         formula_id = formula_cols[acompte_num]
-        acompte_txt = _clean_amount_text(cols.get(formula_id, ""))
+        acompte_txt = _clean_number_text(cols.get(formula_id, ""))
+
+        # 2) Si vide -> recalcul local de l'expression de la Formula (settings_str)
         if float(acompte_txt or "0") <= 0:
-            acompte_txt = _prefer_numeric_from_raw(cols.get(f"{formula_id}__raw", ""))
+            computed = compute_formula_value_for_item(formula_id, int(item_id))
+            if computed is not None and computed > 0:
+                acompte_txt = str(computed)
+
+        # 3) Si toujours vide -> dernier recours: Total HT / 2
         if float(acompte_txt or "0") <= 0:
-            total_ht_txt = _clean_amount_text(cols.get(settings.QUOTE_AMOUNT_FORMULA_ID, "0"))
+            total_ht_txt = _clean_number_text(cols.get(settings.QUOTE_AMOUNT_FORMULA_ID, "0"))
             if float(total_ht_txt) > 0:
                 acompte_txt = str(float(total_ht_txt) / 2.0)
             else:
-                raise HTTPException(status_code=400, detail="Montant introuvable (formula + raw + total HT vides).")
+                raise HTTPException(status_code=400, detail="Montant introuvable (formula + recalcul + total HT vides).")
 
         amount_cents = cents_from_str(acompte_txt)
         if amount_cents <= 0:
             raise HTTPException(status_code=400, detail=f"Montant invalide après parsing: '{acompte_txt}'.")
 
+        # Fallback IBAN via Business Line si formula IBAN vide
         if not iban:
             iban_by_status = _safe_json_loads(getattr(settings, "IBAN_BY_STATUS_JSON", None), default={}) or {}
             business_status_label = cols.get(getattr(settings, "BUSINESS_STATUS_COLUMN_ID", "color_mkwnxf1h"), "")
             if business_status_label and business_status_label in iban_by_status:
                 iban = iban_by_status[business_status_label]
         if not iban:
-            raise HTTPException(status_code=400, detail="IBAN introuvable (formula + fallback Business Line).")
+            raise HTTPException(status_code=400, detail="IBAN introuvable (formula vide + pas de fallback Business Line).")
 
         api_key = _choose_api_key(iban)
         if not api_key:
