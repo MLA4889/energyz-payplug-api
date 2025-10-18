@@ -46,47 +46,64 @@ def _post(path: str, payload: dict):
         raise Exception(f"Evoliz API error {r.status_code}: {r.text}")
     return r.json()
 
-# ---------- Helpers client/prospect ----------
+# ---------- Helpers de recherche ----------
 
 def _find_client_by_email(email: str) -> Optional[str]:
+    if not email:
+        return None
     try:
         data = _get(f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/clients", params={"search": email})
         items = data if isinstance(data, list) else data.get("data") or []
         for it in items:
-            if str(it.get("email", "")).lower() == (email or "").lower():
+            if str(it.get("email", "")).lower() == email.lower():
                 return str(it.get("id") or it.get("clientid"))
     except Exception:
         pass
     return None
 
+def _find_prospect_by_email(email: str) -> Optional[str]:
+    if not email:
+        return None
+    try:
+        data = _get(f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/prospects", params={"search": email})
+        items = data if isinstance(data, list) else data.get("data") or []
+        for it in items:
+            if str(it.get("email", "")).lower() == email.lower():
+                return str(it.get("id") or it.get("prospectid"))
+    except Exception:
+        pass
+    return None
+
+def _find_prospect_by_name(name: str) -> Optional[str]:
+    if not name:
+        return None
+    try:
+        data = _get(f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/prospects", params={"search": name})
+        items = data if isinstance(data, list) else data.get("data") or []
+        # certains endpoints ne filtrent pas strictement → on re-vérifie
+        for it in items:
+            if str(it.get("name", "")).strip().lower() == name.strip().lower():
+                return str(it.get("id") or it.get("prospectid"))
+    except Exception:
+        pass
+    return None
+
+# ---------- Normalisation adresse ----------
+
 def _normalize_address(addr: Dict[str, Any] | None) -> Dict[str, str]:
-    """
-    Transforme le JSON 'location' de Monday en adresse Evoliz:
-    - street: street.long_name (ou address)
-    - town: city.long_name
-    - postcode: '00000' si absent
-    - iso2: country.short_name (FR, MA, EG, …)
-    """
     addr = addr or {}
     street_obj = addr.get("street") or {}
     city_obj   = addr.get("city") or {}
     country    = addr.get("country") or {}
 
-    street  = (street_obj.get("long_name") or addr.get("address") or "").strip()
-    town    = (city_obj.get("long_name") or "").strip()
-    iso2    = (country.get("short_name") or country.get("shortName") or "").strip()  # 2 lettres
-    postcode = (addr.get("postalCode") or addr.get("postcode") or "").strip()
-
-    if not postcode:
-        postcode = "00000"           # fallback propre pour passer la validation Evoliz
-    if not town:
-        town = "N/A"                 # fallback
-    if not street:
-        street = "Adresse non précisée"
-    if not iso2:
-        iso2 = "FR"                  # fallback raisonnable (à adapter si besoin)
+    street   = (street_obj.get("long_name") or addr.get("address") or "").strip() or "Adresse non précisée"
+    town     = (city_obj.get("long_name") or "").strip() or "N/A"
+    iso2     = (country.get("short_name") or country.get("shortName") or "").strip() or "FR"
+    postcode = (addr.get("postalCode") or addr.get("postcode") or "").strip() or "00000"
 
     return {"street": street, "town": town, "postcode": postcode, "iso2": iso2}
+
+# ---------- Création de prospect (avec reprise sur “name taken”) ----------
 
 def _create_prospect(name: str, email: str, address_json: Dict[str, Any] | None) -> Optional[str]:
     address = _normalize_address(address_json)
@@ -95,19 +112,41 @@ def _create_prospect(name: str, email: str, address_json: Dict[str, Any] | None)
         "email": email or "",
         "address": address
     }
-    data = _post(f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/prospects", payload)
-    return str(data.get("id") or data.get("prospectid") or data.get("data", {}).get("id"))
+    try:
+        data = _post(f"/api/v1/companies/{settings.EVOLIZ_COMPANY_ID}/prospects", payload)
+        return str(data.get("id") or data.get("prospectid") or data.get("data", {}).get("id"))
+    except Exception as e:
+        # Si le nom est déjà pris → on récupère l’ID du prospect existant par nom
+        msg = str(e)
+        if "name has already been taken" in msg or "name has already been taken".replace(" ", "") in msg.replace(" ", ""):
+            pid = _find_prospect_by_name(payload["name"])
+            if pid:
+                return pid
+        raise
+
+# ---------- Sélection du destinataire (client/prospect) ----------
 
 def ensure_recipient(name: str, email: str, address_json: Dict[str, Any] | None) -> Tuple[Optional[str], Optional[str]]:
-    # 1) client forcé
+    # 1) client forcé via variable d'env
     if settings.EVOLIZ_DEFAULT_CLIENT_ID:
         return (str(settings.EVOLIZ_DEFAULT_CLIENT_ID), None)
-    # 2) recherche client
-    if email:
-        cid = _find_client_by_email(email)
-        if cid:
-            return (cid, None)
-    # 3) création prospect (avec adresse complète)
+
+    # 2) client existant par email
+    cid = _find_client_by_email(email)
+    if cid:
+        return (cid, None)
+
+    # 3) prospect existant par email
+    pid = _find_prospect_by_email(email)
+    if pid:
+        return (None, pid)
+
+    # 4) prospect existant par nom
+    pid = _find_prospect_by_name(name)
+    if pid:
+        return (None, pid)
+
+    # 5) sinon: création de prospect
     pid = _create_prospect(name, email, address_json)
     return (None, pid)
 
@@ -123,11 +162,11 @@ def create_quote(
     recipient_address_json: Dict[str, Any] | None
 ) -> dict:
     """
-    Crée un devis conforme aux exigences Evoliz.
-    - documentdate
-    - clientid OU prospectid (créé si nécessaire, avec adresse complète)
-    - term.paymentid
-    - items[]
+    Crée un devis Evoliz :
+      - documentdate (YYYY-MM-DD)
+      - clientid OU prospectid (recherché/ créé de façon résiliente)
+      - term.paymentid (1 = comptant)
+      - items[{designation, quantity, unit_price, vat_rate}]
     """
     clientid, prospectid = ensure_recipient(recipient_name, recipient_email, recipient_address_json)
 
@@ -135,7 +174,7 @@ def create_quote(
         "label": label or description or "Devis",
         "documentdate": dt.date.today().isoformat(),
         "status": "draft",
-        "term": {"paymentid": 1},  # 1 = comptant
+        "term": {"paymentid": 1},
         "items": [
             {
                 "designation": description or label or "Prestation",
