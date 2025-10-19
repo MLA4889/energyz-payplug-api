@@ -87,7 +87,7 @@ def create_payment(api_key: str,
     """
     Crée un paiement PayPlug 'hébergé' (lien) en PRÉREMPLISSANT toujours Nom/Prénom/E-mail :
       - si email Monday absent/incorrect, alias stable: paiement+{item_id}@energyz.fr
-      - on envoie toujours customer.{email, first_name, last_name}
+      - le champ e-mail reste ÉDITABLE sur la page PayPlug (le payeur peut mettre son e-mail de reçu)
     Conserve la structure existante pour ne pas casser les intégrations.
     """
     if not api_key:
@@ -117,8 +117,10 @@ def create_payment(api_key: str,
     if not _valid_email(alias_email):
         alias_email = "paiement@energyz.fr"
 
-    description = (metadata or {}).get("description") or f"Paiement acompte { (metadata or {}).get('acompte','?') } — {client_name or 'Client Energyz'}"
-    description = description[:255]
+    # 🔔 Ajout d'une mention pour inciter à renseigner son e-mail de reçu
+    base_desc = (metadata or {}).get("description") or f"Paiement acompte { (metadata or {}).get('acompte','?') } — {client_name or 'Client Energyz'}"
+    hint = " • Merci de vérifier/indiquer votre e-mail pour recevoir le reçu."
+    description = (base_desc + hint)[:255]
 
     payload = {
         "amount": int(amount_cents or 0),
@@ -130,7 +132,7 @@ def create_payment(api_key: str,
         "metadata": metadata or {},
         "description": description,
         "customer": {
-            "email": alias_email,
+            "email": alias_email,       # pré-rempli mais EDITABLE côté PayPlug
             "first_name": first_name,
             "last_name": last_name,
         },
