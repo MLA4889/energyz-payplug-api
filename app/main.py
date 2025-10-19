@@ -12,7 +12,7 @@ from . import monday as m
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("energyz")
 
-app = FastAPI(title="Energyz PayPlug API", version="2.7 (FORCED_IBAN/KEY + prefills + webhook)")
+app = FastAPI(title="Energyz PayPlug API", version="2.8 (prefills + email receipt hint)")
 
 # -------------------- Utils --------------------
 def _safe_json_loads(s, default=None):
