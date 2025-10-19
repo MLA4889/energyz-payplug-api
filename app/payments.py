@@ -48,19 +48,11 @@ def _choose_api_key(iban: str) -> str | None:
 
     mapping = _load_json_env("PAYPLUG_KEYS_LIVE_JSON" if mode == "live" else "PAYPLUG_KEYS_TEST_JSON")
     if mapping:
-        # accepte avec ou sans espaces
         return mapping.get(iban) or mapping.get(iban_c)
 
     return None
 
-# ---------- Préremplissage systématique ----------
-def _slug(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = re.sub(r"[^a-z0-9]+", "-", s)
-    s = re.sub(r"-{2,}", "-", s)
-    s = s.strip("-")
-    return s or "client"
-
+# --------- helpers préremplissage ----------
 def _split_name(fullname: str) -> tuple[str, str]:
     base = (fullname or "Client Energyz").strip()
     parts = base.split()
@@ -73,10 +65,8 @@ def _valid_email(email: str) -> bool:
         return False
     return re.match(r"[^@]+@[^@]+\.[^@]+", email) is not None
 
-def _safe_alias_email(client_name: str | None, item_id: str | int | None) -> str:
-    # alias simple, RFC-valide, toujours accepté par PayPlug
-    iid = str(item_id or "0")
-    return f"paiement+{iid}@energyz.fr"
+def _alias_email(item_id: str | int) -> str:
+    return f"paiement+{str(item_id or '0')}@energyz.fr"
 
 def create_payment(api_key: str,
                    amount_cents: int,
@@ -85,53 +75,48 @@ def create_payment(api_key: str,
                    client_name: str | None,
                    metadata: dict | None) -> str:
     """
-    Crée un paiement PayPlug 'hébergé' (lien) en PRÉREMPLISSANT toujours Nom/Prénom/E-mail :
-      - si email absent/incorrect, alias stable: paiement+{item_id}@energyz.fr
-      - le champ e-mail reste éditable sur la page PayPlug si PayPlug l’affiche (selon leurs UX)
-    Conserve la structure existante pour ne pas casser les intégrations.
+    Crée un paiement PayPlug hébergé (lien) sans saisie côté payeur.
+    E-mail de reçu:
+      - email Monday valide OU
+      - RECEIPT_DEFAULT_EMAIL (env) OU
+      - alias paiement+{item_id}@energyz.fr
     """
     if not api_key:
         raise RuntimeError("create_payment: api_key manquante")
 
     url = "https://api.payplug.com/v1/payments"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
     # URLs de retour/annulation
     base_url   = os.getenv("PUBLIC_BASE_URL", "https://www.energyz.fr")
     return_url = os.getenv("PAYPLUG_RETURN_URL", base_url)
     cancel_url = os.getenv("PAYPLUG_CANCEL_URL", base_url)
 
-    # Nom/Prénom + e-mail alias si besoin
     first_name, last_name = _split_name(client_name or "")
     item_id = str((metadata or {}).get("item_id", "0"))
 
-    alias_email = (email or "").strip()
-    if not _valid_email(alias_email):
-        alias_email = _safe_alias_email(client_name, item_id)
-    if not _valid_email(alias_email):
-        alias_email = "paiement@energyz.fr"
+    # Priorité e-mail
+    rcpt = (email or "").strip()
+    if not _valid_email(rcpt):
+        rcpt = (os.getenv("RECEIPT_DEFAULT_EMAIL") or "").strip()
+    if not _valid_email(rcpt):
+        rcpt = _alias_email(item_id)
 
-    base_desc = (metadata or {}).get("description") or f"Paiement acompte { (metadata or {}).get('acompte','?') } — {client_name or 'Client Energyz'}"
-    description = base_desc[:255]
+    description = ((metadata or {}).get("description")
+                   or f"Paiement acompte { (metadata or {}).get('acompte','?') } — {client_name or 'Client Energyz'}")[:255]
 
     payload = {
         "amount": int(amount_cents or 0),
         "currency": "EUR",
-        "hosted_payment": {
-            "return_url": return_url,
-            "cancel_url": cancel_url,
-        },
+        "hosted_payment": {"return_url": return_url, "cancel_url": cancel_url},
         "metadata": metadata or {},
         "description": description,
         "customer": {
-            "email": alias_email,
+            "email": rcpt,
             "first_name": first_name,
             "last_name": last_name,
         },
-        # "billing": {"address1": (address or "")[:255], "country": "FR"}  # à activer si besoin
+        # "billing": {"address1": (address or "")[:255], "country": "FR"}  # facultatif
     }
 
     resp = requests.post(url, headers=headers, json=payload, timeout=20)
