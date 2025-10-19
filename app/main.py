@@ -5,22 +5,25 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
 from .config import settings
-from .payments import _choose_api_key, cents_from_str, create_payment
+# on n'importe plus _choose_api_key pour éviter le JSON cassé
+from .payments import cents_from_str, create_payment
 from . import monday as m
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("energyz")
 
-app = FastAPI(title="Energyz PayPlug API", version="2.4 (diag + robust BL mapping)")
+app = FastAPI(title="Energyz PayPlug API", version="2.5 (no-json-bomb + diag + robust BL mapping)")
 
-# --- MAPPING IBAN PAR DEFAUT (sécurité si ENV manquant / mal renseigné) ---
+# --- IBANs connus (pour choisir la clé sans JSON) ---
+ENERGYZ_MAR_IBAN     = "FR76 1695 8000 0130 5670 5696 366"
+ENERGYZ_DIVERS_IBAN  = "FR76 1695 8000 0100 0571 1982 492"
+
+# --- MAPPING IBAN PAR DEFAUT (fallback Business Line → IBAN) ---
 DEFAULT_IBAN_BY_STATUS = {
-    # clés telles qu’affichées dans ta colonne “Business Line”
-    "Energyz MAR":    "FR76 1695 8000 0130 5670 5696 366",
-    "Energyz Divers": "FR76 1695 8000 0100 0571 1982 492",
+    "Energyz MAR":    ENERGYZ_MAR_IBAN,
+    "Energyz Divers": ENERGYZ_DIVERS_IBAN,
 }
 
-# -------------------- Utils --------------------
 def _safe_json_loads(s, default=None):
     if s is None:
         return default
@@ -53,6 +56,64 @@ def _extract_status_label(value_json: dict) -> str:
 def _normalize(s: str) -> str:
     return (s or "").strip().lower()
 
+def _compact_iban(s: str) -> str:
+    return re.sub(r"\s+", "", (s or ""))
+
+# -------------------- Choix clé PayPlug (robuste & sans JSON obligatoire) --------------------
+def choose_payplug_key_from_iban(iban: str) -> str | None:
+    """
+    1) Si l'IBAN correspond à un IBAN connu (Energyz MAR / Divers), on prend directement
+       les variables d'env dédiées (plus simple et incassable) :
+         - PAYPLUG_LIVE_KEY_EZMAR / PAYPLUG_TEST_KEY_EZMAR
+         - PAYPLUG_LIVE_KEY_EZDIVERS / PAYPLUG_TEST_KEY_EZDIVERS
+    2) Sinon on essaye (en dernier recours) un mapping JSON souple :
+         - PAYPLUG_KEYS_LIVE_JSON ou PAYPLUG_KEYS_TEST_JSON
+       (supporte JSON strict, dict python via ast.literal_eval, ou "IBAN=KEY,IBAN2=KEY2")
+    """
+    mode = (getattr(settings, "PAYPLUG_MODE", "live") or "live").lower()
+    iban_c = _compact_iban(iban)
+    mar_c  = _compact_iban(ENERGYZ_MAR_IBAN)
+    div_c  = _compact_iban(ENERGYZ_DIVERS_IBAN)
+
+    # 1) mapping simple, béton
+    if iban_c == mar_c:
+        return getattr(settings, "PAYPLUG_LIVE_KEY_EZMAR", "") if mode == "live" else getattr(settings, "PAYPLUG_TEST_KEY_EZMAR", "")
+    if iban_c == div_c:
+        return getattr(settings, "PAYPLUG_LIVE_KEY_EZDIVERS", "") if mode == "live" else getattr(settings, "PAYPLUG_TEST_KEY_EZDIVERS", "")
+
+    # 2) dernier recours: mapping libre depuis l'ENV (tolérant)
+    mapping_raw = getattr(settings, "PAYPLUG_KEYS_LIVE_JSON", None) if mode == "live" else getattr(settings, "PAYPLUG_KEYS_TEST_JSON", None)
+    mapping = {}
+    if mapping_raw:
+        # a) JSON strict
+        try:
+            mapping = json.loads(mapping_raw)
+        except Exception:
+            # b) dict python: {'FR76...':'sk_live_xxx', ...}
+            try:
+                import ast
+                mapping = ast.literal_eval(mapping_raw)
+            except Exception:
+                # c) format 'IBAN=KEY,IBAN2=KEY2' ou avec ';'
+                try:
+                    m2 = {}
+                    for part in mapping_raw.replace(";", ",").split(","):
+                        part = part.strip()
+                        if not part or "=" not in part:
+                            continue
+                        k, v = part.split("=", 1)
+                        m2[k.strip()] = v.strip()
+                    mapping = m2
+                except Exception:
+                    mapping = {}
+
+    # on essaie de matcher l'IBAN compacté
+    for k, v in (mapping or {}).items():
+        if _compact_iban(k) == iban_c and v:
+            return v
+
+    return None
+
 # -------------------- Health/Ping --------------------
 @app.get("/")
 def root():
@@ -62,7 +123,7 @@ def root():
 def from_monday_ping():
     return {"ok": True}
 
-# -------------------- Endpoint DIAG (très utile) --------------------
+# -------------------- Endpoint DIAG --------------------
 @app.get("/diag/{item_id}")
 def diag_item(item_id: int):
     needed = [
@@ -76,28 +137,17 @@ def diag_item(item_id: int):
     ]
     cols = m.get_item_columns(item_id, needed)
 
-    # 1) IBAN calculé via la formule (même si text/value sont vides)
     iban_formula_calc = None
     try:
         iban_formula_calc = m.compute_formula_text_for_item(settings.IBAN_FORMULA_COLUMN_ID, int(item_id))
     except Exception as e:
         iban_formula_calc = f"ERROR: {e}"
 
-    # 2) Fallback Business Line → IBAN (carte réellement utilisée)
-    def _normalize(s: str) -> str: return (s or "").strip().lower()
-
-    from .config import settings as s
-    # ton mapping ENV
-    env_map = _safe_json_loads(getattr(s, "IBAN_BY_STATUS_JSON", None), default={}) or {}
-    # mapping défaut pour Energyz (si ENV vide ou incomplet)
-    default_map = {
-        "Energyz MAR":    "FR76 1695 8000 0130 5670 5696 366",
-        "Energyz Divers": "FR76 1695 8000 0100 0571 1982 492",
-    }
-    merged_map = {**default_map, **env_map}
-
-    bl_col = getattr(s, "BUSINESS_STATUS_COLUMN_ID", "color_mkwnxf1h")
+    env_map = _safe_json_loads(getattr(settings, "IBAN_BY_STATUS_JSON", None), default={}) or {}
+    merged_map = {**DEFAULT_IBAN_BY_STATUS, **env_map}
+    bl_col = getattr(settings, "BUSINESS_STATUS_COLUMN_ID", "color_mkwnxf1h")
     bl_value = (cols.get(bl_col, "") or "").strip()
+
     chosen_iban_from_bl = ""
     tried_keys = []
     if bl_value:
@@ -113,13 +163,12 @@ def diag_item(item_id: int):
 
     return {
         "item_id": item_id,
-        "read": cols,                           # ce que renvoie l'API brute
-        "iban_formula_calc": iban_formula_calc, # IBAN calculé via expression formula
+        "read": cols,
+        "iban_formula_calc": iban_formula_calc,
         "business_line_value": bl_value,
         "bl_mapping_keys": list(merged_map.keys()),
-        "bl_chosen_iban": chosen_iban_from_bl
+        "bl_chosen_iban": chosen_iban_from_bl,
     }
-
 
 # -------------------- Webhook --------------------
 @app.post("/quote/from_monday")
@@ -129,12 +178,12 @@ async def quote_from_monday(request: Request):
         payload = _safe_json_loads(body.decode("utf-8", errors="ignore"), default={}) or {}
         logger.info(f"[WEBHOOK] payload={payload}")
 
-        # 1) challenge d’enregistrement
+        # 1) challenge
         if isinstance(payload, dict) and "challenge" in payload:
             logger.info("[WEBHOOK] responding to challenge")
             return JSONResponse(content={"challenge": payload["challenge"]})
 
-        # 2) appel normal
+        # 2) event normal
         event = payload.get("event") or {}
         item_id = event.get("pulseId") or event.get("itemId")
         if not item_id:
@@ -160,7 +209,7 @@ async def quote_from_monday(request: Request):
         if acompte_num not in ("1", "2"):
             raise HTTPException(status_code=400, detail="Label status non reconnu pour acompte 1/2.")
 
-        # Colonnes de travail
+        # Colonnes
         formula_cols = _safe_json_loads(settings.FORMULA_COLUMN_IDS_JSON, default={}) or {}
         link_columns = _safe_json_loads(settings.LINK_COLUMN_IDS_JSON, default={}) or {}
         if acompte_num not in formula_cols or acompte_num not in link_columns:
@@ -218,16 +267,10 @@ async def quote_from_monday(request: Request):
         business_label  = (cols.get(business_col_id, "") or "").strip()
         logger.info(f"[IBAN] business_label='{business_label}'")
 
-        # ENV puis défaut codé en dur
         env_map = _safe_json_loads(getattr(settings, "IBAN_BY_STATUS_JSON", None), default={}) or {}
-        if not env_map:
-            env_map = {}
-
-        # Merge avec default (ENV prioritaire)
         merged_map = {**DEFAULT_IBAN_BY_STATUS, **env_map}
 
         if not iban and business_label:
-            # matching robuste : exact / normalize / contains
             bl_norm = _normalize(business_label)
             keys_tried = []
             for k, v in merged_map.items():
@@ -243,10 +286,10 @@ async def quote_from_monday(request: Request):
         if not iban:
             raise HTTPException(status_code=400, detail="IBAN introuvable (formule vide + pas de fallback Business Line).")
 
-        # Clé PayPlug
-        api_key = _choose_api_key(iban)
+        # ====== CHOIX DE LA CLE PAYPLUG **SANS JSON CASSE** ======
+        api_key = choose_payplug_key_from_iban(iban)
         if not api_key:
-            raise HTTPException(status_code=400, detail=f"Aucune clé PayPlug mappée pour IBAN '{iban}' (mode={settings.PAYPLUG_MODE}).")
+            raise HTTPException(status_code=400, detail=f"Aucune clé PayPlug associée à l’IBAN '{iban}'. Vérifie les env PAYPLUG_*.")
 
         client_name = cols.get("name", "Client Energyz")
         metadata = {"item_id": str(item_id), "acompte": acompte_num, "description": description or f"Acompte {acompte_num}"}
