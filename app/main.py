@@ -75,7 +75,51 @@ def diag_item(item_id: int):
         "name",
     ]
     cols = m.get_item_columns(item_id, needed)
-    return {"item_id": item_id, "read": cols}
+
+    # 1) IBAN calculé via la formule (même si text/value sont vides)
+    iban_formula_calc = None
+    try:
+        iban_formula_calc = m.compute_formula_text_for_item(settings.IBAN_FORMULA_COLUMN_ID, int(item_id))
+    except Exception as e:
+        iban_formula_calc = f"ERROR: {e}"
+
+    # 2) Fallback Business Line → IBAN (carte réellement utilisée)
+    def _normalize(s: str) -> str: return (s or "").strip().lower()
+
+    from .config import settings as s
+    # ton mapping ENV
+    env_map = _safe_json_loads(getattr(s, "IBAN_BY_STATUS_JSON", None), default={}) or {}
+    # mapping défaut pour Energyz (si ENV vide ou incomplet)
+    default_map = {
+        "Energyz MAR":    "FR76 1695 8000 0130 5670 5696 366",
+        "Energyz Divers": "FR76 1695 8000 0100 0571 1982 492",
+    }
+    merged_map = {**default_map, **env_map}
+
+    bl_col = getattr(s, "BUSINESS_STATUS_COLUMN_ID", "color_mkwnxf1h")
+    bl_value = (cols.get(bl_col, "") or "").strip()
+    chosen_iban_from_bl = ""
+    tried_keys = []
+    if bl_value:
+        bn = _normalize(bl_value)
+        for k, v in merged_map.items():
+            if not v:
+                continue
+            kn = _normalize(k)
+            tried_keys.append(k)
+            if bn == kn or bn.startswith(kn) or kn in bn:
+                chosen_iban_from_bl = v.strip()
+                break
+
+    return {
+        "item_id": item_id,
+        "read": cols,                           # ce que renvoie l'API brute
+        "iban_formula_calc": iban_formula_calc, # IBAN calculé via expression formula
+        "business_line_value": bl_value,
+        "bl_mapping_keys": list(merged_map.keys()),
+        "bl_chosen_iban": chosen_iban_from_bl
+    }
+
 
 # -------------------- Webhook --------------------
 @app.post("/quote/from_monday")
