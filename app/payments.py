@@ -73,6 +73,11 @@ def _valid_email(email: str) -> bool:
         return False
     return re.match(r"[^@]+@[^@]+\.[^@]+", email) is not None
 
+def _safe_alias_email(client_name: str | None, item_id: str | int | None) -> str:
+    # alias simple, RFC-valide, toujours accepté par PayPlug
+    iid = str(item_id or "0")
+    return f"paiement+{iid}@energyz.fr"
+
 def create_payment(api_key: str,
                    amount_cents: int,
                    email: str | None,
@@ -81,7 +86,7 @@ def create_payment(api_key: str,
                    metadata: dict | None) -> str:
     """
     Crée un paiement PayPlug 'hébergé' (lien) en PRÉREMPLISSANT toujours Nom/Prénom/E-mail :
-      - si email Monday absent, on génère un alias stable: slug(client_name)-{item_id}@pay.energyz.fr
+      - si email Monday absent/incorrect, alias stable: paiement+{item_id}@energyz.fr
       - on envoie toujours customer.{email, first_name, last_name}
     Conserve la structure existante pour ne pas casser les intégrations.
     """
@@ -95,13 +100,22 @@ def create_payment(api_key: str,
     }
 
     # URLs de retour/annulation
-    return_url = os.getenv("PAYPLUG_RETURN_URL", os.getenv("PUBLIC_BASE_URL", "https://www.energyz.fr"))
-    cancel_url = os.getenv("PAYPLUG_CANCEL_URL", os.getenv("PUBLIC_BASE_URL", "https://www.energyz.fr"))
+    base_url   = os.getenv("PUBLIC_BASE_URL", "https://www.energyz.fr")
+    return_url = os.getenv("PAYPLUG_RETURN_URL", base_url)
+    cancel_url = os.getenv("PAYPLUG_CANCEL_URL", base_url)
 
     # Nom/Prénom + e-mail alias si besoin
     first_name, last_name = _split_name(client_name or "")
     item_id = str((metadata or {}).get("item_id", "0"))
-    alias_email = (email or "").strip() or f"{_slug(client_name)}-{item_id}@pay.energyz.fr"
+
+    # 1) email Monday si présent
+    alias_email = (email or "").strip()
+    # 2) si vide/invalide -> alias sûr
+    if not _valid_email(alias_email):
+        alias_email = _safe_alias_email(client_name, item_id)
+    # 3) filet ultime
+    if not _valid_email(alias_email):
+        alias_email = "paiement@energyz.fr"
 
     description = (metadata or {}).get("description") or f"Paiement acompte { (metadata or {}).get('acompte','?') } — {client_name or 'Client Energyz'}"
     description = description[:255]
@@ -120,11 +134,10 @@ def create_payment(api_key: str,
             "first_name": first_name,
             "last_name": last_name,
         },
-        # on évite 'billing' pour rester minimaliste et sûr
         # "billing": {"address1": (address or "")[:255], "country": "FR"}  # à activer si besoin
     }
 
-    resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=20)
+    resp = requests.post(url, headers=headers, json=payload, timeout=20)
     if resp.status_code >= 300:
         raise RuntimeError(f"PayPlug error {resp.status_code}: {resp.text}")
 
