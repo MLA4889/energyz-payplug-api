@@ -3,3 +3,4 @@ uvicorn
 requests
 pydantic>=2.5.0
 pydantic-settings>=2.0.1
+python-multipart>=0.0.9
