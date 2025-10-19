@@ -48,27 +48,42 @@ def _choose_api_key(iban: str) -> str | None:
 
     mapping = _load_json_env("PAYPLUG_KEYS_LIVE_JSON" if mode == "live" else "PAYPLUG_KEYS_TEST_JSON")
     if mapping:
+        # accepte avec ou sans espaces
         return mapping.get(iban) or mapping.get(iban_c)
 
     return None
+
+# ---------- Préremplissage systématique ----------
+def _slug(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    s = re.sub(r"-{2,}", "-", s)
+    s = s.strip("-")
+    return s or "client"
+
+def _split_name(fullname: str) -> tuple[str, str]:
+    base = (fullname or "Client Energyz").strip()
+    parts = base.split()
+    first = (parts[0] if parts else "Client")[:64] or "Client"
+    last  = ((parts[-1] if len(parts) > 1 else "Energyz")[:64]) or "Energyz"
+    return first, last
 
 def _valid_email(email: str) -> bool:
     if not email:
         return False
     return re.match(r"[^@]+@[^@]+\.[^@]+", email) is not None
 
-
 def create_payment(api_key: str,
                    amount_cents: int,
                    email: str | None,
-                   address: str | None,      # non utilisé volontairement
+                   address: str | None,      # non bloquant
                    client_name: str | None,
                    metadata: dict | None) -> str:
     """
-    Crée un paiement PayPlug 'hébergé' (lien).
-    - on utilise 'hosted_payment' (pas de 'payment_method')
-    - pas de 'billing'
-    - 'customer' uniquement si email valide
+    Crée un paiement PayPlug 'hébergé' (lien) en PRÉREMPLISSANT toujours Nom/Prénom/E-mail :
+      - si email Monday absent, on génère un alias stable: slug(client_name)-{item_id}@pay.energyz.fr
+      - on envoie toujours customer.{email, first_name, last_name}
+    Conserve la structure existante pour ne pas casser les intégrations.
     """
     if not api_key:
         raise RuntimeError("create_payment: api_key manquante")
@@ -79,32 +94,35 @@ def create_payment(api_key: str,
         "Content-Type": "application/json",
     }
 
-    # URLs de retour/annulation (facultatives, mais c’est propre d’en fournir)
-    return_url = os.getenv("PAYPLUG_RETURN_URL", "https://www.energyz.fr/success")
-    cancel_url = os.getenv("PAYPLUG_CANCEL_URL", "https://www.energyz.fr/cancel")
+    # URLs de retour/annulation
+    return_url = os.getenv("PAYPLUG_RETURN_URL", os.getenv("PUBLIC_BASE_URL", "https://www.energyz.fr"))
+    cancel_url = os.getenv("PAYPLUG_CANCEL_URL", os.getenv("PUBLIC_BASE_URL", "https://www.energyz.fr"))
+
+    # Nom/Prénom + e-mail alias si besoin
+    first_name, last_name = _split_name(client_name or "")
+    item_id = str((metadata or {}).get("item_id", "0"))
+    alias_email = (email or "").strip() or f"{_slug(client_name)}-{item_id}@pay.energyz.fr"
+
+    description = (metadata or {}).get("description") or f"Paiement acompte { (metadata or {}).get('acompte','?') } — {client_name or 'Client Energyz'}"
+    description = description[:255]
 
     payload = {
-        "amount": amount_cents,
+        "amount": int(amount_cents or 0),
         "currency": "EUR",
-        # pas de payment_method -> PayPlug génère une page de paiement hébergée
         "hosted_payment": {
             "return_url": return_url,
             "cancel_url": cancel_url,
         },
         "metadata": metadata or {},
+        "description": description,
+        "customer": {
+            "email": alias_email,
+            "first_name": first_name,
+            "last_name": last_name,
+        },
+        # on évite 'billing' pour rester minimaliste et sûr
+        # "billing": {"address1": (address or "")[:255], "country": "FR"}  # à activer si besoin
     }
-
-    if _valid_email(email):
-        payload["customer"] = {
-            "email": email.strip(),
-        }
-        if client_name:
-            # Pas obligatoire, mais utile pour le ticket
-            payload["customer"]["first_name"] = str(client_name)[:100]
-
-    # NE PAS ENVOYER 'billing'
-    # if address:
-    #     payload["billing"] = {"address1": address, "country": "FR"}
 
     resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=20)
     if resp.status_code >= 300:
