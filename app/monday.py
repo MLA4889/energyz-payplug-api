@@ -23,13 +23,11 @@ def _post(query: str, variables: dict):
     data = resp.json()
     if isinstance(data, dict) and data.get("errors"):
         raise Exception(f"Erreur Monday: {data['errors']}")
-    return data  # retourne le JSON complet {"data":{...}}
+    return data  # {"data": {...}}
 
 def _extract_text_from_column(col: dict) -> str:
     """
     Renvoie le texte "humain" d'une colonne Monday.
-    - Si col["text"] existe, on renvoie ça.
-    - Sinon, on tente de parser col["value"] (JSON brut) et on en extrait 'text'/'value' si présent.
     """
     if col.get("text"):
         return str(col["text"])
@@ -53,7 +51,7 @@ def _extract_text_from_column(col: dict) -> str:
 def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
     """
     Récupère name + un sous-ensemble de colonnes (par id), et renvoie un dict {col_id: texte}.
-    Astuce: Monday calcule parfois mieux le 'text' des formules quand on filtre avec ids:[].
+    On déclare col_ids en [String!] (non-null) et on filtre toute valeur vide/None.
     """
     # 1) name
     q_name = """
@@ -64,9 +62,13 @@ def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
     data_name = _post(q_name, {"item_id": item_id})
     name = (data_name["data"]["items"][0]["name"]) if data_name.get("data") else ""
 
+    # Filtrer / dédupliquer pour respecter [String!]
+    col_ids = [c for c in (column_ids or []) if c]
+    col_ids = list(dict.fromkeys(col_ids))
+
     # 2) colonnes ciblées
     q_cols = """
-    query ($item_id: ID!, $col_ids: [String]) {
+    query ($item_id: ID!, $col_ids: [String!]) {
       items(ids: [$item_id]) {
         column_values(ids: $col_ids) {
           id
@@ -77,7 +79,7 @@ def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
       }
     }
     """
-    data_cols = _post(q_cols, {"item_id": item_id, "col_ids": column_ids})
+    data_cols = _post(q_cols, {"item_id": item_id, "col_ids": col_ids})
     cvs = (data_cols["data"]["items"][0]["column_values"]) if data_cols.get("data") else []
 
     result = {"name": name}
@@ -311,10 +313,10 @@ def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float |
 def compute_formula_text_for_item(column_id: str, item_id: int) -> str | None:
     """
     Récupère le 'text' d'une colonne FORMULA (ex: IBAN) pour un item.
-    Cette requête ciblée (ids: [column_id]) force souvent Monday à renvoyer le texte calculé.
+    Déclarations des variables en [Int!] et [String!] pour coller au schéma.
     """
     q = """
-    query ($item_id: [Int], $col_id: [String]) {
+    query ($item_id: [Int!], $col_id: [String!]) {
       items(ids: $item_id) {
         id
         column_values(ids: $col_id) {
@@ -325,7 +327,8 @@ def compute_formula_text_for_item(column_id: str, item_id: int) -> str | None:
       }
     }
     """
-    data = _post(q, {"item_id": [int(item_id)], "col_id": [column_id]})
+    col_list = [str(column_id)] if column_id else []
+    data = _post(q, {"item_id": [int(item_id)], "col_id": col_list})
     items = (data.get("data") or {}).get("items") or []
     if not items:
         return None
@@ -335,7 +338,6 @@ def compute_formula_text_for_item(column_id: str, item_id: int) -> str | None:
     text = (cvs[0].get("text") or "").strip()
     if text:
         return text
-    # fallback au cas où (peu probable)
     return _extract_text_from_column(cvs[0]) or None
 
 # -------------------- Mutations --------------------
