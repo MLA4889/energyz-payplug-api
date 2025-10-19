@@ -10,7 +10,7 @@ HEADERS = {
     "Content-Type": "application/json",
 }
 
-# -------------------- HTTP / GraphQL --------------------
+# ================== HTTP / GraphQL ==================
 
 def _post(query: str, variables: dict):
     resp = requests.post(
@@ -26,9 +26,7 @@ def _post(query: str, variables: dict):
     return data  # {"data": {...}}
 
 def _extract_text_from_column(col: dict) -> str:
-    """
-    Renvoie le texte "humain" d'une colonne Monday.
-    """
+    """Renvoie le texte 'humain' d'une colonne Monday."""
     if col.get("text"):
         return str(col["text"])
     raw_val = col.get("value")
@@ -46,30 +44,21 @@ def _extract_text_from_column(col: dict) -> str:
         return json.dumps(parsed, ensure_ascii=False)
     return str(parsed)
 
-# -------------------- Lecture d’item --------------------
+# ================== Lecture d’item ==================
 
 def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
     """
     Récupère name + un sous-ensemble de colonnes (par id), et renvoie un dict {col_id: texte}.
-    On déclare col_ids en [String!] (non-null) et on filtre toute valeur vide/None.
+    Déclare col_ids en [String!] et item_id en ID! pour coller au schéma Monday.
     """
-    # 1) name
-    q_name = """
-    query ($item_id: ID!) {
-      items(ids: [$item_id]) { name }
-    }
-    """
-    data_name = _post(q_name, {"item_id": item_id})
-    name = (data_name["data"]["items"][0]["name"]) if data_name.get("data") else ""
-
-    # Filtrer / dédupliquer pour respecter [String!]
+    # Nettoyage / dédoublonnage pour respecter [String!]
     col_ids = [c for c in (column_ids or []) if c]
     col_ids = list(dict.fromkeys(col_ids))
 
-    # 2) colonnes ciblées
-    q_cols = """
+    query = """
     query ($item_id: ID!, $col_ids: [String!]) {
       items(ids: [$item_id]) {
+        name
         column_values(ids: $col_ids) {
           id
           type
@@ -79,17 +68,20 @@ def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
       }
     }
     """
-    data_cols = _post(q_cols, {"item_id": item_id, "col_ids": col_ids})
-    cvs = (data_cols["data"]["items"][0]["column_values"]) if data_cols.get("data") else []
+    data = _post(query, {"item_id": str(item_id), "col_ids": col_ids})
+    items = (data.get("data") or {}).get("items") or []
+    if not items:
+        return {}
 
-    result = {"name": name}
-    for col in cvs:
+    item = items[0]
+    result = {"name": item.get("name", "")}
+    for col in item.get("column_values", []):
         cid = col["id"]
         result[cid] = _extract_text_from_column(col)
         result[cid + "__raw"] = col.get("value") or ""
     return result
 
-# -------------------- Métadonnées de board --------------------
+# ================== Métadonnées de board ==================
 
 def get_board_columns_map():
     """
@@ -114,7 +106,7 @@ def get_board_columns_map():
     }
     """
     data = _post(query, {"board_id": settings.MONDAY_BOARD_ID})
-    boards = data["data"]["boards"]
+    boards = (data.get("data") or {}).get("boards") or []
     if not boards:
         return [], {}, {}, {}, {}
     cols = boards[0]["columns"]
@@ -141,7 +133,7 @@ def get_formula_expression(column_id: str) -> str | None:
     _, _, _, formulas, _ = get_board_columns_map()
     return formulas.get(column_id)
 
-# -------------------- Formules: numérique & texte --------------------
+# ================== Formules: numérique & texte ==================
 
 def _translate_monday_expr(expr: str) -> str:
     """Petit traducteur d'expressions Monday -> Python safe (arith/booleen)."""
@@ -189,11 +181,9 @@ def _safe_eval_arith_bool(expr: str) -> float:
         'True': True, 'False': False,
     }
     def _eval(node):
-        if isinstance(node, ast.Expression):
-            return _eval(node.body)
+        if isinstance(node, ast.Expression): return _eval(node.body)
         if hasattr(ast, "Constant") and isinstance(node, ast.Constant):
-            if isinstance(node.value, (int, float, bool, str)):
-                return node.value
+            if isinstance(node.value, (int, float, bool, str)): return node.value
             raise ValueError("Constante non autorisée")
         if isinstance(node, ast.Str): return node.s
         if isinstance(node, ast.Num): return node.n
@@ -231,7 +221,6 @@ def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float |
     """
     _, id_to_title, title_to_id, formulas, col_types = get_board_columns_map()
 
-    # Récup toutes les valeurs de colonnes pour l'item (pour résolution des tokens)
     query = """
     query ($item_id: ID!) {
       items (ids: [$item_id]) {
@@ -244,8 +233,8 @@ def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float |
       }
     }
     """
-    data = _post(query, {"item_id": item_id})
-    item_cols = data["data"]["items"][0]["column_values"]
+    data = _post(query, {"item_id": str(item_id)})
+    item_cols = (data["data"]["items"][0]["column_values"]) if data.get("data") else []
 
     id_to_numeric: dict[str, float] = {}
     id_to_string: dict[str, str] = {}
@@ -312,14 +301,13 @@ def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float |
 
 def compute_formula_text_for_item(column_id: str, item_id: int) -> str | None:
     """
-    Récupère le 'text' d'une colonne FORMULA (ex: IBAN) pour un item.
-    Déclarations des variables en [Int!] et [String!] pour coller au schéma.
+    Récupère le *texte* d'une colonne FORMULA (ex: IBAN) pour un item.
+    Variables déclarées en [ID!] et [String!] comme attendu par l'API Monday.
     """
     q = """
-    query ($item_id: [Int!], $col_id: [String!]) {
-      items(ids: $item_id) {
-        id
-        column_values(ids: $col_id) {
+    query ($item_ids: [ID!], $col_ids: [String!]) {
+      items(ids: $item_ids) {
+        column_values(ids: $col_ids) {
           id
           text
           value
@@ -327,8 +315,9 @@ def compute_formula_text_for_item(column_id: str, item_id: int) -> str | None:
       }
     }
     """
-    col_list = [str(column_id)] if column_id else []
-    data = _post(q, {"item_id": [int(item_id)], "col_id": col_list})
+    item_ids = [str(item_id)]
+    col_ids = [str(column_id)] if column_id else []
+    data = _post(q, {"item_ids": item_ids, "col_ids": col_ids})
     items = (data.get("data") or {}).get("items") or []
     if not items:
         return None
@@ -340,7 +329,7 @@ def compute_formula_text_for_item(column_id: str, item_id: int) -> str | None:
         return text
     return _extract_text_from_column(cvs[0]) or None
 
-# -------------------- Mutations --------------------
+# ================== Mutations ==================
 
 def set_link_in_column(item_id: int, column_id: str, url: str, text: str):
     mutation = """
@@ -353,7 +342,7 @@ def set_link_in_column(item_id: int, column_id: str, url: str, text: str):
     link_value = json.dumps({"url": url, "text": text}, ensure_ascii=False)
     _post(mutation, {
         "board_id": settings.MONDAY_BOARD_ID,
-        "item_id": item_id,
+        "item_id": str(item_id),
         "column_id": column_id,
         "value": link_value
     })
@@ -368,7 +357,7 @@ def set_status(item_id: int, column_id: str, label: str):
     """
     _post(mutation, {
         "board_id": settings.MONDAY_BOARD_ID,
-        "item_id": item_id,
+        "item_id": str(item_id),
         "column_id": column_id,
         "value": label
     })
