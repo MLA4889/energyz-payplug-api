@@ -11,7 +11,14 @@ from . import monday as m
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("energyz")
 
-app = FastAPI(title="Energyz PayPlug API", version="2.3 (iban-text + fallbacks + challenge)")
+app = FastAPI(title="Energyz PayPlug API", version="2.4 (diag + robust BL mapping)")
+
+# --- MAPPING IBAN PAR DEFAUT (sécurité si ENV manquant / mal renseigné) ---
+DEFAULT_IBAN_BY_STATUS = {
+    # clés telles qu’affichées dans ta colonne “Business Line”
+    "Energyz MAR":    "FR76 1695 8000 0130 5670 5696 366",
+    "Energyz Divers": "FR76 1695 8000 0100 0571 1982 492",
+}
 
 # -------------------- Utils --------------------
 def _safe_json_loads(s, default=None):
@@ -43,6 +50,9 @@ def _extract_status_label(value_json: dict) -> str:
     v = value_json.get("value")
     return str(v or "").strip()
 
+def _normalize(s: str) -> str:
+    return (s or "").strip().lower()
+
 # -------------------- Health/Ping --------------------
 @app.get("/")
 def root():
@@ -51,6 +61,21 @@ def root():
 @app.get("/quote/from_monday")
 def from_monday_ping():
     return {"ok": True}
+
+# -------------------- Endpoint DIAG (très utile) --------------------
+@app.get("/diag/{item_id}")
+def diag_item(item_id: int):
+    needed = [
+        settings.EMAIL_COLUMN_ID,
+        settings.ADDRESS_COLUMN_ID,
+        settings.DESCRIPTION_COLUMN_ID,
+        settings.IBAN_FORMULA_COLUMN_ID,
+        settings.QUOTE_AMOUNT_FORMULA_ID,
+        getattr(settings, "BUSINESS_STATUS_COLUMN_ID", "color_mkwnxf1h"),
+        "name",
+    ]
+    cols = m.get_item_columns(item_id, needed)
+    return {"item_id": item_id, "read": cols}
 
 # -------------------- Webhook --------------------
 @app.post("/quote/from_monday")
@@ -74,7 +99,8 @@ async def quote_from_monday(request: Request):
         trigger_col = event.get("columnId")
         trigger_status_col = getattr(settings, "TRIGGER_STATUS_COLUMN_ID", "status")
         trigger_labels = _safe_json_loads(getattr(settings, "TRIGGER_LABELS_JSON", None),
-                                          default={"1": "Acompte 1", "2": "Acompte 2"}) or {"1": "Acompte 1", "2": "Acompte 2"}
+                                          default={"1": "Générer acompte 1", "2": "Générer acompte 2"}) \
+                          or {"1": "Générer acompte 1", "2": "Générer acompte 2"}
 
         acompte_num = None
         if trigger_col == trigger_status_col:
@@ -100,7 +126,7 @@ async def quote_from_monday(request: Request):
             settings.EMAIL_COLUMN_ID,
             settings.ADDRESS_COLUMN_ID,
             settings.DESCRIPTION_COLUMN_ID,
-            settings.IBAN_FORMULA_COLUMN_ID,     # peut être vide côté UI
+            settings.IBAN_FORMULA_COLUMN_ID,
             settings.QUOTE_AMOUNT_FORMULA_ID,
             formula_cols[acompte_num],
             getattr(settings, "BUSINESS_STATUS_COLUMN_ID", "color_mkwnxf1h"),
@@ -119,7 +145,7 @@ async def quote_from_monday(request: Request):
             try:
                 iban = (m.compute_formula_text_for_item(settings.IBAN_FORMULA_COLUMN_ID, int(item_id)) or "").strip()
                 if iban:
-                    logger.info(f"[IBAN] obtenu via formula API = '{iban}'")
+                    logger.info(f"[IBAN] via formula API = '{iban}'")
             except Exception as e:
                 logger.warning(f"[IBAN] compute_formula_text_for_item a échoué: {e}")
 
@@ -143,21 +169,35 @@ async def quote_from_monday(request: Request):
         if amount_cents <= 0:
             raise HTTPException(status_code=400, detail=f"Montant invalide après parsing: '{acompte_txt}'.")
 
-        # Fallback IBAN via Business Line (Status)
-        if not iban:
-            iban_by_status = _safe_json_loads(getattr(settings, "IBAN_BY_STATUS_JSON", None), default={}) or {}
-            business_col_id = getattr(settings, "BUSINESS_STATUS_COLUMN_ID", "color_mkwnxf1h")
-            business_status_label = (cols.get(business_col_id, "") or "").strip()
-            logger.info(f"[IBAN] business_label='{business_status_label}' keys={list(iban_by_status.keys())}")
-            if business_status_label:
-                bl = business_status_label.lower()
-                for k, v in iban_by_status.items():
-                    if (k or "").strip().lower() == bl and v:
-                        iban = v.strip()
-                        break
+        # ------- Fallback IBAN via Business Line (STATUT) -------
+        business_col_id = getattr(settings, "BUSINESS_STATUS_COLUMN_ID", "color_mkwnxf1h")
+        business_label  = (cols.get(business_col_id, "") or "").strip()
+        logger.info(f"[IBAN] business_label='{business_label}'")
+
+        # ENV puis défaut codé en dur
+        env_map = _safe_json_loads(getattr(settings, "IBAN_BY_STATUS_JSON", None), default={}) or {}
+        if not env_map:
+            env_map = {}
+
+        # Merge avec default (ENV prioritaire)
+        merged_map = {**DEFAULT_IBAN_BY_STATUS, **env_map}
+
+        if not iban and business_label:
+            # matching robuste : exact / normalize / contains
+            bl_norm = _normalize(business_label)
+            keys_tried = []
+            for k, v in merged_map.items():
+                if not v:
+                    continue
+                kn = _normalize(k)
+                keys_tried.append(k)
+                if bl_norm == kn or bl_norm.startswith(kn) or kn in bl_norm:
+                    iban = v.strip()
+                    break
+            logger.info(f"[IBAN] keys tried: {keys_tried}")
 
         if not iban:
-            raise HTTPException(status_code=400, detail="IBAN introuvable (formula vide + pas de fallback Business Line).")
+            raise HTTPException(status_code=400, detail="IBAN introuvable (formule vide + pas de fallback Business Line).")
 
         # Clé PayPlug
         api_key = _choose_api_key(iban)
