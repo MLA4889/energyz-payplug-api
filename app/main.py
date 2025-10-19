@@ -6,7 +6,6 @@ from fastapi.responses import JSONResponse
 
 from .config import settings
 from .payments import _choose_api_key, cents_from_str, create_payment
-# >>> on importe le module monday, pas la fonction directement
 from . import monday as m
 
 logging.basicConfig(level=logging.INFO)
@@ -134,7 +133,6 @@ async def quote_from_monday(request: Request):
         acompte_txt = _clean_number_text(cols.get(formula_id, ""))
 
         if float(acompte_txt or "0") <= 0:
-            # fonction numérique existante dans monday.py
             computed = m.compute_formula_value_for_item(formula_id, int(item_id))
             if computed is not None and computed > 0:
                 acompte_txt = str(computed)
