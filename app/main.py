@@ -317,3 +317,34 @@ async def quote_from_monday(request: Request):
     except Exception as e:
         logger.exception(f"[EXCEPTION] {e}")
         raise HTTPException(status_code=500, detail=f"Erreur webhook Monday : {e}")
+
+# --- DEBUG ENV (temporaire) ---
+@app.get("/__env_diag__")
+def env_diag():
+    import os
+    from .payments import _mode, _compact_iban, ENERGYZ_MAR_IBAN, ENERGYZ_DIVERS_IBAN
+    return {
+        "mode": _mode(),
+        "has_PAYPLUG_TEST_KEY_EZMAR": bool(os.getenv("PAYPLUG_TEST_KEY_EZMAR")),
+        "has_PAYPLUG_TEST_KEY_EZDIVERS": bool(os.getenv("PAYPLUG_TEST_KEY_EZDIVERS")),
+        "has_PAYPLUG_LIVE_KEY_EZMAR": bool(os.getenv("PAYPLUG_LIVE_KEY_EZMAR")),
+        "has_PAYPLUG_LIVE_KEY_EZDIVERS": bool(os.getenv("PAYPLUG_LIVE_KEY_EZDIVERS")),
+        "has_KEYS_TEST_JSON": bool(os.getenv("PAYPLUG_KEYS_TEST_JSON")),
+        "has_KEYS_LIVE_JSON": bool(os.getenv("PAYPLUG_KEYS_LIVE_JSON")),
+        "constants": {
+            "ENERGYZ_MAR_IBAN_compact": _compact_iban(ENERGYZ_MAR_IBAN),
+            "ENERGYZ_DIVERS_IBAN_compact": _compact_iban(ENERGYZ_DIVERS_IBAN),
+        }
+    }
+
+@app.get("/__test_choose_key__")
+def test_choose_key(iban: str):
+    from .payments import _choose_api_key
+    k = _choose_api_key(iban)
+    return {
+        "iban": iban,
+        "api_key_found": bool(k),
+        "key_len": len(k or ""),
+        "mode": (os.getenv("PAYPLUG_MODE") or "n/a")
+    }
+
