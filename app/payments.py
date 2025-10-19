@@ -3,18 +3,14 @@ import re
 import requests
 import json
 
-# IBAN “connus” côté Energyz
 ENERGYZ_MAR_IBAN = "FR76 1695 8000 0130 5670 5696 366"
 ENERGYZ_DIVERS_IBAN = "FR76 1695 8000 0100 0571 1982 492"
-
 
 def _compact_iban(iban: str) -> str:
     return (iban or "").replace(" ", "").upper()
 
-
 def _mode() -> str:
     return (os.getenv("PAYPLUG_MODE") or "test").lower().strip()
-
 
 def _load_json_env(name: str) -> dict:
     raw = os.getenv(name)
@@ -25,7 +21,6 @@ def _load_json_env(name: str) -> dict:
     except Exception:
         return {}
 
-
 def cents_from_str(s: str) -> int:
     s = (s or "").replace(" ", "").replace("€", "").replace(",", ".")
     try:
@@ -34,11 +29,7 @@ def cents_from_str(s: str) -> int:
         v = 0.0
     return int(round(v * 100))
 
-
 def _choose_api_key(iban: str) -> str | None:
-    """
-    Choix de la clé PayPlug en fonction de l’IBAN + ENV + FORCED_PAYPLUG_KEY éventuel.
-    """
     forced_key = os.getenv("FORCED_PAYPLUG_KEY")
     if forced_key:
         return forced_key.strip()
@@ -57,25 +48,12 @@ def _choose_api_key(iban: str) -> str | None:
 
     return None
 
-
 def _valid_email(email: str) -> bool:
     if not email:
         return False
     return re.match(r"[^@]+@[^@]+\.[^@]+", email) is not None
 
-
-def create_payment(
-    api_key: str,
-    amount_cents: int,
-    email: str | None,
-    address: str | None,
-    client_name: str | None,
-    metadata: dict | None,
-) -> dict:
-    """
-    Crée un paiement PayPlug 'hébergé' (lien).
-    Utilise notification_url pour notifier ton webhook directement à la validation.
-    """
+def create_payment(api_key: str, amount_cents: int, email: str | None, address: str | None, client_name: str | None, metadata: dict | None) -> str:
     if not api_key:
         raise RuntimeError("create_payment: api_key manquante")
 
@@ -87,16 +65,11 @@ def create_payment(
 
     return_url = os.getenv("PAYPLUG_RETURN_URL", "https://www.energyz.fr/success")
     cancel_url = os.getenv("PAYPLUG_CANCEL_URL", "https://www.energyz.fr/cancel")
-    notification_url = os.getenv("PAYPLUG_NOTIFICATION_URL", "https://energyz-payplug-api-2.onrender.com/payplug/webhook")
 
     payload = {
         "amount": amount_cents,
         "currency": "EUR",
-        "hosted_payment": {
-            "return_url": return_url,
-            "cancel_url": cancel_url,
-        },
-        "notification_url": notification_url,
+        "hosted_payment": {"return_url": return_url, "cancel_url": cancel_url},
         "metadata": metadata or {},
     }
 
@@ -105,13 +78,14 @@ def create_payment(
         if client_name:
             payload["customer"]["first_name"] = str(client_name)[:100]
 
-    resp = requests.post(url, headers=headers, json=payload, timeout=20)
+    resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=20)
     if resp.status_code >= 300:
         raise RuntimeError(f"PayPlug error {resp.status_code}: {resp.text}")
 
     data = resp.json()
     hp = (data or {}).get("hosted_payment", {})
-    if not hp.get("payment_url"):
+    pay_url = hp.get("payment_url") or data.get("payment_url") or data.get("hosted_payment_url")
+    if not pay_url:
         raise RuntimeError(f"PayPlug: URL de paiement introuvable dans la réponse: {data}")
 
-    return data
+    return pay_url
