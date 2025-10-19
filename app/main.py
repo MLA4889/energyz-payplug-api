@@ -6,18 +6,13 @@ from fastapi.responses import JSONResponse
 
 from .config import settings
 from .payments import _choose_api_key, cents_from_str, create_payment
-from .monday import (
-    get_item_columns,
-    set_link_in_column,
-    set_status,
-    compute_formula_value_for_item,   # (numérique)
-    compute_formula_text_for_item,    # <<< NOUVEAU : texte (ex. IBAN)
-)
+# >>> on importe le module monday, pas la fonction directement
+from . import monday as m
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("energyz")
 
-app = FastAPI(title="Energyz PayPlug API", version="2.2 (iban-formula+fallback+challenge)")
+app = FastAPI(title="Energyz PayPlug API", version="2.2b (iban-formula-optional+challenge)")
 
 # -------------------- Utils --------------------
 def _safe_json_loads(s, default=None):
@@ -104,7 +99,7 @@ async def quote_from_monday(request: Request):
         if acompte_num not in formula_cols or acompte_num not in link_columns:
             raise HTTPException(status_code=500, detail=f"FORMULA_COLUMN_IDS_JSON/LINK_COLUMN_IDS_JSON sans clé '{acompte_num}'.")
 
-        # Lecture de base des colonnes (rapide)
+        # Lecture rapide des colonnes
         needed_cols = [
             settings.EMAIL_COLUMN_ID,
             settings.ADDRESS_COLUMN_ID,
@@ -115,7 +110,7 @@ async def quote_from_monday(request: Request):
             getattr(settings, "BUSINESS_STATUS_COLUMN_ID", "color_mkwnxf1h"),
             "name",
         ]
-        cols = get_item_columns(item_id, needed_cols)
+        cols = m.get_item_columns(item_id, needed_cols)
         logger.info(f"[MONDAY] item_id={item_id} values={cols}")
 
         email       = cols.get(settings.EMAIL_COLUMN_ID, "") or ""
@@ -123,18 +118,24 @@ async def quote_from_monday(request: Request):
         description = cols.get(settings.DESCRIPTION_COLUMN_ID, "") or ""
         iban        = (cols.get(settings.IBAN_FORMULA_COLUMN_ID, "") or "").strip()
 
-        # ===== IBAN via FORMULE (prioritaire) =====
+        # ===== IBAN via FORMULE (prioritaire) – dynamique et optionnel =====
         if not iban:
-            iban = (compute_formula_text_for_item(settings.IBAN_FORMULA_COLUMN_ID, int(item_id)) or "").strip()
-            if iban:
-                logger.info(f"[IBAN] obtenu via formula API = '{iban}'")
+            compute_text = getattr(m, "compute_formula_text_for_item", None)
+            if callable(compute_text):
+                try:
+                    iban = (compute_text(settings.IBAN_FORMULA_COLUMN_ID, int(item_id)) or "").strip()
+                    if iban:
+                        logger.info(f"[IBAN] obtenu via formula API = '{iban}'")
+                except Exception as e:
+                    logger.warning(f"[IBAN] compute_formula_text_for_item a échoué: {e}")
 
         # --- Montant acompte (formule -> recompute -> 50% total) ---
         formula_id  = formula_cols[acompte_num]
         acompte_txt = _clean_number_text(cols.get(formula_id, ""))
 
         if float(acompte_txt or "0") <= 0:
-            computed = compute_formula_value_for_item(formula_id, int(item_id))
+            # fonction numérique existante dans monday.py
+            computed = m.compute_formula_value_for_item(formula_id, int(item_id))
             if computed is not None and computed > 0:
                 acompte_txt = str(computed)
 
@@ -182,10 +183,10 @@ async def quote_from_monday(request: Request):
             metadata=metadata,
         )
 
-        set_link_in_column(item_id, link_columns[acompte_num], payment_url, f"Payer acompte {acompte_num}")
+        m.set_link_in_column(item_id, link_columns[acompte_num], payment_url, f"Payer acompte {acompte_num}")
         status_after = _safe_json_loads(settings.STATUS_AFTER_PAY_JSON, default={}) or {}
         next_status = status_after.get(acompte_num, f"Payé acompte {acompte_num}")
-        set_status(item_id, settings.STATUS_COLUMN_ID, next_status)
+        m.set_status(item_id, settings.STATUS_COLUMN_ID, next_status)
 
         logger.info(f"[OK] item={item_id} acompte={acompte_num} amount_cents={amount_cents} url={payment_url}")
         return {"status": "ok", "item_id": item_id, "acompte": acompte_num, "amount_cents": amount_cents, "payment_url": payment_url}
