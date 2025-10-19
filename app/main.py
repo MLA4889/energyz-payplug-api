@@ -12,7 +12,7 @@ from . import monday as m
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("energyz")
 
-app = FastAPI(title="Energyz PayPlug API", version="2.5.2 (status-safe + robust webhook + admin fallback)")
+app = FastAPI(title="Energyz PayPlug API", version="2.6 (status-only-on-webhook)")
 
 
 # -------------------- Utils --------------------
@@ -48,14 +48,8 @@ def _extract_status_label(value_json: dict) -> str:
     return str(v or "").strip()
 
 
-def _normalize(s: str) -> str:
-    return (s or "").strip().lower()
-
-
 def _set_status_safe(item_id: int, column_id: str, label: str):
-    """
-    Pose un statut Monday sans faire échouer le flux si le libellé n'existe pas.
-    """
+    """Pose un statut Monday sans faire échouer le flux si le libellé n'existe pas."""
     try:
         m.set_status(item_id, column_id, label)
     except Exception as e:
@@ -64,12 +58,6 @@ def _set_status_safe(item_id: int, column_id: str, label: str):
             logger.warning("[MONDAY] statut ignoré (label inexistant): '%s' (item_id=%s)", label, item_id)
         else:
             logger.exception("[MONDAY] set_status erreur non bloquante (item_id=%s, label=%s): %s", item_id, label, e)
-
-
-def _mark_paid(item_id: int, acompte: str):
-    status_after = _safe_json_loads(getattr(settings, "STATUS_AFTER_PAY_JSON", None), default={}) or {}
-    next_status = status_after.get(acompte, f"Payé acompte {acompte}")
-    _set_status_safe(item_id, getattr(settings, "STATUS_COLUMN_ID", "status"), next_status)
 
 
 # -------------------- Health/Ping --------------------
@@ -83,7 +71,7 @@ def from_monday_ping():
     return {"ok": True}
 
 
-# -------------------- Webhook Monday -> création du lien --------------------
+# -------------------- Monday -> création du lien (NE CHANGE PAS LE STATUT) --------------------
 @app.post("/quote/from_monday")
 async def quote_from_monday(request: Request):
     try:
@@ -93,7 +81,6 @@ async def quote_from_monday(request: Request):
 
         # 1) challenge d’enregistrement
         if isinstance(payload, dict) and "challenge" in payload:
-            logger.info("[WEBHOOK] responding to challenge")
             return JSONResponse(content={"challenge": payload["challenge"]})
 
         # 2) évènement normal
@@ -127,10 +114,7 @@ async def quote_from_monday(request: Request):
         formula_cols = _safe_json_loads(settings.FORMULA_COLUMN_IDS_JSON, default={}) or {}
         link_columns = _safe_json_loads(settings.LINK_COLUMN_IDS_JSON, default={}) or {}
         if acompte_num not in formula_cols or acompte_num not in link_columns:
-            raise HTTPException(
-                status_code=500,
-                detail=f"FORMULA_COLUMN_IDS_JSON/LINK_COLUMN_IDS_JSON sans clé '{acompte_num}'.",
-            )
+            raise HTTPException(status_code=500, detail=f"FORMULA_COLUMN_IDS_JSON/LINK_COLUMN_IDS_JSON sans clé '{acompte_num}'.")
 
         needed_cols = [
             settings.EMAIL_COLUMN_ID,
@@ -145,12 +129,13 @@ async def quote_from_monday(request: Request):
         cols = m.get_item_columns(item_id, needed_cols)
         logger.info(f"[MONDAY] item_id={item_id} values={cols}")
 
-        email = cols.get(settings.EMAIL_COLUMN_ID, "") or ""
-        address = cols.get(settings.ADDRESS_COLUMN_ID, "") or ""
+        email       = cols.get(settings.EMAIL_COLUMN_ID, "") or ""
+        address     = cols.get(settings.ADDRESS_COLUMN_ID, "") or ""
         description = cols.get(settings.DESCRIPTION_COLUMN_ID, "") or ""
+        item_name   = (cols.get("name", "") or "Client Energyz").strip()
 
         # ---------- MONTANT ----------
-        formula_id = formula_cols[acompte_num]
+        formula_id  = formula_cols[acompte_num]
         acompte_txt = _clean_number_text(cols.get(formula_id, ""))
 
         if float(acompte_txt or "0") <= 0:
@@ -169,74 +154,58 @@ async def quote_from_monday(request: Request):
         if amount_cents <= 0:
             raise HTTPException(status_code=400, detail=f"Montant invalide après parsing: '{acompte_txt}'.")
 
-        # ---------- IBAN / KEY forcés ----------
+        # ---------- IBAN / KEY ----------
         forced_iban = (os.getenv("FORCED_IBAN") or getattr(settings, "FORCED_IBAN", "") or "").strip()
-        forced_key = (os.getenv("FORCED_PAYPLUG_KEY") or getattr(settings, "FORCED_PAYPLUG_KEY", "") or "").strip()
+        forced_key  = (os.getenv("FORCED_PAYPLUG_KEY") or getattr(settings, "FORCED_PAYPLUG_KEY", "") or "").strip()
 
         if forced_iban:
             iban = forced_iban
-            logger.info(f"[IBAN] FORCED_IBAN utilisé: '{iban}'")
         else:
             iban = (cols.get(settings.IBAN_FORMULA_COLUMN_ID, "") or "").strip()
             if not iban:
                 iban_by_status = _safe_json_loads(getattr(settings, "IBAN_BY_STATUS_JSON", None), default={}) or {}
                 business_col_id = getattr(settings, "BUSINESS_STATUS_COLUMN_ID", "color_mkwnxf1h")
-                business_label = (cols.get(business_col_id, "") or "").strip()
+                business_label  = (cols.get(business_col_id, "") or "").strip()
                 if business_label and business_label in iban_by_status:
                     iban = iban_by_status[business_label]
             if not iban:
                 raise HTTPException(status_code=400, detail="IBAN introuvable (ni FORCED_IBAN, ni formula, ni mapping Business Line).")
 
-        # ---------- Sélection de la clé PayPlug ----------
         if forced_key:
             api_key = forced_key
-            logger.info("[PAYPLUG] FORCED_PAYPLUG_KEY utilisée.")
         else:
             api_key = _choose_api_key(iban)
             if not api_key:
                 raise HTTPException(
                     status_code=400,
-                    detail=(
-                        f"Aucune clé PayPlug pour IBAN '{iban}'. "
-                        f"Soit définis FORCED_PAYPLUG_KEY, soit poses PAYPLUG_TEST_KEY_EZDIVERS / "
-                        f"PAYPLUG_LIVE_KEY_EZDIVERS selon le mode."
-                    ),
+                    detail=f"Aucune clé PayPlug pour IBAN '{iban}'. "
+                           f"Soit définis FORCED_PAYPLUG_KEY, soit poses PAYPLUG_* selon le mode.",
                 )
 
         # ---------- Création paiement ----------
-        client_name = cols.get("name", "Client Energyz")
-        metadata = {
-            "item_id": str(item_id),
-            "acompte": acompte_num,
-            "description": description or f"Acompte {acompte_num}",
-        }
-
+        desc = (description or f"{item_name} — Acompte {acompte_num}").strip()
         payment_url = create_payment(
             api_key=api_key,
             amount_cents=amount_cents,
             email=email,
             address=address,
-            client_name=client_name,
-            metadata=metadata,
+            client_name=item_name,
+            metadata={
+                "item_id": str(item_id),
+                "item_name": item_name,
+                "acompte": acompte_num,
+                "description": desc,
+                "source": "energyz-monday",
+            },
         )
+        if not payment_url:
+            raise HTTPException(status_code=500, detail="URL PayPlug manquante dans la réponse.")
 
-        # Lien PayPlug dans la colonne lien
+        # 👉 On pose UNIQUEMENT le lien ; AUCUN changement de statut ici
         m.set_link_in_column(item_id, link_columns[acompte_num], payment_url, f"Payer acompte {acompte_num}")
 
-        # Statut neutre optionnel : si le label n’existe pas, on ignore
-        status_on_create = _safe_json_loads(getattr(settings, "STATUS_ON_CREATE_JSON", None), default={}) or {}
-        next_status = status_on_create.get(acompte_num)  # None si non configuré
-        if next_status:
-            _set_status_safe(item_id, getattr(settings, "STATUS_COLUMN_ID", "status"), next_status)
-
         logger.info(f"[OK] item={item_id} acompte={acompte_num} amount_cents={amount_cents} url={payment_url}")
-        return {
-            "status": "ok",
-            "item_id": item_id,
-            "acompte": acompte_num,
-            "amount_cents": amount_cents,
-            "payment_url": payment_url,
-        }
+        return {"status": "ok", "item_id": item_id, "acompte": acompte_num, "amount_cents": amount_cents, "payment_url": payment_url}
 
     except HTTPException as e:
         logger.error(f"[HTTP] {e.status_code} {e.detail}")
@@ -246,7 +215,7 @@ async def quote_from_monday(request: Request):
         raise HTTPException(status_code=500, detail=f"Erreur webhook Monday : {e}")
 
 
-# -------------------- PayPlug -> Webhook paiement réussi --------------------
+# -------------------- PayPlug -> Webhook paiement réussi (POSE LE STATUT PAYÉ) --------------------
 @app.post("/payplug/webhook")
 async def payplug_webhook(request: Request):
     try:
@@ -263,7 +232,7 @@ async def payplug_webhook(request: Request):
 
         event_type = payload.get("type") or payload.get("event") or ""
         data = payload.get("data") or {}
-        obj = data.get("object") or data or payload.get("object") or {}
+        obj  = data.get("object") or data or payload.get("object") or {}
 
         meta = obj.get("metadata")
         metadata = _as_dict(meta) if meta else _as_dict(payload.get("metadata"))
@@ -284,22 +253,22 @@ async def payplug_webhook(request: Request):
             logger.error(f"[PP-WEBHOOK] metadata incomplète: item_id={item_id} acompte={acompte}")
             return JSONResponse({"ok": False, "error": "bad_metadata"}, status_code=200)
 
-        _mark_paid(int(item_id), acompte)
+        # ➜ Pose “Payé acompte X”
+        status_after = _safe_json_loads(getattr(settings, "STATUS_AFTER_PAY_JSON", None), default={}) or {}
+        label = status_after.get(acompte, f"Payé acompte {acompte}")
+        _set_status_safe(int(item_id), getattr(settings, "STATUS_COLUMN_ID", "status"), label)
+
         return JSONResponse({"ok": True})
 
     except Exception as e:
         logger.exception(f"[PP-WEBHOOK] EXCEPTION {e}")
-        # Toujours 200 pour éviter les retries agressifs
         return JSONResponse({"ok": False}, status_code=200)
 
 
 # -------------------- Fallback admin (test manuel) --------------------
 @app.get("/payplug/mark_paid")
 def mark_paid(item_id: int, acompte: str, token: str):
-    """
-    Marque payé via URL (pour test manuel / secours).
-    Protéger avec env ADMIN_HOOK_TOKEN.
-    """
+    """Marque payé via URL (pour test manuel) — protégé par ADMIN_HOOK_TOKEN."""
     admin_token = (os.getenv("ADMIN_HOOK_TOKEN") or "").strip()
     if not admin_token or token != admin_token:
         raise HTTPException(status_code=403, detail="Forbidden")
@@ -307,5 +276,7 @@ def mark_paid(item_id: int, acompte: str, token: str):
     if acompte not in ("1", "2"):
         raise HTTPException(status_code=400, detail="acompte doit être '1' ou '2'")
 
-    _mark_paid(item_id, acompte)
+    status_after = _safe_json_loads(getattr(settings, "STATUS_AFTER_PAY_JSON", None), default={}) or {}
+    label = status_after.get(acompte, f"Payé acompte {acompte}")
+    _set_status_safe(int(item_id), getattr(settings, "STATUS_COLUMN_ID", "status"), label)
     return {"ok": True, "item_id": item_id, "acompte": acompte}
