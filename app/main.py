@@ -357,51 +357,109 @@ async def quote_from_monday(request: Request):
 # -------------------- PayPlug -> Webhook (pose le statut payé) --------------------
 @app.post("/payplug/webhook")
 async def payplug_webhook(request: Request):
+    """
+    Webhook PayPlug tolérant :
+    - Accepte plusieurs structures ('data.object', 'data.payment', 'data.resource', ou top-level).
+    - Détecte le paiement réussi via type, status ou is_paid/paid/paid_at.
+    - Récupère metadata même si elle est sous 'metadata.custom' ou string JSON.
+    - Accepte item_id/acompte sous plusieurs clés (item_id, itemId, monday_item_id / acompte, deposit, deposit_number).
+    """
     try:
-        payload = await request.json()
-        logger.info(f"[PP-WEBHOOK] payload={payload}")
+        raw = await request.body()
+        raw_txt = raw.decode("utf-8", errors="ignore")
+        try:
+            payload = json.loads(raw_txt) if raw_txt else {}
+        except Exception:
+            payload = {}
+        logger.info(f"[PP-WEBHOOK] raw={raw_txt}")
 
         def _as_dict(x):
             if isinstance(x, dict):
                 return x
-            try:
-                return json.loads(x) if isinstance(x, str) else {}
-            except Exception:
-                return {}
+            if isinstance(x, str):
+                try:
+                    return json.loads(x)
+                except Exception:
+                    return {}
+            return {}
 
-        event_type = payload.get("type") or payload.get("event") or ""
-        data = payload.get("data") or {}
-        obj  = data.get("object") or data or payload.get("object") or {}
+        # 1) Event type
+        event_type = (payload.get("type") or payload.get("event") or "").strip().lower()
 
-        meta = obj.get("metadata")
-        metadata = _as_dict(meta) if meta else _as_dict(payload.get("metadata"))
+        # 2) Trouver l'objet paiement selon différentes variantes PayPlug
+        data = _as_dict(payload.get("data"))
+        candidates = [
+            _as_dict(data.get("object")),
+            _as_dict(data.get("payment")),
+            _as_dict(data.get("resource")),
+            _as_dict(payload.get("object")),
+            _as_dict(payload.get("payment")),
+            _as_dict(payload.get("resource")),
+            _as_dict(payload),  # fallback
+        ]
+        obj = next((c for c in candidates if c), {})
 
-        status = (obj.get("status") or "").lower()
-        is_paid_flag = bool(obj.get("is_paid") or obj.get("paid") or obj.get("paid_at"))
+        # 3) Déterminer "paid"
+        status = str(obj.get("status") or obj.get("payment_status") or "").lower()
+        paid_flags = bool(obj.get("is_paid") or obj.get("paid") or obj.get("paid_at"))
         paid_like = (
             event_type in {"payment.succeeded", "charge.succeeded", "payment_paid", "payment.success"} or
             status in {"paid", "succeeded", "succeeded_pending"} or
-            is_paid_flag
+            paid_flags
         )
         if not paid_like:
+            logger.info(f"[PP-WEBHOOK] ignored event: type={event_type} status={status} flags={paid_flags}")
             return JSONResponse({"ok": True, "ignored": True})
 
-        item_id = metadata.get("item_id")
-        acompte = metadata.get("acompte")
+        # 4) Récupérer metadata (plusieurs formes possibles)
+        meta = obj.get("metadata")
+        md = _as_dict(meta)
+        if not md and isinstance(meta, dict) and "custom" in meta:
+            md = _as_dict(meta.get("custom"))
+        if not md:
+            md = _as_dict(payload.get("metadata"))
+
+        # Certains comptes PayPlug mettent les infos client sous 'metadata.custom'
+        if isinstance(md, dict) and "custom" in md and isinstance(md["custom"], dict):
+            md = md["custom"]
+
+        # 5) Normaliser les clés attendues
+        item_id = (
+            md.get("item_id") or
+            md.get("itemId") or
+            md.get("monday_item_id") or
+            md.get("mondayItemId")
+        )
+        acompte = (
+            md.get("acompte") or
+            md.get("deposit") or
+            md.get("deposit_number") or
+            md.get("depositNumber")
+        )
+        if item_id is not None:
+            item_id = str(item_id)
+        if acompte is not None:
+            acompte = str(acompte)
+
         if not item_id or acompte not in ("1", "2"):
-            logger.error("[PP-WEBHOOK] metadata incomplète: item_id=%s acompte=%s", item_id, acompte)
+            logger.error(f"[PP-WEBHOOK] bad_metadata md={md} (item_id={item_id}, acompte={acompte})")
             return JSONResponse({"ok": False, "error": "bad_metadata"}, status_code=200)
 
+        # 6) Libellé à appliquer
         status_after = _safe_json_loads(getattr(settings, "STATUS_AFTER_PAY_JSON", None), default={}) or {}
         label = status_after.get(acompte, f"Payé acompte {acompte}")
 
-        _set_status_force(int(item_id), getattr(settings, "STATUS_COLUMN_ID", "status"), label)
+        # 7) Mise à jour Monday (triple fallback)
+        col_id = getattr(settings, "STATUS_COLUMN_ID", "status")
+        _set_status_force(int(item_id), col_id, label)
 
+        logger.info(f"[PP-WEBHOOK] DONE item={item_id} acompte={acompte} label={label}")
         return JSONResponse({"ok": True})
 
     except Exception as e:
         logger.exception(f"[PP-WEBHOOK] EXCEPTION {e}")
         return JSONResponse({"ok": False}, status_code=200)
+
 
 
 # -------------------- Diag + Fallback admin --------------------
