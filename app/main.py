@@ -12,7 +12,8 @@ from . import monday as m
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("energyz")
 
-app = FastAPI(title="Energyz PayPlug API", version="2.8 (stable webhook + status index fallback)")
+app = FastAPI(title="Energyz PayPlug API", version="2.9 (fix webhook status via change_column_value + labels fetch)")
+
 
 # -------------------- Utils --------------------
 def _safe_json_loads(s, default=None):
@@ -25,6 +26,7 @@ def _safe_json_loads(s, default=None):
     except Exception:
         return default
 
+
 def _clean_number_text(s: str) -> str:
     if not s:
         return "0"
@@ -32,6 +34,7 @@ def _clean_number_text(s: str) -> str:
     s = s.replace(",", ".")
     mch = re.search(r"[-+]?\d*\.?\d+", s)
     return mch.group(0) if mch else "0"
+
 
 def _extract_status_label(value_json: dict) -> str:
     if not isinstance(value_json, dict):
@@ -44,6 +47,7 @@ def _extract_status_label(value_json: dict) -> str:
     v = value_json.get("value")
     return str(v or "").strip()
 
+
 # -------------------- Monday GraphQL helpers (fallbacks) --------------------
 def _monday_headers():
     token = getattr(settings, "MONDAY_API_TOKEN", None) or os.getenv("MONDAY_API_TOKEN") \
@@ -55,11 +59,13 @@ def _monday_headers():
         "Content-Type": "application/json",
     }
 
+
 def _monday_board_id() -> int:
     v = getattr(settings, "MONDAY_BOARD_ID", None) or os.getenv("MONDAY_BOARD_ID")
     if not v:
         raise RuntimeError("MONDAY_BOARD_ID manquant")
     return int(v)
+
 
 def _monday_graphql(query: str, variables: dict) -> dict:
     import requests
@@ -70,9 +76,11 @@ def _monday_graphql(query: str, variables: dict) -> dict:
         logger.error("[MONDAY][GQL] code=%s data=%s", resp.status_code, data)
     return data
 
+
 def _monday_change_status_by_label(item_id: int, column_id: str, label: str) -> bool:
     """
-    Tentative GraphQL avec {"label":"..."}.
+    Utilise change_column_value avec value=JSON (stringifié) -> {"label": "..."}.
+    Plus robuste que change_simple_column_value sur la colonne Status.
     """
     try:
         board_id = _monday_board_id()
@@ -81,28 +89,34 @@ def _monday_change_status_by_label(item_id: int, column_id: str, label: str) -> 
         return False
 
     query = """
-      mutation ($board_id:Int!, $item_id:Int!, $column_id:String!, $value: JSON!) {
-        change_simple_column_value(board_id:$board_id, item_id:$item_id, column_id:$column_id, value:$value) { id }
+      mutation ($board_id: ID!, $item_id: ID!, $column_id: String!, $value: JSON!) {
+        change_column_value(
+          board_id: $board_id,
+          item_id: $item_id,
+          column_id: $column_id,
+          value: $value
+        ) { id }
       }
     """
-    value = {"label": label}
+    value_json = json.dumps({"label": label}, ensure_ascii=False)
     data = _monday_graphql(query, {
-        "board_id": board_id,
-        "item_id": int(item_id),
+        "board_id": str(board_id),
+        "item_id": str(item_id),
         "column_id": column_id,
-        "value": json.dumps(value),
+        "value": value_json,
     })
-    ok = bool(data.get("data") and data["data"].get("change_simple_column_value"))
+    ok = bool(data.get("data") and data["data"].get("change_column_value"))
     if ok:
-        logger.info("[MONDAY][LABEL] OK item=%s label='%s'", item_id, label)
+        logger.info("[MONDAY][LABEL->change_column_value] OK item=%s label='%s'", item_id, label)
     else:
-        logger.warning("[MONDAY][LABEL] FAIL item=%s label='%s'", item_id, label)
+        logger.warning("[MONDAY][LABEL->change_column_value] FAIL item=%s label='%s' data=%s", item_id, label, data)
     return ok
+
 
 def _monday_fetch_status_labels_map(column_id: str) -> dict:
     """
-    FIX CRITIQUE: Passer l'ID de colonne en **variable** ([String!]) pour récupérer correctement
-    settings_str.labels. Avant, l'ID était injecté sans guillemets et la requête retournait vide.
+    FIX: passer l'ID de colonne en VARIABLE ([String!]) pour récupérer correctement
+    settings_str.labels { "0":"...", "1":"Payé acompte 1", ... }.
     """
     try:
         board_id = _monday_board_id()
@@ -127,12 +141,14 @@ def _monday_fetch_status_labels_map(column_id: str) -> dict:
         logger.error("[MONDAY] parse settings_str error: %s", e)
         return {}
 
+
 def _monday_change_status_by_index(item_id: int, column_id: str, wanted_label: str) -> bool:
     """
-    Si le set par label échoue, on trouve l'index exact et on met {"index": n}.
+    Résout l'index via settings_str.labels puis change_column_value avec {"index": n}.
     """
     labels_map = _monday_fetch_status_labels_map(column_id)
     if not labels_map:
+        logger.error("[MONDAY] labels_map vide pour column_id=%s", column_id)
         return False
 
     wanted_norm = (wanted_label or "").strip().lower()
@@ -142,7 +158,7 @@ def _monday_change_status_by_index(item_id: int, column_id: str, wanted_label: s
             idx = int(k)
             break
     if idx is None:
-        logger.error("[MONDAY] label '%s' introuvable dans settings_str: %s", wanted_label, labels_map)
+        logger.error("[MONDAY] label '%s' introuvable dans %s", wanted_label, labels_map)
         return False
 
     try:
@@ -152,32 +168,38 @@ def _monday_change_status_by_index(item_id: int, column_id: str, wanted_label: s
         return False
 
     query = """
-      mutation ($board_id:Int!, $item_id:Int!, $column_id:String!, $value: JSON!) {
-        change_simple_column_value(board_id:$board_id, item_id:$item_id, column_id:$column_id, value:$value) { id }
+      mutation ($board_id: ID!, $item_id: ID!, $column_id: String!, $value: JSON!) {
+        change_column_value(
+          board_id: $board_id,
+          item_id: $item_id,
+          column_id: $column_id,
+          value: $value
+        ) { id }
       }
     """
-    value = {"index": idx}
+    value_json = json.dumps({"index": idx}, ensure_ascii=False)
     data = _monday_graphql(query, {
-        "board_id": board_id,
-        "item_id": int(item_id),
+        "board_id": str(board_id),
+        "item_id": str(item_id),
         "column_id": column_id,
-        "value": json.dumps(value),
+        "value": value_json,
     })
-    ok = bool(data.get("data") and data["data"].get("change_simple_column_value"))
+    ok = bool(data.get("data") and data["data"].get("change_column_value"))
     if ok:
-        logger.info("[MONDAY][INDEX] OK item=%s index=%s label='%s'", item_id, idx, wanted_label)
+        logger.info("[MONDAY][INDEX->change_column_value] OK item=%s index=%s label='%s'", item_id, idx, wanted_label)
     else:
-        logger.error("[MONDAY][INDEX] FAIL item=%s index=%s", item_id, idx)
+        logger.error("[MONDAY][INDEX->change_column_value] FAIL item=%s index=%s data=%s", item_id, idx, data)
     return ok
+
 
 def _set_status_force(item_id: int, column_id: str, label: str):
     """
     Triple fallback :
       1) wrapper m.set_status
-      2) GraphQL {"label": "..."}
-      3) GraphQL {"index": n} (résolution via settings_str)
+      2) change_column_value {"label": "..."}
+      3) change_column_value {"index": n}
     """
-    # 1) Wrapper
+    # 1) Wrapper officiel
     try:
         m.set_status(item_id, column_id, label)
         logger.info("[MONDAY][WRAPPER] OK item=%s label='%s'", item_id, label)
@@ -192,14 +214,17 @@ def _set_status_force(item_id: int, column_id: str, label: str):
     # 3) Index
     _monday_change_status_by_index(item_id, column_id, label)
 
+
 # -------------------- Health/Ping --------------------
 @app.get("/")
 def root():
     return {"status": "ok", "service": "energyz-payplug-api", "version": app.version}
 
+
 @app.get("/quote/from_monday")
 def from_monday_ping():
     return {"ok": True}
+
 
 # -------------------- Monday -> création du lien (statut inchangé) --------------------
 @app.post("/quote/from_monday")
@@ -315,7 +340,6 @@ async def quote_from_monday(request: Request):
         if not payment_url:
             raise HTTPException(status_code=500, detail="URL PayPlug manquante.")
 
-        link_columns = _safe_json_loads(settings.LINK_COLUMN_IDS_JSON, default={}) or {}
         m.set_link_in_column(item_id, link_columns[acompte_num], payment_url, f"Payer acompte {acompte_num}")
 
         logger.info(f"[OK] item={item_id} acompte={acompte_num} amount_cents={amount_cents} url={payment_url}")
@@ -327,6 +351,7 @@ async def quote_from_monday(request: Request):
     except Exception as e:
         logger.exception(f"[EXCEPTION] {e}")
         raise HTTPException(status_code=500, detail=f"Erreur webhook Monday : {e}")
+
 
 # -------------------- PayPlug -> Webhook (pose le statut payé) --------------------
 @app.post("/payplug/webhook")
@@ -377,6 +402,7 @@ async def payplug_webhook(request: Request):
         logger.exception(f"[PP-WEBHOOK] EXCEPTION {e}")
         return JSONResponse({"ok": False}, status_code=200)
 
+
 # -------------------- Diag + Fallback admin --------------------
 @app.get("/payplug/mark_paid")
 def mark_paid(item_id: int, acompte: str, token: str):
@@ -390,6 +416,7 @@ def mark_paid(item_id: int, acompte: str, token: str):
     label = status_after.get(acompte, f"Payé acompte {acompte}")
     _set_status_force(int(item_id), getattr(settings, "STATUS_COLUMN_ID", "status"), label)
     return {"ok": True, "item_id": item_id, "acompte": acompte}
+
 
 @app.get("/diag/monday/status")
 def diag_status(item_id: int, label: str, token: str):
