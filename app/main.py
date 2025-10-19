@@ -12,7 +12,7 @@ from . import monday as m
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("energyz")
 
-app = FastAPI(title="Energyz PayPlug API", version="2.6 (FORCED_IBAN/KEY + prefills)")
+app = FastAPI(title="Energyz PayPlug API", version="2.7 (FORCED_IBAN/KEY + prefills + webhook)")
 
 # -------------------- Utils --------------------
 def _safe_json_loads(s, default=None):
@@ -56,7 +56,7 @@ def root():
 def from_monday_ping():
     return {"ok": True}
 
-# -------------------- Webhook --------------------
+# -------------------- Monday -> création lien --------------------
 @app.post("/quote/from_monday")
 async def quote_from_monday(request: Request):
     try:
@@ -209,3 +209,46 @@ async def quote_from_monday(request: Request):
     except Exception as e:
         logger.exception(f"[EXCEPTION] {e}")
         raise HTTPException(status_code=500, detail=f"Erreur webhook Monday : {e}")
+
+# -------------------- PayPlug -> Webhook paiement réussi (optionnel) --------------------
+@app.post("/payplug/webhook")
+async def payplug_webhook(request: Request):
+    try:
+        payload = await request.json()
+        logger.info(f"[PP-WEBHOOK] payload={payload}")
+
+        event_type = payload.get("type")
+        data = payload.get("data") or {}
+        payment = data.get("object") or data or {}
+        meta_raw = payment.get("metadata") if isinstance(payment, dict) else None
+        try:
+            metadata = json.loads(meta_raw) if isinstance(meta_raw, str) else (meta_raw or {})
+        except Exception:
+            metadata = meta_raw or {}
+
+        status = (payment.get("status") or "").lower()
+        is_paid_flag = bool(payment.get("is_paid"))
+        paid_like = event_type in {"payment.succeeded", "charge.succeeded", "payment_paid"} or \
+                    status in {"paid", "succeeded"} or \
+                    is_paid_flag
+        if not paid_like:
+            return JSONResponse({"ok": True, "ignored": True})
+
+        item_id = metadata.get("item_id")
+        acompte = metadata.get("acompte")
+        if item_id and acompte in ("1", "2"):
+            status_after = _safe_json_loads(getattr(settings, "STATUS_AFTER_PAY_JSON", None), default={}) or {}
+            next_status = status_after.get(acompte, f"Payé acompte {acompte}")
+            try:
+                m.set_status(int(item_id), getattr(settings, "STATUS_COLUMN_ID", "status"), next_status)
+                logger.info(f"[PP-WEBHOOK] set_status OK item_id={item_id} -> '{next_status}'")
+            except Exception as e:
+                logger.exception(f"[PP-WEBHOOK] set_status FAILED item_id={item_id}: {e}")
+                return JSONResponse({"ok": False, "error": "monday_update_failed"}, status_code=200)
+
+        return JSONResponse({"ok": True})
+
+    except Exception as e:
+        logger.exception(f"[PP-WEBHOOK] EXCEPTION {e}")
+        # Toujours 200 pour éviter les retries agressifs
+        return JSONResponse({"ok": False}, status_code=200)
