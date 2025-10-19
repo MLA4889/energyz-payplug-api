@@ -86,8 +86,8 @@ def create_payment(api_key: str,
                    metadata: dict | None) -> str:
     """
     Crée un paiement PayPlug 'hébergé' (lien) en PRÉREMPLISSANT toujours Nom/Prénom/E-mail :
-      - si email Monday absent/incorrect, alias stable: paiement+{item_id}@energyz.fr
-      - le champ e-mail reste ÉDITABLE sur la page PayPlug (le payeur peut mettre son e-mail de reçu)
+      - si email absent/incorrect, alias stable: paiement+{item_id}@energyz.fr
+      - le champ e-mail reste éditable sur la page PayPlug si PayPlug l’affiche (selon leurs UX)
     Conserve la structure existante pour ne pas casser les intégrations.
     """
     if not api_key:
@@ -108,19 +108,14 @@ def create_payment(api_key: str,
     first_name, last_name = _split_name(client_name or "")
     item_id = str((metadata or {}).get("item_id", "0"))
 
-    # 1) email Monday si présent
     alias_email = (email or "").strip()
-    # 2) si vide/invalide -> alias sûr
     if not _valid_email(alias_email):
         alias_email = _safe_alias_email(client_name, item_id)
-    # 3) filet ultime
     if not _valid_email(alias_email):
         alias_email = "paiement@energyz.fr"
 
-    # 🔔 Ajout d'une mention pour inciter à renseigner son e-mail de reçu
     base_desc = (metadata or {}).get("description") or f"Paiement acompte { (metadata or {}).get('acompte','?') } — {client_name or 'Client Energyz'}"
-    hint = " • Merci de vérifier/indiquer votre e-mail pour recevoir le reçu."
-    description = (base_desc + hint)[:255]
+    description = base_desc[:255]
 
     payload = {
         "amount": int(amount_cents or 0),
@@ -132,7 +127,7 @@ def create_payment(api_key: str,
         "metadata": metadata or {},
         "description": description,
         "customer": {
-            "email": alias_email,       # pré-rempli mais EDITABLE côté PayPlug
+            "email": alias_email,
             "first_name": first_name,
             "last_name": last_name,
         },
