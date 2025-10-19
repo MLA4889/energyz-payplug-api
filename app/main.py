@@ -145,10 +145,7 @@ async def quote_from_monday(request: Request):
             if float(total_ht_txt) > 0:
                 acompte_txt = str(float(total_ht_txt) / 2.0)
             else:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Montant introuvable (formula + recalcul + total HT vides).",
-                )
+                raise HTTPException(status_code=400, detail="Montant introuvable (formula + recalcul + total HT vides).")
 
         amount_cents = cents_from_str(acompte_txt)
         if amount_cents <= 0:
@@ -172,10 +169,7 @@ async def quote_from_monday(request: Request):
                 if business_label and business_label in iban_by_status:
                     iban = iban_by_status[business_label]
             if not iban:
-                raise HTTPException(
-                    status_code=400,
-                    detail="IBAN introuvable (ni FORCED_IBAN, ni formula, ni mapping Business Line).",
-                )
+                raise HTTPException(status_code=400, detail="IBAN introuvable (ni FORCED_IBAN, ni formula, ni mapping Business Line).")
 
         # ---------- Sélection de la clé PayPlug ----------
         if forced_key:
@@ -210,11 +204,13 @@ async def quote_from_monday(request: Request):
             metadata=metadata,
         )
 
-        # lien + statut
+        # lien + statut (⚠️ NE PAS mettre “Payé …” ici)
         m.set_link_in_column(item_id, link_columns[acompte_num], payment_url, f"Payer acompte {acompte_num}")
-        status_after = _safe_json_loads(settings.STATUS_AFTER_PAY_JSON, default={}) or {}
-        next_status = status_after.get(acompte_num, f"Payé acompte {acompte_num}")
-        m.set_status(item_id, settings.STATUS_COLUMN_ID, next_status)
+
+        # Nouveau : statut neutre à la création ; "Payé ..." sera posé par le webhook PayPlug
+        status_on_create = _safe_json_loads(getattr(settings, "STATUS_ON_CREATE_JSON", None), default={}) or {}
+        next_status = status_on_create.get(acompte_num, f"Lien acompte {acompte_num} envoyé")
+        m.set_status(item_id, getattr(settings, "STATUS_COLUMN_ID", "status"), next_status)
 
         logger.info(f"[OK] item={item_id} acompte={acompte_num} amount_cents={amount_cents} url={payment_url}")
         return {
