@@ -340,6 +340,7 @@ async def quote_from_monday(request: Request):
         if not payment_url:
             raise HTTPException(status_code=500, detail="URL PayPlug manquante.")
 
+        link_columns = _safe_json_loads(settings.LINK_COLUMN_IDS_JSON, default={}) or {}
         m.set_link_in_column(item_id, link_columns[acompte_num], payment_url, f"Payer acompte {acompte_num}")
 
         logger.info(f"[OK] item={item_id} acompte={acompte_num} amount_cents={amount_cents} url={payment_url}")
