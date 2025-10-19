@@ -10,13 +10,14 @@ from .monday import (
     get_item_columns,
     set_link_in_column,
     set_status,
-    compute_formula_value_for_item,
+    compute_formula_value_for_item,   # (numérique)
+    compute_formula_text_for_item,    # <<< NOUVEAU : texte (ex. IBAN)
 )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("energyz")
 
-app = FastAPI(title="Energyz PayPlug API", version="2.0 (destrat+ping+challenge)")
+app = FastAPI(title="Energyz PayPlug API", version="2.2 (iban-formula+fallback+challenge)")
 
 # -------------------- Utils --------------------
 def _safe_json_loads(s, default=None):
@@ -53,12 +54,11 @@ def _extract_status_label(value_json: dict) -> str:
 def root():
     return {"status": "ok", "service": "energyz-payplug-api", "version": app.version}
 
-# GET ping sur la même route pour que Monday valide l’URL
 @app.get("/quote/from_monday")
 def from_monday_ping():
     return {"ok": True}
 
-# -------------------- Webhook principal --------------------
+# -------------------- Webhook --------------------
 @app.post("/quote/from_monday")
 async def quote_from_monday(request: Request):
     try:
@@ -66,14 +66,12 @@ async def quote_from_monday(request: Request):
         payload = _safe_json_loads(raw.decode("utf-8", errors="ignore"), default={}) or {}
         logger.info(f"[WEBHOOK] payload={payload}")
 
-        # 1) Phase d'enregistrement du webhook (challenge)
-        # Monday appelle en POST avec {"challenge":"..."} -> il faut renvoyer le même champ.
+        # Challenge d’enregistrement du webhook
         if isinstance(payload, dict) and "challenge" in payload:
-            challenge = payload["challenge"]
             logger.info("[WEBHOOK] responding to challenge")
-            return JSONResponse(content={"challenge": challenge})
+            return JSONResponse(content={"challenge": payload["challenge"]})
 
-        # 2) Appel normal avec event.*
+        # Appel normal
         event = payload.get("event") or {}
         item_id = event.get("pulseId") or event.get("itemId")
         if not item_id:
@@ -100,16 +98,18 @@ async def quote_from_monday(request: Request):
         if acompte_num not in ("1", "2"):
             raise HTTPException(status_code=400, detail="Label status non reconnu pour acompte 1/2.")
 
+        # Colonnes → formule & lien correspondants
         formula_cols = _safe_json_loads(settings.FORMULA_COLUMN_IDS_JSON, default={}) or {}
         link_columns = _safe_json_loads(settings.LINK_COLUMN_IDS_JSON, default={}) or {}
         if acompte_num not in formula_cols or acompte_num not in link_columns:
             raise HTTPException(status_code=500, detail=f"FORMULA_COLUMN_IDS_JSON/LINK_COLUMN_IDS_JSON sans clé '{acompte_num}'.")
 
+        # Lecture de base des colonnes (rapide)
         needed_cols = [
             settings.EMAIL_COLUMN_ID,
             settings.ADDRESS_COLUMN_ID,
             settings.DESCRIPTION_COLUMN_ID,
-            settings.IBAN_FORMULA_COLUMN_ID,
+            settings.IBAN_FORMULA_COLUMN_ID,     # peut être vide côté UI
             settings.QUOTE_AMOUNT_FORMULA_ID,
             formula_cols[acompte_num],
             getattr(settings, "BUSINESS_STATUS_COLUMN_ID", "color_mkwnxf1h"),
@@ -118,12 +118,19 @@ async def quote_from_monday(request: Request):
         cols = get_item_columns(item_id, needed_cols)
         logger.info(f"[MONDAY] item_id={item_id} values={cols}")
 
-        email = cols.get(settings.EMAIL_COLUMN_ID, "") or ""
-        address = cols.get(settings.ADDRESS_COLUMN_ID, "") or ""
+        email       = cols.get(settings.EMAIL_COLUMN_ID, "") or ""
+        address     = cols.get(settings.ADDRESS_COLUMN_ID, "") or ""
         description = cols.get(settings.DESCRIPTION_COLUMN_ID, "") or ""
-        iban = cols.get(settings.IBAN_FORMULA_COLUMN_ID, "") or ""
+        iban        = (cols.get(settings.IBAN_FORMULA_COLUMN_ID, "") or "").strip()
 
-        formula_id = formula_cols[acompte_num]
+        # ===== IBAN via FORMULE (prioritaire) =====
+        if not iban:
+            iban = (compute_formula_text_for_item(settings.IBAN_FORMULA_COLUMN_ID, int(item_id)) or "").strip()
+            if iban:
+                logger.info(f"[IBAN] obtenu via formula API = '{iban}'")
+
+        # --- Montant acompte (formule -> recompute -> 50% total) ---
+        formula_id  = formula_cols[acompte_num]
         acompte_txt = _clean_number_text(cols.get(formula_id, ""))
 
         if float(acompte_txt or "0") <= 0:
@@ -142,14 +149,23 @@ async def quote_from_monday(request: Request):
         if amount_cents <= 0:
             raise HTTPException(status_code=400, detail=f"Montant invalide après parsing: '{acompte_txt}'.")
 
+        # ===== Fallback IBAN via Business Line =====
         if not iban:
             iban_by_status = _safe_json_loads(getattr(settings, "IBAN_BY_STATUS_JSON", None), default={}) or {}
-            business_status_label = cols.get(getattr(settings, "BUSINESS_STATUS_COLUMN_ID", "color_mkwnxf1h"), "")
-            if business_status_label and business_status_label in iban_by_status:
-                iban = iban_by_status[business_status_label]
+            business_col_id = getattr(settings, "BUSINESS_STATUS_COLUMN_ID", "color_mkwnxf1h")
+            business_status_label = (cols.get(business_col_id, "") or "").strip()
+            logger.info(f"[IBAN] business_label='{business_status_label}' keys={list(iban_by_status.keys())}")
+            if business_status_label:
+                bl = business_status_label.lower()
+                for k, v in iban_by_status.items():
+                    if (k or "").strip().lower() == bl and v:
+                        iban = v.strip()
+                        break
+
         if not iban:
             raise HTTPException(status_code=400, detail="IBAN introuvable (formula vide + pas de fallback Business Line).")
 
+        # Sélection clé PayPlug
         api_key = _choose_api_key(iban)
         if not api_key:
             raise HTTPException(status_code=400, detail=f"Aucune clé PayPlug mappée pour IBAN '{iban}' (mode={settings.PAYPLUG_MODE}).")
