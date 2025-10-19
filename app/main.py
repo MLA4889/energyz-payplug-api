@@ -353,6 +353,111 @@ async def quote_from_monday(request: Request):
         logger.exception(f"[EXCEPTION] {e}")
         raise HTTPException(status_code=500, detail=f"Erreur webhook Monday : {e}")
 
+# --- Endpoint d'enregistrement automatique de webhooks PayPlug (ADMIN only) ---
+import os
+import json
+import requests
+from fastapi import Query
+
+@app.post("/payplug/register_webhook")
+def payplug_register_webhook(token: str = Query(..., description="ADMIN hook token")):
+    """
+    Endpoint ADMIN qui tente d'enregistrer un webhook 'payment.succeeded' vers:
+      https://energyz-payplug-api-2.onrender.com/payplug/webhook
+
+    Il parcourt toutes les clés PayPlug disponibles dans l'environnement et tente
+    d'ajouter le webhook pour chacune d'entre elles. Retourne un résumé par clé.
+    Usage:
+      /payplug/register_webhook?token=<ADMIN_HOOK_TOKEN>
+    """
+    admin_token = (os.getenv("ADMIN_HOOK_TOKEN") or "").strip()
+    if not admin_token or token != admin_token:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    target_url = os.getenv("PAYPLUG_WEBHOOK_URL", "https://energyz-payplug-api-2.onrender.com/payplug/webhook")
+    event_name = "payment.succeeded"
+
+    # Rassembler les clés candidates
+    keys = []
+
+    # 1) FORCED_PAYPLUG_KEY (utile pour testing)
+    forced = (os.getenv("FORCED_PAYPLUG_KEY") or "").strip()
+    if forced:
+        keys.append(("FORCED_PAYPLUG_KEY", forced))
+
+    # 2) Known explicit env keys (test + live common names)
+    for name in ["PAYPLUG_TEST_KEY_EZMAR", "PAYPLUG_TEST_KEY_EZDIVERS", "PAYPLUG_LIVE_KEY_EZMAR", "PAYPLUG_LIVE_KEY_EZDIVERS"]:
+        v = (os.getenv(name) or "").strip()
+        if v:
+            keys.append((name, v))
+
+    # 3) JSON mappings (test / live)
+    def _load_json_keys(envname):
+        raw = os.getenv(envname) or ""
+        try:
+            j = json.loads(raw) if raw else {}
+            if isinstance(j, dict):
+                # j may be { "IBAN": "sk_test_..." } or { "FR...":"sk_..." }
+                for k, val in j.items():
+                    if isinstance(val, str) and val.strip():
+                        keys.append((f"{envname}:{k}", val.strip()))
+        except Exception:
+            # ignore parse errors
+            pass
+
+    _load_json_keys("PAYPLUG_KEYS_TEST_JSON")
+    _load_json_keys("PAYPLUG_KEYS_LIVE_JSON")
+
+    # Dédupliquer par valeur (garder premier nom)
+    seen = set()
+    uniq = []
+    for name, k in keys:
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append((name, k))
+
+    if not uniq:
+        return {"ok": False, "error": "no_payplug_keys_found", "details": "Aucune clé PayPlug détectée dans les variables d'environnement."}
+
+    results = []
+    for name, key in uniq:
+        try:
+            url = "https://api.payplug.com/v1/webhooks"
+            headers = {
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+            }
+            payload = {"url": target_url, "event": event_name}
+
+            # On tente la création
+            resp = requests.post(url, headers=headers, json=payload, timeout=15)
+            status = resp.status_code
+            try:
+                resp_json = resp.json()
+            except Exception:
+                resp_json = {"text": resp.text}
+
+            entry = {"key_env": name, "status_code": status, "response": resp_json}
+
+            # PayPlug peut renvoyer 201/200 ou 409/422 si déjà existant ou autre.
+            if status in (200, 201):
+                entry["ok"] = True
+                entry["message"] = "webhook_created"
+            elif status in (400, 409, 422):
+                # 409 or 422 might indicate webhook already exists or bad payload.
+                entry["ok"] = False
+                entry["message"] = "not_created"
+            else:
+                entry["ok"] = False
+                entry["message"] = "error"
+
+            results.append(entry)
+        except Exception as e:
+            results.append({"key_env": name, "ok": False, "message": "exception", "error": str(e)})
+
+    return {"ok": True, "attempts": len(results), "results": results}
+
 
 # -------------------- PayPlug -> Webhook (pose le statut payé) --------------------
 @app.post("/payplug/webhook")
