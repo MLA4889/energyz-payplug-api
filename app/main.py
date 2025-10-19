@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import requests  # <— fallback GraphQL
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
@@ -12,7 +13,7 @@ from . import monday as m
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("energyz")
 
-app = FastAPI(title="Energyz PayPlug API", version="2.6 (status-only-on-webhook)")
+app = FastAPI(title="Energyz PayPlug API", version="2.6.1 (webhook-only + monday-fallback)")
 
 
 # -------------------- Utils --------------------
@@ -48,16 +49,69 @@ def _extract_status_label(value_json: dict) -> str:
     return str(v or "").strip()
 
 
+# -------------------- Monday status helpers --------------------
+def _monday_graphql_set_status(item_id: int, column_id: str, label: str) -> bool:
+    """
+    Fallback direct → API Monday GraphQL 'change_simple_column_value' avec label de statut.
+    Ne lève pas, renvoie True/False.
+    """
+    token = getattr(settings, "MONDAY_API_TOKEN", None) or os.getenv("MONDAY_API_TOKEN")
+    board_id = getattr(settings, "MONDAY_BOARD_ID", None) or os.getenv("MONDAY_BOARD_ID")
+    if not token or not board_id:
+        logger.error("[MONDAY][FALLBACK] MONDAY_API_TOKEN/MONDAY_BOARD_ID manquants → abandon")
+        return False
+
+    url = "https://api.monday.com/v2"
+    headers = {
+        "Authorization": token,
+        "Content-Type": "application/json",
+    }
+    # Pour une colonne Status : value attend un JSON stringifié {"label":"..."}
+    value_obj = {"label": label}
+    variables = {
+        "board_id": int(board_id),
+        "item_id": int(item_id),
+        "column_id": column_id,
+        "value": json.dumps(value_obj),
+    }
+    query = """
+      mutation ($board_id: Int!, $item_id: Int!, $column_id: String!, $value: JSON!) {
+        change_simple_column_value(board_id: $board_id, item_id: $item_id, column_id: $column_id, value: $value) {
+          id
+        }
+      }
+    """
+    try:
+        resp = requests.post(url, headers=headers, json={"query": query, "variables": variables}, timeout=20)
+        data = resp.json() if resp.content else {}
+        if resp.status_code >= 300 or "errors" in data:
+            logger.error("[MONDAY][FALLBACK] GraphQL error: code=%s body=%s", resp.status_code, data)
+            return False
+        logger.info("[MONDAY][FALLBACK] set_status OK via GraphQL (item_id=%s, label='%s')", item_id, label)
+        return True
+    except Exception as e:
+        logger.exception("[MONDAY][FALLBACK] exception: %s", e)
+        return False
+
+
 def _set_status_safe(item_id: int, column_id: str, label: str):
-    """Pose un statut Monday sans faire échouer le flux si le libellé n'existe pas."""
+    """
+    1) tente m.set_status (lib d’origine)
+    2) si erreur → fallback GraphQL direct
+    3) si encore erreur → log, mais ne bloque pas le flux
+    """
     try:
         m.set_status(item_id, column_id, label)
+        logger.info("[MONDAY] set_status OK via wrapper (item_id=%s, label='%s')", item_id, label)
+        return
     except Exception as e:
         msg = str(e)
-        if "missingLabel" in msg or "This status label doesn't exist" in msg:
-            logger.warning("[MONDAY] statut ignoré (label inexistant): '%s' (item_id=%s)", label, item_id)
-        else:
-            logger.exception("[MONDAY] set_status erreur non bloquante (item_id=%s, label=%s): %s", item_id, label, e)
+        logger.warning("[MONDAY] wrapper set_status a échoué: %s", msg)
+
+    # Fallback GraphQL
+    ok = _monday_graphql_set_status(item_id, column_id, label)
+    if not ok:
+        logger.error("[MONDAY] set_status impossible (wrapper + fallback) item_id=%s label='%s'", item_id, label)
 
 
 # -------------------- Health/Ping --------------------
@@ -79,7 +133,7 @@ async def quote_from_monday(request: Request):
         payload = _safe_json_loads(raw.decode("utf-8", errors="ignore"), default={}) or {}
         logger.info(f"[WEBHOOK] payload={payload}")
 
-        # 1) challenge d’enregistrement
+        # 1) challenge
         if isinstance(payload, dict) and "challenge" in payload:
             return JSONResponse(content={"challenge": payload["challenge"]})
 
@@ -201,7 +255,7 @@ async def quote_from_monday(request: Request):
         if not payment_url:
             raise HTTPException(status_code=500, detail="URL PayPlug manquante dans la réponse.")
 
-        # 👉 On pose UNIQUEMENT le lien ; AUCUN changement de statut ici
+        # pose UNIQUEMENT le lien
         m.set_link_in_column(item_id, link_columns[acompte_num], payment_url, f"Payer acompte {acompte_num}")
 
         logger.info(f"[OK] item={item_id} acompte={acompte_num} amount_cents={amount_cents} url={payment_url}")
@@ -215,7 +269,7 @@ async def quote_from_monday(request: Request):
         raise HTTPException(status_code=500, detail=f"Erreur webhook Monday : {e}")
 
 
-# -------------------- PayPlug -> Webhook paiement réussi (POSE LE STATUT PAYÉ) --------------------
+# -------------------- PayPlug -> Webhook paiement réussi --------------------
 @app.post("/payplug/webhook")
 async def payplug_webhook(request: Request):
     try:
@@ -253,9 +307,10 @@ async def payplug_webhook(request: Request):
             logger.error(f"[PP-WEBHOOK] metadata incomplète: item_id={item_id} acompte={acompte}")
             return JSONResponse({"ok": False, "error": "bad_metadata"}, status_code=200)
 
-        # ➜ Pose “Payé acompte X”
         status_after = _safe_json_loads(getattr(settings, "STATUS_AFTER_PAY_JSON", None), default={}) or {}
         label = status_after.get(acompte, f"Payé acompte {acompte}")
+
+        # ✅ MAJ Monday — wrapper puis fallback GraphQL si besoin
         _set_status_safe(int(item_id), getattr(settings, "STATUS_COLUMN_ID", "status"), label)
 
         return JSONResponse({"ok": True})
@@ -268,11 +323,9 @@ async def payplug_webhook(request: Request):
 # -------------------- Fallback admin (test manuel) --------------------
 @app.get("/payplug/mark_paid")
 def mark_paid(item_id: int, acompte: str, token: str):
-    """Marque payé via URL (pour test manuel) — protégé par ADMIN_HOOK_TOKEN."""
     admin_token = (os.getenv("ADMIN_HOOK_TOKEN") or "").strip()
     if not admin_token or token != admin_token:
         raise HTTPException(status_code=403, detail="Forbidden")
-
     if acompte not in ("1", "2"):
         raise HTTPException(status_code=400, detail="acompte doit être '1' ou '2'")
 
