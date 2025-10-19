@@ -7,22 +7,34 @@ from .config import settings
 MONDAY_API_URL = "https://api.monday.com/v2"
 HEADERS = {
     "Authorization": settings.MONDAY_API_KEY,
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
 }
 
+# -------------------- HTTP / GraphQL --------------------
+
 def _post(query: str, variables: dict):
-    resp = requests.post(MONDAY_API_URL, headers=HEADERS, json={"query": query, "variables": variables})
+    resp = requests.post(
+        MONDAY_API_URL,
+        headers=HEADERS,
+        json={"query": query, "variables": variables or {}},
+        timeout=30,
+    )
     resp.raise_for_status()
     data = resp.json()
-    if "errors" in data and data["errors"]:
+    if isinstance(data, dict) and data.get("errors"):
         raise Exception(f"Erreur Monday: {data['errors']}")
-    return data
+    return data  # retourne le JSON complet {"data":{...}}
 
 def _extract_text_from_column(col: dict) -> str:
+    """
+    Renvoie le texte "humain" d'une colonne Monday.
+    - Si col["text"] existe, on renvoie ça.
+    - Sinon, on tente de parser col["value"] (JSON brut) et on en extrait 'text'/'value' si présent.
+    """
     if col.get("text"):
         return str(col["text"])
     raw_val = col.get("value")
-    if raw_val is None or raw_val == "":
+    if raw_val in (None, ""):
         return ""
     try:
         parsed = json.loads(raw_val) if isinstance(raw_val, str) else raw_val
@@ -36,12 +48,27 @@ def _extract_text_from_column(col: dict) -> str:
         return json.dumps(parsed, ensure_ascii=False)
     return str(parsed)
 
+# -------------------- Lecture d’item --------------------
+
 def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
-    query = """
+    """
+    Récupère name + un sous-ensemble de colonnes (par id), et renvoie un dict {col_id: texte}.
+    Astuce: Monday calcule parfois mieux le 'text' des formules quand on filtre avec ids:[].
+    """
+    # 1) name
+    q_name = """
     query ($item_id: ID!) {
-      items (ids: [$item_id]) {
-        name
-        column_values {
+      items(ids: [$item_id]) { name }
+    }
+    """
+    data_name = _post(q_name, {"item_id": item_id})
+    name = (data_name["data"]["items"][0]["name"]) if data_name.get("data") else ""
+
+    # 2) colonnes ciblées
+    q_cols = """
+    query ($item_id: ID!, $col_ids: [String]) {
+      items(ids: [$item_id]) {
+        column_values(ids: $col_ids) {
           id
           type
           text
@@ -50,16 +77,27 @@ def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
       }
     }
     """
-    data = _post(query, {"item_id": item_id})
-    item = data["data"]["items"][0]
-    result = {"name": item["name"]}
-    for col in item["column_values"]:
-        if col["id"] in column_ids:
-            result[col["id"]] = _extract_text_from_column(col)
-            result[col["id"] + "__raw"] = col.get("value") or ""
+    data_cols = _post(q_cols, {"item_id": item_id, "col_ids": column_ids})
+    cvs = (data_cols["data"]["items"][0]["column_values"]) if data_cols.get("data") else []
+
+    result = {"name": name}
+    for col in cvs:
+        cid = col["id"]
+        result[cid] = _extract_text_from_column(col)
+        result[cid + "__raw"] = col.get("value") or ""
     return result
 
+# -------------------- Métadonnées de board --------------------
+
 def get_board_columns_map():
+    """
+    Renvoie:
+      - cols: liste brute des colonnes
+      - id_to_title: {id -> titre}
+      - title_to_id: {titre -> id}
+      - formulas: {id -> expression formula}
+      - col_types: {id -> type}
+    """
     query = """
     query ($board_id: [ID!]) {
       boards (ids: $board_id) {
@@ -78,6 +116,7 @@ def get_board_columns_map():
     if not boards:
         return [], {}, {}, {}, {}
     cols = boards[0]["columns"]
+
     id_to_title, title_to_id, formulas, col_types = {}, {}, {}, {}
     for c in cols:
         cid = c["id"]
@@ -100,7 +139,10 @@ def get_formula_expression(column_id: str) -> str | None:
     _, _, _, formulas, _ = get_board_columns_map()
     return formulas.get(column_id)
 
+# -------------------- Formules: numérique & texte --------------------
+
 def _translate_monday_expr(expr: str) -> str:
+    """Petit traducteur d'expressions Monday -> Python safe (arith/booleen)."""
     if expr is None:
         return ""
     out = expr
@@ -133,9 +175,7 @@ def _safe_eval_arith_bool(expr: str) -> float:
     def if_(*args):
         if len(args) < 2:
             raise ValueError("IF() requiert au moins 2 arguments")
-        cond = bool(args[0])
-        a = args[1]
-        b = args[2] if len(args) >= 3 else 0
+        cond = bool(args[0]); a = args[1]; b = args[2] if len(args) >= 3 else 0
         return a if cond else b
     def and_(*args): return float(all(bool(x) for x in args))
     def or_(*args):  return float(any(bool(x) for x in args))
@@ -153,40 +193,30 @@ def _safe_eval_arith_bool(expr: str) -> float:
             if isinstance(node.value, (int, float, bool, str)):
                 return node.value
             raise ValueError("Constante non autorisée")
-        if isinstance(node, ast.Str):
-            return node.s
-        if isinstance(node, ast.Num):
-            return node.n
-        if isinstance(node, ast.BinOp):
-            return allowed_binops[type(node.op)](_eval(node.left), _eval(node.right))
-        if isinstance(node, ast.UnaryOp):
-            return allowed_unary[type(node.op)](_eval(node.operand))
+        if isinstance(node, ast.Str): return node.s
+        if isinstance(node, ast.Num): return node.n
+        if isinstance(node, ast.BinOp): return allowed_binops[type(node.op)](_eval(node.left), _eval(node.right))
+        if isinstance(node, ast.UnaryOp): return allowed_unary[type(node.op)](_eval(node.operand))
         if isinstance(node, ast.BoolOp):
             vals = [_eval(v) for v in node.values]
-            if isinstance(node.op, ast.And):
-                return all(bool(v) for v in vals)
-            if isinstance(node.op, ast.Or):
-                return any(bool(v) for v in vals)
-            raise ValueError("BoolOp non autorisé")
+            if isinstance(node.op, ast.And): return all(bool(v) for v in vals)
+            if isinstance(node.op, ast.Or):  return any(bool(v) for v in vals)
+            raise ValueError("BoolOp non autorisée")
         if isinstance(node, ast.Compare):
             left = _eval(node.left)
             for opnode, comp in zip(node.ops, node.comparators):
                 right = _eval(comp)
-                if not allowed_cmp[type(opnode)](left, right):
-                    return False
+                if not allowed_cmp[type(opnode)](left, right): return False
                 left = right
             return True
         if isinstance(node, ast.Call):
-            if not isinstance(node.func, ast.Name):
-                raise ValueError("Appel non autorisé")
+            if not isinstance(node.func, ast.Name): raise ValueError("Appel non autorisé")
             fname = node.func.id
-            if fname not in safe_funcs:
-                raise ValueError(f"Fonction non autorisée: {fname}")
+            if fname not in safe_funcs: raise ValueError(f"Fonction non autorisée: {fname}")
             args = [_eval(a) for a in node.args]
             return safe_funcs[fname](*args)
         if isinstance(node, ast.Name):
-            if node.id in safe_funcs:
-                return safe_funcs[node.id]
+            if node.id in safe_funcs: return safe_funcs[node.id]
             raise ValueError(f"Nom non autorisé: {node.id}")
         raise ValueError("Expression non autorisée")
     tree = ast.parse(expr, mode='eval')
@@ -194,7 +224,12 @@ def _safe_eval_arith_bool(expr: str) -> float:
     return float(val) if isinstance(val, (int, float, bool)) else 0.0
 
 def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float | None:
+    """
+    Évalue *numériquement* une colonne formula pour un item (utile pour montants).
+    """
     _, id_to_title, title_to_id, formulas, col_types = get_board_columns_map()
+
+    # Récup toutes les valeurs de colonnes pour l'item (pour résolution des tokens)
     query = """
     query ($item_id: ID!) {
       items (ids: [$item_id]) {
@@ -209,6 +244,7 @@ def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float |
     """
     data = _post(query, {"item_id": item_id})
     item_cols = data["data"]["items"][0]["column_values"]
+
     id_to_numeric: dict[str, float] = {}
     id_to_string: dict[str, str] = {}
     for col in item_cols:
@@ -218,8 +254,10 @@ def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float |
             id_to_numeric[col["id"]] = float(re.sub(r"[^0-9\.\-]", "", val_txt.replace(",", ".")) or 0)
         else:
             id_to_string[col["id"]] = val_txt
+
     seen: set[str] = set()
     cache_num: dict[str, float] = {}
+
     def resolve_token(token: str):
         col_id = token
         if col_id not in col_types and token in title_to_id:
@@ -238,10 +276,12 @@ def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float |
             if not child_expr:
                 seen.discard(col_id); return 0.0
             child_expr = _translate_monday_expr(child_expr)
+
             def repl_child(m: re.Match) -> str:
                 tk = m.group(1)
                 val = resolve_token(tk)
                 return str(val)
+
             child_expr = re.sub(r"\{([^}]+)\}", repl_child, child_expr)
             try:
                 val = _safe_eval_arith_bool(child_expr)
@@ -251,19 +291,54 @@ def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float |
             seen.discard(col_id)
             return val
         return 0.0
+
     root = formulas.get(formula_col_id)
     if not root:
         return None
     root_expr = _translate_monday_expr(root)
+
     def repl_root(m: re.Match) -> str:
         tk = m.group(1)
         val = resolve_token(tk)
         return str(val)
+
     root_expr = re.sub(r"\{([^}]+)\}", repl_root, root_expr)
     try:
         return _safe_eval_arith_bool(root_expr)
     except Exception:
         return None
+
+def compute_formula_text_for_item(column_id: str, item_id: int) -> str | None:
+    """
+    Récupère le 'text' d'une colonne FORMULA (ex: IBAN) pour un item.
+    Cette requête ciblée (ids: [column_id]) force souvent Monday à renvoyer le texte calculé.
+    """
+    q = """
+    query ($item_id: [Int], $col_id: [String]) {
+      items(ids: $item_id) {
+        id
+        column_values(ids: $col_id) {
+          id
+          text
+          value
+        }
+      }
+    }
+    """
+    data = _post(q, {"item_id": [int(item_id)], "col_id": [column_id]})
+    items = (data.get("data") or {}).get("items") or []
+    if not items:
+        return None
+    cvs = items[0].get("column_values") or []
+    if not cvs:
+        return None
+    text = (cvs[0].get("text") or "").strip()
+    if text:
+        return text
+    # fallback au cas où (peu probable)
+    return _extract_text_from_column(cvs[0]) or None
+
+# -------------------- Mutations --------------------
 
 def set_link_in_column(item_id: int, column_id: str, url: str, text: str):
     mutation = """
