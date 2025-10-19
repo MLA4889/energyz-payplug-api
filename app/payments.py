@@ -1,142 +1,131 @@
-import json
 import os
 import re
 import requests
-from .config import settings
 
-# IBAN Energyz connus
+# IBAN “connus” côté Energyz
 ENERGYZ_MAR_IBAN    = "FR76 1695 8000 0130 5670 5696 366"
 ENERGYZ_DIVERS_IBAN = "FR76 1695 8000 0100 0571 1982 492"
 
-def _compact_iban(s: str) -> str:
-    # supprime tous les espaces (y compris NBSP, U+202F)
-    return re.sub(r"\s+", "", (s or ""))
+def _compact_iban(iban: str) -> str:
+    return (iban or "").replace(" ", "").upper()
 
 def _mode() -> str:
-    # lit le mode depuis env ou settings
-    return (os.getenv("PAYPLUG_MODE") or getattr(settings, "PAYPLUG_MODE", "live") or "live").lower()
+    return (os.getenv("PAYPLUG_MODE") or "test").lower().strip()
 
-def _get_env(name: str) -> str:
-    # lit d'abord OS env, puis settings (au cas où c’est aussi défini dans config.py)
-    return (os.getenv(name) or getattr(settings, name, "") or "").strip()
-
-def _safe_parse_mapping(raw: str):
-    """
-    Tente de parser un mapping IBAN->KEY dans tous les formats usuels:
-    - JSON strict
-    - dict python (ast.literal_eval)
-    - 'IBAN=KEY,IBAN2=KEY2' ou avec ';'
-    Retourne un dict {iban: key}
-    """
+def _load_json_env(name: str) -> dict:
+    raw = os.getenv(name)
     if not raw:
         return {}
-    # a) JSON strict
     try:
-        v = json.loads(raw)
-        if isinstance(v, dict):
-            return v
-    except Exception:
-        pass
-    # b) dict python
-    try:
-        import ast
-        v = ast.literal_eval(raw)
-        if isinstance(v, dict):
-            return v
-    except Exception:
-        pass
-    # c) 'IBAN=KEY,IBAN2=KEY2'
-    out = {}
-    try:
-        for part in raw.replace(";", ",").split(","):
-            part = part.strip()
-            if not part or "=" not in part:
-                continue
-            k, v = part.split("=", 1)
-            out[k.strip()] = v.strip()
+        import json
+        return json.loads(raw)
     except Exception:
         return {}
-    return out
-
-def _choose_api_key(iban: str) -> str:
-    """
-    Choix robuste de la clé PayPlug à partir de l'IBAN:
-      1) IBAN Energyz MAR → PAYPLUG_*_KEY_EZMAR
-      2) IBAN Energyz Divers → PAYPLUG_*_KEY_EZDIVERS
-      3) Sinon: mapping libre PAYPLUG_KEYS_*_JSON
-    """
-    mode = _mode()
-    iban_c = _compact_iban(iban)
-    mar_c  = _compact_iban(ENERGYZ_MAR_IBAN)
-    div_c  = _compact_iban(ENERGYZ_DIVERS_IBAN)
-
-    # 1) chemins directs par IBAN Energyz
-    if iban_c == mar_c:
-        return _get_env("PAYPLUG_LIVE_KEY_EZMAR") if mode == "live" else _get_env("PAYPLUG_TEST_KEY_EZMAR")
-    if iban_c == div_c:
-        return _get_env("PAYPLUG_LIVE_KEY_EZDIVERS") if mode == "live" else _get_env("PAYPLUG_TEST_KEY_EZDIVERS")
-
-    # 3) mapping libre via JSON/dict/chaine
-    raw = _get_env("PAYPLUG_KEYS_LIVE_JSON") if mode == "live" else _get_env("PAYPLUG_KEYS_TEST_JSON")
-    mapping = _safe_parse_mapping(raw)
-    for k, v in (mapping or {}).items():
-        if _compact_iban(k) == iban_c and v:
-            return v.strip()
-
-    return ""  # rien trouvé
 
 def cents_from_str(s: str) -> int:
-    """
-    Convertit '1 234,56'/'1234.56' en centimes (int).
-    """
-    if not s:
-        return 0
-    s = s.replace("\u202f", "").replace(" ", "").replace("€", "").strip()
-    s = s.replace(",", ".")
-    m = re.search(r"[-+]?\d*\.?\d+", s)
-    if not m:
-        return 0
-    val = float(m.group(0))
-    return int(round(val * 100))
+    s = (s or "").replace(" ", "").replace("€", "").replace(",", ".")
+    try:
+        v = float(s)
+    except Exception:
+        v = 0.0
+    return int(round(v * 100))
 
-def create_payment(*, api_key: str, amount_cents: int, email: str = "", address: str = "", client_name: str = "", metadata: dict | None = None) -> str:
+def _choose_api_key(iban: str) -> str | None:
     """
-    Crée un paiement PayPlug et retourne l'URL d'encaissement hébergée.
+    Choix de la clé PayPlug en fonction de l’IBAN + ENV + FORCED_PAYPLUG_KEY éventuel.
+    """
+    # 1) clé forcée (si tu veux bypasser toutes les règles)
+    forced_key = os.getenv("FORCED_PAYPLUG_KEY")
+    if forced_key:
+        return forced_key.strip()
+
+    mode = _mode()
+    iban_c = _compact_iban(iban)
+
+    # 2) cas “connus” Energyz (plus simples)
+    if iban_c == _compact_iban(ENERGYZ_MAR_IBAN):
+        if mode == "live":
+            return os.getenv("PAYPLUG_LIVE_KEY_EZMAR")
+        return os.getenv("PAYPLUG_TEST_KEY_EZMAR")
+    if iban_c == _compact_iban(ENERGYZ_DIVERS_IBAN):
+        if mode == "live":
+            return os.getenv("PAYPLUG_LIVE_KEY_EZDIVERS")
+        return os.getenv("PAYPLUG_TEST_KEY_EZDIVERS")
+
+    # 3) mapping JSON libre (clé = IBAN compact)
+    if mode == "live":
+        mapping = _load_json_env("PAYPLUG_KEYS_LIVE_JSON")
+    else:
+        mapping = _load_json_env("PAYPLUG_KEYS_TEST_JSON")
+
+    if mapping:
+        # accepte aussi des clés avec espaces
+        key = mapping.get(iban) or mapping.get(iban_c)
+        if key:
+            return key
+
+    return None
+
+def _valid_email(email: str) -> bool:
+    if not email:
+        return False
+    # check très simple, suffisant ici
+    return re.match(r"[^@]+@[^@]+\.[^@]+", email) is not None
+
+
+def create_payment(api_key: str,
+                   amount_cents: int,
+                   email: str | None,
+                   address: str | None,
+                   client_name: str | None,
+                   metadata: dict | None) -> str:
+    """
+    Crée un paiement PayPlug (lien hébergé).
+    - NE PAS ENVOYER `billing` (l’API renvoie "This field is unknown." dans ton cas)
+    - N’ENVOYER `customer` QUE SI l’email est valide
     """
     if not api_key:
-        raise ValueError("PayPlug API key manquante")
+        raise RuntimeError("create_payment: api_key manquante")
+
+    url = "https://api.payplug.com/v1/payments"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
 
     payload = {
         "amount": amount_cents,
         "currency": "EUR",
-        "billing": {},
-        "customer": {},
+        "payment_method": "link",
         "metadata": metadata or {},
-        "hosted_payment": {
-            "return_url": "https://payplug.com",
-            "cancel_url": "https://payplug.com"
+    }
+
+    # Email uniquement s'il est valide
+    if _valid_email(email):
+        payload["customer"] = {
+            "email": email.strip(),
         }
-    }
+        # on peut mettre un first_name si tu veux, mais pas obligatoire
+        if client_name:
+            payload["customer"]["first_name"] = str(client_name)[:100]
 
-    if email:
-        payload["customer"]["email"] = email
-    if client_name:
-        payload["customer"]["first_name"] = client_name[:40]
-    if address:
-        payload["billing"]["address1"] = address[:100]
-        payload["billing"]["country"] = "FR"
+    # IMPORTANT : ne pas envoyer "billing" (ton log montre que cet endpoint ne le supporte pas)
+    # if address:
+    #     payload["billing"] = {"address1": address, "country": "FR"}
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
+    import json
+    resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=20)
+    if resp.status_code >= 300:
+        raise RuntimeError(f"PayPlug error {resp.status_code}: {resp.text}")
 
-    r = requests.post("https://api.payplug.com/v1/payments", headers=headers, json=payload, timeout=20)
-    if r.status_code >= 400:
-        raise RuntimeError(f"PayPlug error {r.status_code}: {r.text}")
+    data = resp.json()
+    # l’URL se trouve en général dans hosted_payment.payment_url
+    hp = (data or {}).get("hosted_payment", {})
+    pay_url = hp.get("payment_url")
+    if not pay_url:
+        # fallback éventuels
+        pay_url = data.get("payment_url") or data.get("hosted_payment_url")
+    if not pay_url:
+        raise RuntimeError(f"PayPlug: URL de paiement introuvable dans la réponse: {data}")
 
-    data = r.json()
-    link = (data.get("hosted_payment") or {}).get("payment_url", "") or data.get("payment_url", "") or data.get("url", "")
-    if not link:
-        raise RuntimeError(f"PayPlug response sans payment_url: {data}")
-    return link
+    return pay_url
