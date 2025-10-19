@@ -68,15 +68,13 @@ def create_payment(
     api_key: str,
     amount_cents: int,
     email: str | None,
-    address: str | None,      # non utilisé volontairement
+    address: str | None,
     client_name: str | None,
     metadata: dict | None,
-) -> str:
+) -> dict:
     """
     Crée un paiement PayPlug 'hébergé' (lien).
-      - on utilise 'hosted_payment' (pas de 'payment_method')
-      - pas de 'billing'
-      - 'customer' uniquement si email valide
+    Utilise notification_url pour notifier ton webhook directement à la validation.
     """
     if not api_key:
         raise RuntimeError("create_payment: api_key manquante")
@@ -87,39 +85,33 @@ def create_payment(
         "Content-Type": "application/json",
     }
 
-    # URLs de retour/annulation (facultatives, mais c’est propre d’en fournir)
     return_url = os.getenv("PAYPLUG_RETURN_URL", "https://www.energyz.fr/success")
     cancel_url = os.getenv("PAYPLUG_CANCEL_URL", "https://www.energyz.fr/cancel")
+    notification_url = os.getenv("PAYPLUG_NOTIFICATION_URL", "https://energyz-payplug-api-2.onrender.com/payplug/webhook")
 
     payload = {
         "amount": amount_cents,
         "currency": "EUR",
-        # pas de payment_method -> PayPlug génère une page de paiement hébergée
         "hosted_payment": {
             "return_url": return_url,
             "cancel_url": cancel_url,
         },
+        "notification_url": notification_url,
         "metadata": metadata or {},
     }
 
     if _valid_email(email):
         payload["customer"] = {"email": email.strip()}
         if client_name:
-            # Pas obligatoire, mais utile pour le ticket
             payload["customer"]["first_name"] = str(client_name)[:100]
 
-    # NE PAS ENVOYER 'billing'
-    # if address:
-    #     payload["billing"] = {"address1": address, "country": "FR"}
-
-    resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=20)
+    resp = requests.post(url, headers=headers, json=payload, timeout=20)
     if resp.status_code >= 300:
         raise RuntimeError(f"PayPlug error {resp.status_code}: {resp.text}")
 
     data = resp.json()
     hp = (data or {}).get("hosted_payment", {})
-    pay_url = hp.get("payment_url") or data.get("payment_url") or data.get("hosted_payment_url")
-    if not pay_url:
+    if not hp.get("payment_url"):
         raise RuntimeError(f"PayPlug: URL de paiement introuvable dans la réponse: {data}")
 
-    return pay_url
+    return data
