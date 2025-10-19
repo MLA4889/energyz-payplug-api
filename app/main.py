@@ -2,8 +2,8 @@ import json
 import logging
 import os
 import re
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Request, HTTPException, Form
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 
 from .config import settings
 from .payments import _choose_api_key, cents_from_str, create_payment
@@ -12,7 +12,7 @@ from . import monday as m
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("energyz")
 
-app = FastAPI(title="Energyz PayPlug API", version="2.8 (prefills + email receipt hint)")
+app = FastAPI(title="Energyz PayPlug API", version="2.9 (email-collect + webhook-only-paid)")
 
 # -------------------- Utils --------------------
 def _safe_json_loads(s, default=None):
@@ -56,7 +56,88 @@ def root():
 def from_monday_ping():
     return {"ok": True}
 
-# -------------------- Monday -> création lien --------------------
+# -------------------- Logic commune montant/iban --------------------
+def _resolve_amount_iban_and_texts(item_id: int, acompte_num: str):
+    # Colonnes de travail
+    formula_cols = _safe_json_loads(getattr(settings, "FORMULA_COLUMN_IDS_JSON", None), default={}) or {}
+    link_columns = _safe_json_loads(getattr(settings, "LINK_COLUMN_IDS_JSON", None), default={}) or {}
+    if acompte_num not in formula_cols or acompte_num not in link_columns:
+        raise HTTPException(status_code=500, detail=f"FORMULA_COLUMN_IDS_JSON/LINK_COLUMN_IDS_JSON sans clé '{acompte_num}'.")
+
+    needed_cols = [
+        getattr(settings, "EMAIL_COLUMN_ID", "email"),
+        getattr(settings, "ADDRESS_COLUMN_ID", "address"),
+        getattr(settings, "DESCRIPTION_COLUMN_ID", "description"),
+        getattr(settings, "IBAN_FORMULA_COLUMN_ID", "iban"),
+        getattr(settings, "QUOTE_AMOUNT_FORMULA_ID", "quote_total"),
+        formula_cols[acompte_num],
+        getattr(settings, "BUSINESS_STATUS_COLUMN_ID", "color_mkwnxf1h"),
+        "name",
+    ]
+    cols = m.get_item_columns(item_id, needed_cols)
+    logger.info(f"[MONDAY] item_id={item_id} values={cols}")
+
+    email       = cols.get(getattr(settings, "EMAIL_COLUMN_ID", "email"), "") or ""
+    address     = cols.get(getattr(settings, "ADDRESS_COLUMN_ID", "address"), "") or ""
+    description = cols.get(getattr(settings, "DESCRIPTION_COLUMN_ID", "description"), "") or ""
+    item_name   = (cols.get("name", "") or "Client Energyz").strip()
+
+    # Montant
+    formula_id  = formula_cols[acompte_num]
+    acompte_txt = _clean_number_text(cols.get(formula_id, ""))
+    if float(acompte_txt or "0") <= 0:
+        computed = m.compute_formula_value_for_item(formula_id, int(item_id))
+        if computed is not None and computed > 0:
+            acompte_txt = str(computed)
+    if float(acompte_txt or "0") <= 0:
+        total_ht_txt = _clean_number_text(cols.get(getattr(settings, "QUOTE_AMOUNT_FORMULA_ID", "quote_total"), "0"))
+        if float(total_ht_txt) > 0:
+            acompte_txt = str(float(total_ht_txt) / 2.0)
+        else:
+            raise HTTPException(status_code=400, detail="Montant introuvable (formula + recalcul + total HT vides).")
+    amount_cents = cents_from_str(acompte_txt)
+    if amount_cents <= 0:
+        raise HTTPException(status_code=400, detail=f"Montant invalide après parsing: '{acompte_txt}'.")
+
+    # IBAN/clé (FORCED si dispo)
+    forced_iban = (os.getenv("FORCED_IBAN") or getattr(settings, "FORCED_IBAN", "") or "").strip()
+    forced_key  = (os.getenv("FORCED_PAYPLUG_KEY") or getattr(settings, "FORCED_PAYPLUG_KEY", "") or "").strip()
+
+    if forced_iban:
+        iban = forced_iban
+        logger.info(f"[IBAN] FORCED_IBAN utilisé: '{iban}'")
+    else:
+        iban = (cols.get(getattr(settings, "IBAN_FORMULA_COLUMN_ID", "iban"), "") or "").strip()
+        if not iban:
+            iban_by_status = _safe_json_loads(getattr(settings, "IBAN_BY_STATUS_JSON", None), default={}) or {}
+            business_col_id = getattr(settings, "BUSINESS_STATUS_COLUMN_ID", "color_mkwnxf1h")
+            business_label  = (cols.get(business_col_id, "") or "").strip()
+            if business_label and business_label in iban_by_status:
+                iban = iban_by_status[business_label]
+        if not iban:
+            raise HTTPException(status_code=400, detail="IBAN introuvable (ni FORCED_IBAN, ni formula, ni mapping Business Line).")
+
+    if forced_key:
+        api_key = forced_key
+        logger.info("[PAYPLUG] FORCED_PAYPLUG_KEY utilisée.")
+    else:
+        api_key = _choose_api_key(iban)
+        if not api_key:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Aucune clé PayPlug pour IBAN '{iban}'. "
+                       f"Soit définis FORCED_PAYPLUG_KEY, soit poses PAYPLUG_* pour tes IBAN en {getattr(settings, 'PAYPLUG_MODE','?')}."
+            )
+
+    desc = (description or f"{item_name} — Acompte {acompte_num}").strip()
+    link_col_id = link_columns[acompte_num]
+
+    return {
+        "email": email, "address": address, "item_name": item_name, "description": desc,
+        "amount_cents": amount_cents, "api_key": api_key, "link_col_id": link_col_id
+    }
+
+# -------------------- Webhook Monday -> créer le lien --------------------
 @app.post("/quote/from_monday")
 async def quote_from_monday(request: Request):
     try:
@@ -96,112 +177,43 @@ async def quote_from_monday(request: Request):
         if acompte_num not in ("1", "2"):
             raise HTTPException(status_code=400, detail="Label status non reconnu pour acompte 1/2.")
 
-        # Colonnes de travail
-        formula_cols = _safe_json_loads(getattr(settings, "FORMULA_COLUMN_IDS_JSON", None), default={}) or {}
-        link_columns = _safe_json_loads(getattr(settings, "LINK_COLUMN_IDS_JSON", None), default={}) or {}
-        if acompte_num not in formula_cols or acompte_num not in link_columns:
-            raise HTTPException(status_code=500, detail=f"FORMULA_COLUMN_IDS_JSON/LINK_COLUMN_IDS_JSON sans clé '{acompte_num}'.")
+        # Récup data et IBAN/clé/montant
+        info = _resolve_amount_iban_and_texts(int(item_id), acompte_num)
 
-        needed_cols = [
-            getattr(settings, "EMAIL_COLUMN_ID", "email"),
-            getattr(settings, "ADDRESS_COLUMN_ID", "address"),
-            getattr(settings, "DESCRIPTION_COLUMN_ID", "description"),
-            getattr(settings, "IBAN_FORMULA_COLUMN_ID", "iban"),
-            getattr(settings, "QUOTE_AMOUNT_FORMULA_ID", "quote_total"),
-            formula_cols[acompte_num],
-            getattr(settings, "BUSINESS_STATUS_COLUMN_ID", "color_mkwnxf1h"),
-            "name",
-        ]
-        cols = m.get_item_columns(item_id, needed_cols)
-        logger.info(f"[MONDAY] item_id={item_id} values={cols}")
-
-        email       = cols.get(getattr(settings, "EMAIL_COLUMN_ID", "email"), "") or ""
-        address     = cols.get(getattr(settings, "ADDRESS_COLUMN_ID", "address"), "") or ""
-        description = cols.get(getattr(settings, "DESCRIPTION_COLUMN_ID", "description"), "") or ""
-        item_name   = (cols.get("name", "") or "Client Energyz").strip()
-
-        # ---------- MONTANT ----------
-        formula_id  = formula_cols[acompte_num]
-        acompte_txt = _clean_number_text(cols.get(formula_id, ""))
-
-        if float(acompte_txt or "0") <= 0:
-            computed = m.compute_formula_value_for_item(formula_id, int(item_id))
-            if computed is not None and computed > 0:
-                acompte_txt = str(computed)
-
-        if float(acompte_txt or "0") <= 0:
-            total_ht_txt = _clean_number_text(cols.get(getattr(settings, "QUOTE_AMOUNT_FORMULA_ID", "quote_total"), "0"))
-            if float(total_ht_txt) > 0:
-                acompte_txt = str(float(total_ht_txt) / 2.0)
-            else:
-                raise HTTPException(status_code=400, detail="Montant introuvable (formula + recalcul + total HT vides).")
-
-        amount_cents = cents_from_str(acompte_txt)
-        if amount_cents <= 0:
-            raise HTTPException(status_code=400, detail=f"Montant invalide après parsing: '{acompte_txt}'.")
-
-        # ---------- IBAN / KEY forcés ----------
-        forced_iban = (os.getenv("FORCED_IBAN") or getattr(settings, "FORCED_IBAN", "") or "").strip()
-        forced_key  = (os.getenv("FORCED_PAYPLUG_KEY") or getattr(settings, "FORCED_PAYPLUG_KEY", "") or "").strip()
-
-        if forced_iban:
-            iban = forced_iban
-            logger.info(f"[IBAN] FORCED_IBAN utilisé: '{iban}'")
+        # Mode collecte e-mail avant PayPlug ?
+        collect_first = (os.getenv("COLLECT_EMAIL_BEFORE_PAY") or "0").strip() in ("1", "true", "yes")
+        if collect_first:
+            # On pose un lien vers notre mini-formulaire
+            base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+            start_url = f"{base}/payplug/start?item_id={item_id}&acompte={acompte_num}"
+            m.set_link_in_column(item_id, info["link_col_id"], start_url, f"Payer acompte {acompte_num} — {info['item_name']}")
         else:
-            iban = (cols.get(getattr(settings, "IBAN_FORMULA_COLUMN_ID", "iban"), "") or "").strip()
-            if not iban:
-                iban_by_status = _safe_json_loads(getattr(settings, "IBAN_BY_STATUS_JSON", None), default={}) or {}
-                business_col_id = getattr(settings, "BUSINESS_STATUS_COLUMN_ID", "color_mkwnxf1h")
-                business_label  = (cols.get(business_col_id, "") or "").strip()
-                if business_label and business_label in iban_by_status:
-                    iban = iban_by_status[business_label]
-            if not iban:
-                raise HTTPException(status_code=400, detail="IBAN introuvable (ni FORCED_IBAN, ni formula, ni mapping Business Line).")
+            # Création immédiate du paiement PayPlug (comportement historique)
+            payment_url = create_payment(
+                api_key=info["api_key"],
+                amount_cents=info["amount_cents"],
+                email=info["email"],
+                address=info["address"],
+                client_name=info["item_name"],
+                metadata={
+                    "item_id": str(item_id),
+                    "item_name": info["item_name"],
+                    "acompte": acompte_num,
+                    "description": info["description"],
+                    "source": "energyz-monday",
+                },
+            )
+            if not payment_url:
+                raise HTTPException(status_code=500, detail="URL PayPlug manquante dans la réponse.")
+            m.set_link_in_column(item_id, info["link_col_id"], payment_url, f"Payer acompte {acompte_num} — {info['item_name']}")
 
-        # ---------- Sélection de la clé PayPlug ----------
-        if forced_key:
-            api_key = forced_key
-            logger.info("[PAYPLUG] FORCED_PAYPLUG_KEY utilisée.")
-        else:
-            api_key = _choose_api_key(iban)
-            if not api_key:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Aucune clé PayPlug pour IBAN '{iban}'. "
-                           f"Soit définis FORCED_PAYPLUG_KEY, soit poses PAYPLUG_* pour tes IBAN en {getattr(settings, 'PAYPLUG_MODE','?')}."
-                )
-
-        # ---------- Metadata enrichie ----------
-        desc = (description or f"{item_name} — Acompte {acompte_num}").strip()
-        metadata = {
-            "item_id": str(item_id),
-            "item_name": item_name,
-            "acompte": acompte_num,
-            "description": desc,
-            "source": "energyz-monday",
-        }
-
-        # ---------- Création paiement ----------
-        payment_url = create_payment(
-            api_key=api_key,
-            amount_cents=amount_cents,
-            email=email,           # peut être vide -> alias auto côté payments.py
-            address=address,       # non bloquant
-            client_name=item_name, # sert pour first/last + alias
-            metadata=metadata,
-        )
-
-        if not payment_url:
-            raise HTTPException(status_code=500, detail="URL PayPlug manquante dans la réponse.")
-
-        # Lien + statut
-        m.set_link_in_column(item_id, link_columns[acompte_num], payment_url, f"Payer acompte {acompte_num} — {item_name}")
-        status_after = _safe_json_loads(getattr(settings, "STATUS_AFTER_PAY_JSON", None), default={}) or {}
-        next_status = status_after.get(acompte_num, f"Payé acompte {acompte_num}")
+        # ⚠️ NE PLUS mettre “Payé …” ici.
+        # On met un statut d’envoi (configurable) ; le “Payé …” vient UNIQUEMENT du webhook.
+        sent_status_map = _safe_json_loads(getattr(settings, "STATUS_ON_CREATE_JSON", None), default={}) or {}
+        next_status = sent_status_map.get(acompte_num, f"Lien acompte {acompte_num} envoyé")
         m.set_status(item_id, getattr(settings, "STATUS_COLUMN_ID", "status"), next_status)
 
-        logger.info(f"[OK] item={item_id} acompte={acompte_num} amount_cents={amount_cents} url={payment_url}")
-        return {"status": "ok", "item_id": item_id, "acompte": acompte_num, "amount_cents": amount_cents, "payment_url": payment_url}
+        return {"status": "ok", "item_id": item_id, "acompte": acompte_num}
 
     except HTTPException as e:
         logger.error(f"[HTTP] {e.status_code} {e.detail}")
@@ -210,7 +222,68 @@ async def quote_from_monday(request: Request):
         logger.exception(f"[EXCEPTION] {e}")
         raise HTTPException(status_code=500, detail=f"Erreur webhook Monday : {e}")
 
-# -------------------- PayPlug -> Webhook paiement réussi (optionnel) --------------------
+# -------------------- Mini-formulaire e-mail -> création paiement ------
+@app.get("/payplug/start")
+async def payplug_start(item_id: int, acompte: str):
+    """
+    Affiche un mini formulaire pour saisir l'e-mail de reçu.
+    """
+    # On récupère nom + montant pour affichage
+    info = _resolve_amount_iban_and_texts(item_id, acompte)
+    html = f"""
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Paiement acompte {acompte} — {info['item_name']}</title>
+<style>
+body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:24px;}}
+.card{{max-width:560px;margin:auto;padding:24px;border:1px solid #eee;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.04)}}
+label{{display:block;margin:12px 0 6px;font-weight:600}}
+input[type=email]{{width:100%;padding:12px;border:1px solid #ccc;border-radius:8px}}
+button{{margin-top:16px;padding:12px 16px;border:none;border-radius:10px;background:#10b981;color:#fff;font-weight:700;cursor:pointer}}
+.small{{color:#666;font-size:12px;margin-top:8px}}
+</style></head><body>
+<div class="card">
+  <h2>Paiement acompte {acompte}</h2>
+  <div><strong>{info['item_name']}</strong></div>
+  <div class="small">Montant : {info['amount_cents']/100:.2f} €</div>
+  <form method="post" action="/payplug/start">
+    <input type="hidden" name="item_id" value="{item_id}">
+    <input type="hidden" name="acompte" value="{acompte}">
+    <label for="email">Votre e-mail pour recevoir le reçu</label>
+    <input id="email" name="email" type="email" placeholder="ex. nom@domaine.fr" required>
+    <button type="submit">Continuer vers le paiement</button>
+    <div class="small">Vous serez redirigé vers la page sécurisée PayPlug.</div>
+  </form>
+</div>
+</body></html>
+"""
+    return HTMLResponse(content=html)
+
+@app.post("/payplug/start")
+async def payplug_start_post(item_id: int = Form(...), acompte: str = Form(...), email: str = Form(...)):
+    """
+    Reçoit l'e-mail, crée le paiement PayPlug, puis redirige vers la page de paiement.
+    """
+    info = _resolve_amount_iban_and_texts(int(item_id), acompte)
+
+    payment_url = create_payment(
+        api_key=info["api_key"],
+        amount_cents=info["amount_cents"],
+        email=email,                    # e-mail saisi par le payeur
+        address=info["address"],
+        client_name=info["item_name"],
+        metadata={
+            "item_id": str(item_id),
+            "item_name": info["item_name"],
+            "acompte": acompte,
+            "description": info["description"],
+            "source": "energyz-monday",
+        },
+    )
+    if not payment_url:
+        raise HTTPException(status_code=500, detail="URL PayPlug manquante dans la réponse.")
+    return RedirectResponse(url=payment_url, status_code=302)
+
+# -------------------- PayPlug -> Webhook paiement réussi --------------------
 @app.post("/payplug/webhook")
 async def payplug_webhook(request: Request):
     try:
