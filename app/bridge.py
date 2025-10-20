@@ -14,17 +14,13 @@ def _headers():
         "Bridge-Version": BRIDGE_VERSION,
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "Client-Id": BRIDGE_CLIENT_ID,
-        "Client-Secret": BRIDGE_CLIENT_SECRET,
+        "Client-Id": BRIDGE_CLIENT_ID or "",
+        "Client-Secret": BRIDGE_CLIENT_SECRET or "",
     }
 
 def create_bridge_payment_link(amount_cents: int, label: str, metadata: dict) -> str:
-    """
-    Crée un 'payment link' Bridge (virement open banking) et renvoie l'URL.
-    Nécessite les VAR d'env BRIDGE_* (déjà ajoutées chez toi).
-    """
     body = {
-        "amount": amount_cents,          # en centimes
+        "amount": int(amount_cents),
         "currency": "EUR",
         "label": label or "Acompte Energyz",
         "success_url": BRIDGE_SUCCESS_URL,
@@ -35,4 +31,5 @@ def create_bridge_payment_link(amount_cents: int, label: str, metadata: dict) ->
     res = requests.post(url, headers=_headers(), json=body, timeout=20)
     if res.status_code not in (200, 201):
         raise Exception(f"Bridge create link failed: {res.status_code} -> {res.text}")
-    return res.json().get("url") or ""
+    data = res.json() or {}
+    return data.get("url") or ""
