@@ -1,7 +1,7 @@
 import json
 import logging
 import re
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from .config import settings
@@ -16,7 +16,7 @@ from .monday import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("energyz")
 
-app = FastAPI(title="Energyz PayPlug API", version="2.2 (robust per-payment webhook)")
+app = FastAPI(title="Energyz PayPlug API", version="2.3 (webhook-debug)")
 
 
 # ---------- Utils ----------
@@ -59,7 +59,17 @@ def _norm(s: str) -> str:
 # ---------- Health ----------
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "Energyz PayPlug API is live 🚀"}
+    return {"status": "ok", "message": "Energyz PayPlug API is live 🚀", "version": "2.3"}
+
+
+@app.get("/debug/config")
+def debug_config():
+    return {
+        "PUBLIC_BASE_URL": getattr(settings, "PUBLIC_BASE_URL", ""),
+        "NOTIFICATION_URL": getattr(settings, "NOTIFICATION_URL", None),
+        "MONDAY_BOARD_ID": getattr(settings, "MONDAY_BOARD_ID", None),
+        "STATUS_COLUMN_ID": getattr(settings, "STATUS_COLUMN_ID", None),
+    }
 
 
 # ---------- Monday -> création lien ----------
@@ -203,7 +213,6 @@ async def quote_from_monday(request: Request):
         )
 
         # On met UNIQUEMENT le lien, PAS le statut (on attend le webhook PayPlug)
-        link_columns = _safe_json_loads(settings.LINK_COLUMN_IDS_JSON, default={}) or {}
         set_link_in_column(item_id, link_columns[acompte_num], payment_url, f"Payer acompte {acompte_num}")
 
         logger.info(f"[OK-LINK] item={item_id} acompte={acompte_num} amount_cents={amount_cents} url={payment_url}")
@@ -241,7 +250,6 @@ async def payplug_webhook(request: Request):
         root_is_paid = bool(payload.get("is_paid"))
         root_status = str(payload.get("status") or "").lower()
         root_type = str(payload.get("type") or "")
-
         data_obj = payload.get("data") or {}
         obj = data_obj.get("object") or {}
 
@@ -258,40 +266,64 @@ async def payplug_webhook(request: Request):
         ])
 
         if not paid_like:
-            # on ignore les événements non payés
+            logger.info("[PP-WEBHOOK] not paid-like, ignore")
             return JSONResponse({"ok": True, "ignored": True})
 
         # --- Récup metadata (plusieurs emplacements possibles) ---
         metadata = {}
-        for candidate in [
-            obj.get("metadata"),
-            data_obj.get("metadata"),
-            payload.get("metadata"),
-        ]:
-            md = _safe_json_loads(candidate, default=None) if isinstance(candidate, (str, dict)) else None
+        for candidate in [obj.get("metadata"), data_obj.get("metadata"), payload.get("metadata")]:
+            if candidate is None:
+                continue
+            md = candidate if isinstance(candidate, dict) else _safe_json_loads(candidate, default=None)
             if isinstance(md, dict):
                 metadata = md
                 break
 
-        # Supporte "item_id" (nouveau) ET "customer_id" (ancien)
         item_id = metadata.get("item_id") or metadata.get("customer_id")
-        acompte = metadata.get("acompte") or "1"
+        acompte = str(metadata.get("acompte") or "1")
 
         if not item_id:
-            logger.error("[PP-WEBHOOK] metadata sans item_id/customer_id → rien à mettre à jour")
+            logger.error("[PP-WEBHOOK] metadata sans item_id/customer_id → rien à MAJ")
             return JSONResponse({"ok": False, "error": "no_item_id"}, status_code=200)
 
         status_after = _safe_json_loads(settings.STATUS_AFTER_PAY_JSON, default={}) or {}
-        next_status = status_after.get(str(acompte), f"Payé acompte {acompte}")
+        next_status = status_after.get(acompte, f"Payé acompte {acompte}")
 
         try:
             set_status(int(item_id), settings.STATUS_COLUMN_ID, next_status)
             logger.info(f"[PP-WEBHOOK] set_status OK item_id={item_id} -> '{next_status}'")
+            return JSONResponse({"ok": True})
         except Exception as e:
             logger.exception(f"[PP-WEBHOOK] set_status FAILED item_id={item_id}: {e}")
             return JSONResponse({"ok": False, "error": "monday_update_failed"}, status_code=200)
 
-        return JSONResponse({"ok": True})
     except Exception as e:
         logger.exception(f"[PP-WEBHOOK] EXCEPTION {e}")
         return JSONResponse({"ok": False}, status_code=200)
+
+
+# ---------- DEBUG: simuler un paiement PayPlug 'paid' ----------
+@app.get("/debug/mock_paid")
+def debug_mock_paid(
+    item_id: int = Query(..., description="ID de l'item Monday"),
+    acompte: int = Query(1, description="Numéro d'acompte 1/2")
+):
+    try:
+        status_after = _safe_json_loads(settings.STATUS_AFTER_PAY_JSON, default={}) or {}
+        next_status = status_after.get(str(acompte), f"Payé acompte {acompte}")
+        set_status(int(item_id), settings.STATUS_COLUMN_ID, next_status)
+        return {"ok": True, "item_id": item_id, "acompte": acompte, "set_to": next_status}
+    except Exception as e:
+        logger.exception(f"[DEBUG] mock_paid failed: {e}")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+# ---------- DEBUG: coller un payload PayPlug tel quel ----------
+@app.post("/debug/raw_webhook")
+async def debug_raw_webhook(request: Request):
+    payload = await request.json()
+    logger.info(f"[DEBUG-RAW] payload={payload}")
+    # On réutilise le même handler, en l'appelant "à la main"
+    req = request
+    req._body = json.dumps(payload).encode("utf-8")
+    return await payplug_webhook(req)
