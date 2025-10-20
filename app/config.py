@@ -37,7 +37,4 @@ class Settings(BaseSettings):
     # IBAN mapping fallback
     IBAN_BY_STATUS_JSON: str | None = None
 
-    # Optionnel : forcer un IBAN
-    FORCE_IBAN: str | None = None
-
 settings = Settings()
