@@ -12,11 +12,13 @@ from .monday import (
     set_status,
     compute_formula_value_for_item,
 )
+# >>> Bridge (nouveau)
+from .bridge import create_bridge_payment_link
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("energyz")
 
-app = FastAPI(title="Energyz PayPlug API", version="2.3 (webhook-debug)")
+app = FastAPI(title="Energyz PayPlug API", version="2.4 (payplug + bridge)")
 
 
 # ---------- Utils ----------
@@ -59,7 +61,7 @@ def _norm(s: str) -> str:
 # ---------- Health ----------
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "Energyz PayPlug API is live 🚀", "version": "2.3"}
+    return {"status": "ok", "message": "Energyz PayPlug API is live 🚀", "version": "2.4"}
 
 
 @app.get("/debug/config")
@@ -195,14 +197,14 @@ async def quote_from_monday(request: Request):
         # ---------- Metadata ----------
         metadata = {
             "board_id": str(getattr(settings, "MONDAY_BOARD_ID", "")),
-            "item_id": str(item_id),              # <- clé standard qu'on lit dans le webhook
+            "item_id": str(item_id),              # <- clé standard qu'on lit dans les webhooks
             "item_name": cols.get("name", ""),
             "acompte": acompte_num,
             "description": description or f"Acompte {acompte_num}",
             "source": "energyz-monday",
         }
 
-        # ---------- Création paiement ----------
+        # ---------- Création paiement (CB PayPlug) ----------
         payment_url = create_payment(
             api_key=api_key,
             amount_cents=amount_cents,
@@ -211,11 +213,25 @@ async def quote_from_monday(request: Request):
             client_name=cols.get("name", "Client Energyz"),
             metadata=metadata,
         )
-
         # On met UNIQUEMENT le lien, PAS le statut (on attend le webhook PayPlug)
         set_link_in_column(item_id, link_columns[acompte_num], payment_url, "Payer")
 
-        logger.info(f"[OK-LINK] item={item_id} acompte={acompte_num} amount_cents={amount_cents} url={payment_url}")
+        # ---------- Création paiement (Virement Bridge) ----------
+        try:
+            bridge_url = create_bridge_payment_link(
+                amount_cents=amount_cents,
+                label=metadata.get("description", f"Acompte {acompte_num}"),
+                metadata=metadata,
+            )
+            bridge_key = f"{acompte_num}_v"  # "1_v" / "2_v"
+            if bridge_url and bridge_key in link_columns:
+                set_link_in_column(item_id, link_columns[bridge_key], bridge_url, "Payer par virement")
+        except Exception as be:
+            logger.exception(f"[BRIDGE] create link failed: {be}")
+
+        logger.info(
+            f"[OK-LINK] item={item_id} acompte={acompte_num} amount_cents={amount_cents} url={payment_url}"
+        )
         return {
             "status": "ok",
             "item_id": item_id,
@@ -299,6 +315,42 @@ async def payplug_webhook(request: Request):
 
     except Exception as e:
         logger.exception(f"[PP-WEBHOOK] EXCEPTION {e}")
+        return JSONResponse({"ok": False}, status_code=200)
+
+
+# ---------- Bridge -> Webhook paiement confirmé ----------
+@app.post("/bridge/webhook")
+async def bridge_webhook(request: Request):
+    try:
+        payload = await request.json()
+        logger.info(f"[BRIDGE-WEBHOOK] payload={payload}")
+
+        # payload attendu: {..., "status": "ACSP"/"ACSC"/..., "metadata": {...}}
+        status = str(payload.get("status") or "").upper()
+        md_in = payload.get("metadata")
+        metadata = md_in if isinstance(md_in, dict) else _safe_json_loads(md_in, default={}) or {}
+
+        item_id = metadata.get("item_id")
+        acompte = str(metadata.get("acompte") or "")
+
+        paid_like = status in {"ACSP", "ACSC", "ACCC"}  # accepté / exécuté / compensé
+        if not (paid_like and item_id and acompte in {"1", "2"}):
+            return JSONResponse({"ok": True, "ignored": True})
+
+        status_after = _safe_json_loads(settings.STATUS_AFTER_PAY_JSON, default={}) or {}
+        default_status = "Payé" if acompte == "1" else f"Payé acompte {acompte}"
+        next_status = status_after.get(acompte, default_status)
+
+        try:
+            set_status(int(item_id), settings.STATUS_COLUMN_ID, next_status)
+            logger.info(f"[BRIDGE-WEBHOOK] set_status OK item_id={item_id} -> '{next_status}'")
+            return JSONResponse({"ok": True})
+        except Exception as e:
+            logger.exception(f"[BRIDGE-WEBHOOK] set_status FAILED item_id={item_id}: {e}")
+            return JSONResponse({"ok": False, "error": "monday_update_failed"}, status_code=200)
+
+    except Exception as e:
+        logger.exception(f"[BRIDGE-WEBHOOK] EXCEPTION {e}")
         return JSONResponse({"ok": False}, status_code=200)
 
 
