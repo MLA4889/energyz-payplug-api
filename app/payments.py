@@ -33,8 +33,8 @@ def cents_from_str(amount_str: str) -> int:
         return 0
 
 
+# (conservé pour compat, même si on n'envoie plus "customer")
 def _sanitize_email(raw: str | None) -> str:
-    """Garde pour compat, même si on n'envoie plus 'customer'."""
     if not raw:
         return "client@energyz.fr"
     s = str(raw).strip()
@@ -65,17 +65,17 @@ def _split_first_last(name: str | None) -> tuple[str, str]:
 
 def create_payment(api_key: str, amount_cents: int, email: str, address: str, client_name: str, metadata: dict) -> str:
     """
-    Crée un lien de paiement PayPlug (HTTP) :
-    - redirige vers https://www.energyz.fr après validation (et aussi en cas d’annulation)
-    - notification_url envoyée à chaque paiement pour mettre à jour Monday via /payplug/webhook
-    - n'envoie PAS 'customer' → PayPlug affichera la saisie prénom/nom/email.
+    Crée un lien de paiement PayPlug (HTTP, comme avant) avec UNIQUEMENT :
+    - return_url / cancel_url → https://www.energyz.fr
+    - notification_url pour le webhook (inchangé)
+    - sans bloc "customer" pour forcer la saisie prénom/nom/email côté PayPlug.
     """
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
 
-    # URL de notification : ENV prioritaire, sinon PUBLIC_BASE_URL + /payplug/webhook
+    # notification_url : on continue d'envoyer à chaque paiement (comme avant)
     notif_url = getattr(settings, "NOTIFICATION_URL", None) or (
         settings.PUBLIC_BASE_URL.rstrip("/") + "/payplug/webhook"
     )
@@ -86,14 +86,14 @@ def create_payment(api_key: str, amount_cents: int, email: str, address: str, cl
         "metadata": metadata or {},
         "hosted_payment": {
             "return_url": "https://www.energyz.fr",  # ← après paiement validé
-            "cancel_url": "https://www.energyz.fr",  # ← si annulé
+            "cancel_url": "https://www.energyz.fr",  # ← si paiement annulé
         },
-        "notification_url": notif_url,               # ← PayPlug enverra ici l’event payé
+        "notification_url": notif_url,
         "description": (metadata or {}).get("description", "Paiement acompte Energyz"),
     }
 
-    # ⚠️ On n’inclut PAS 'customer' pour forcer la saisie côté checkout.
-    # Si un jour tu veux pré-remplir, dé-commente ce bloc :
+    # ⚠️ NE PAS inclure "customer" → PayPlug affiche le formulaire Prénom/Nom/Email.
+    # (si tu veux repasser en prérempli un jour, dé-commente le bloc ci-dessous)
     # email_clean = _sanitize_email(email)
     # address_clean = _sanitize_address_line(address)
     # first_name, last_name = _split_first_last(client_name)
