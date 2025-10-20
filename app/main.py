@@ -126,7 +126,6 @@ async def quote_from_monday(request: Request):
         # ---------- Montant ----------
         formula_id = formula_cols[acompte_num]
         acompte_txt = _clean_number_text(cols.get(formula_id, ""))
-
         if float(acompte_txt or "0") <= 0:
             computed = compute_formula_value_for_item(formula_id, int(item_id))
             if computed is not None and computed > 0:
@@ -148,7 +147,7 @@ async def quote_from_monday(request: Request):
 
         # ---------- IBAN : 3 niveaux de fallback ----------
         # 0) IBAN forcé (si présent dans l'env) : FORCE_IBAN
-        forced_iban = (getattr(settings, "FORCE_IBAN", "") or "").strip()
+        forced_iban = getattr(settings, "FORCE_IBAN", "").strip()
         if forced_iban:
             iban = forced_iban
             logger.info(f"[IBAN] Using FORCE_IBAN='{iban}'")
@@ -162,13 +161,12 @@ async def quote_from_monday(request: Request):
             env_map = _safe_json_loads(getattr(settings, "IBAN_BY_STATUS_JSON", None), default={}) or {}
             default_map = {
                 # défauts utiles si ton env est vide/incomplet
-                "energyz mar":    "FR76 1695 8000 0130 5670 5696 366",
+                "energyz mar": "FR76 1695 8000 0130 5670 5696 366",
                 "energyz divers": "FR76 1695 8000 0100 0571 1982 492",
             }
             # merge : l'env écrase les défauts
             # (on normalise les clés ici pour matcher en minuscule partout)
             merged = {**default_map, **{_norm(k): v for k, v in env_map.items()}}
-
             bl = _norm(business_label)
             chosen = ""
             tried = []
@@ -180,7 +178,6 @@ async def quote_from_monday(request: Request):
                 if bl == k or bl.startswith(k) or (k in bl):
                     chosen = v.strip()
                     break
-
             logger.info(f"[IBAN] business_label='{business_label}' (norm='{bl}') tried={tried} → chosen='{chosen}'")
             if chosen:
                 iban = chosen
@@ -235,7 +232,6 @@ async def quote_from_monday(request: Request):
             "amount_cents": amount_cents,
             "payment_url": payment_url,
         }
-
     except HTTPException as e:
         logger.error(f"[HTTP] {e.status_code} {e.detail}")
         raise
@@ -261,8 +257,9 @@ async def payplug_webhook(request: Request):
         status = (payment.get("status") or "").lower()
         is_paid_flag = bool(payment.get("is_paid"))
         paid_like = event_type in {"payment.succeeded", "charge.succeeded", "payment_paid"} or \
-                    status in {"paid", "succeeded"} or \
-                    is_paid_flag
+            status in {"paid", "succeeded"} or \
+            is_paid_flag
+
         if not paid_like:
             return JSONResponse({"ok": True, "ignored": True})
 
@@ -279,7 +276,6 @@ async def payplug_webhook(request: Request):
                 return JSONResponse({"ok": False, "error": "monday_update_failed"}, status_code=200)
 
         return JSONResponse({"ok": True})
-
     except Exception as e:
         logger.exception(f"[PP-WEBHOOK] EXCEPTION {e}")
         return JSONResponse({"ok": False}, status_code=200)
