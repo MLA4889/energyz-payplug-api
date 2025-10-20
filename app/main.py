@@ -148,7 +148,7 @@ async def quote_from_monday(request: Request):
 
         # ---------- IBAN : 3 niveaux de fallback ----------
         # 0) IBAN forcé (si présent dans l'env) : FORCE_IBAN
-        forced_iban = getattr(settings, "FORCE_IBAN", "").strip()
+        forced_iban = (getattr(settings, "FORCE_IBAN", "") or "").strip()
         if forced_iban:
             iban = forced_iban
             logger.info(f"[IBAN] Using FORCE_IBAN='{iban}'")
