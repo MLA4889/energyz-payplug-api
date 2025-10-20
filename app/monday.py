@@ -51,10 +51,7 @@ def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
     }
     """
     data = _post(query, {"item_id": item_id})
-    items = data["data"]["items"]
-    if not items:
-        return {}
-    item = items[0]
+    item = data["data"]["items"][0]
     result = {"name": item["name"]}
     for col in item["column_values"]:
         if col["id"] in column_ids:
