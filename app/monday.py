@@ -10,6 +10,7 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
+
 def _post(query: str, variables: dict):
     resp = requests.post(MONDAY_API_URL, headers=HEADERS, json={"query": query, "variables": variables})
     resp.raise_for_status()
@@ -17,6 +18,7 @@ def _post(query: str, variables: dict):
     if "errors" in data and data["errors"]:
         raise Exception(f"Erreur Monday: {data['errors']}")
     return data
+
 
 def _extract_text_from_column(col: dict) -> str:
     if col.get("text"):
@@ -36,17 +38,13 @@ def _extract_text_from_column(col: dict) -> str:
         return json.dumps(parsed, ensure_ascii=False)
     return str(parsed)
 
+
 def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
     query = """
     query ($item_id: ID!) {
       items (ids: [$item_id]) {
         name
-        column_values {
-          id
-          type
-          text
-          value
-        }
+        column_values { id type text value }
       }
     }
     """
@@ -59,17 +57,13 @@ def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
             result[col["id"] + "__raw"] = col.get("value") or ""
     return result
 
+
 def get_board_columns_map():
     query = """
     query ($board_id: [ID!]) {
       boards (ids: $board_id) {
         id
-        columns {
-          id
-          title
-          type
-          settings_str
-        }
+        columns { id title type settings_str }
       }
     }
     """
@@ -96,9 +90,11 @@ def get_board_columns_map():
                 pass
     return cols, id_to_title, title_to_id, formulas, col_types
 
+
 def get_formula_expression(column_id: str) -> str | None:
     _, _, _, formulas, _ = get_board_columns_map()
     return formulas.get(column_id)
+
 
 def _translate_monday_expr(expr: str) -> str:
     if expr is None:
@@ -120,16 +116,17 @@ def _translate_monday_expr(expr: str) -> str:
     out = re.sub(r"(?<![<>!=])=(?!=)", "==", out)
     return out
 
+
 def _safe_eval_arith_bool(expr: str) -> float:
     import ast, operator as op
     allowed_binops = {
-        ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul, ast.Div: op.truediv,
-        ast.Pow: op.pow, ast.Mod: op.mod
+        ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul, ast.Div: op.truediv, ast.Pow: op.pow, ast.Mod: op.mod
     }
     allowed_unary = {ast.UAdd: op.pos, ast.USub: op.neg, ast.Not: op.not_}
     allowed_cmp = {
         ast.Eq: op.eq, ast.NotEq: op.ne, ast.Gt: op.gt, ast.GtE: op.ge, ast.Lt: op.lt, ast.LtE: op.le
     }
+
     def if_(*args):
         if len(args) < 2:
             raise ValueError("IF() requiert au moins 2 arguments")
@@ -137,15 +134,22 @@ def _safe_eval_arith_bool(expr: str) -> float:
         a = args[1]
         b = args[2] if len(args) >= 3 else 0
         return a if cond else b
-    def and_(*args): return float(all(bool(x) for x in args))
-    def or_(*args):  return float(any(bool(x) for x in args))
-    def not_(x):     return float(not bool(x))
+
+    def and_(*args):
+        return float(all(bool(x) for x in args))
+
+    def or_(*args):
+        return float(any(bool(x) for x in args))
+
+    def not_(x):
+        return float(not bool(x))
+
     safe_funcs = {
-        'round': round, 'if_': if_, 'min': min, 'max': max,
-        'abs': abs, 'floor': math.floor, 'ceil': math.ceil,
-        'and_': and_, 'or_': or_, 'not_': not_,
+        'round': round, 'if_': if_, 'min': min, 'max': max, 'abs': abs,
+        'floor': math.floor, 'ceil': math.ceil, 'and_': and_, 'or_': or_, 'not_': not_,
         'True': True, 'False': False,
     }
+
     def _eval(node):
         if isinstance(node, ast.Expression):
             return _eval(node.body)
@@ -153,9 +157,9 @@ def _safe_eval_arith_bool(expr: str) -> float:
             if isinstance(node.value, (int, float, bool, str)):
                 return node.value
             raise ValueError("Constante non autorisée")
-        if isinstance(node, ast.Str):  # < Py3.8
+        if isinstance(node, ast.Str):
             return node.s
-        if isinstance(node, ast.Num):  # < Py3.8
+        if isinstance(node, ast.Num):
             return node.n
         if isinstance(node, ast.BinOp):
             return allowed_binops[type(node.op)](_eval(node.left), _eval(node.right))
@@ -189,26 +193,25 @@ def _safe_eval_arith_bool(expr: str) -> float:
                 return safe_funcs[node.id]
             raise ValueError(f"Nom non autorisé: {node.id}")
         raise ValueError("Expression non autorisée")
+
     tree = ast.parse(expr, mode='eval')
     val = _eval(tree)
     return float(val) if isinstance(val, (int, float, bool)) else 0.0
 
+
 def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float | None:
     _, id_to_title, title_to_id, formulas, col_types = get_board_columns_map()
+
     query = """
     query ($item_id: ID!) {
       items (ids: [$item_id]) {
-        column_values {
-          id
-          type
-          text
-          value
-        }
+        column_values { id type text value }
       }
     }
     """
     data = _post(query, {"item_id": item_id})
     item_cols = data["data"]["items"][0]["column_values"]
+
     id_to_numeric: dict[str, float] = {}
     id_to_string: dict[str, str] = {}
     for col in item_cols:
@@ -218,8 +221,10 @@ def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float |
             id_to_numeric[col["id"]] = float(re.sub(r"[^0-9\.\-]", "", val_txt.replace(",", ".")) or 0)
         else:
             id_to_string[col["id"]] = val_txt
+
     seen: set[str] = set()
     cache_num: dict[str, float] = {}
+
     def resolve_token(token: str):
         col_id = token
         if col_id not in col_types and token in title_to_id:
@@ -238,10 +243,12 @@ def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float |
             if not child_expr:
                 seen.discard(col_id); return 0.0
             child_expr = _translate_monday_expr(child_expr)
+
             def repl_child(m: re.Match) -> str:
                 tk = m.group(1)
                 val = resolve_token(tk)
                 return str(val)
+
             child_expr = re.sub(r"\{([^}]+)\}", repl_child, child_expr)
             try:
                 val = _safe_eval_arith_bool(child_expr)
@@ -251,19 +258,23 @@ def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float |
             seen.discard(col_id)
             return val
         return 0.0
+
     root = formulas.get(formula_col_id)
     if not root:
         return None
     root_expr = _translate_monday_expr(root)
+
     def repl_root(m: re.Match) -> str:
         tk = m.group(1)
         val = resolve_token(tk)
         return str(val)
+
     root_expr = re.sub(r"\{([^}]+)\}", repl_root, root_expr)
     try:
         return _safe_eval_arith_bool(root_expr)
     except Exception:
         return None
+
 
 def set_link_in_column(item_id: int, column_id: str, url: str, text: str):
     mutation = """
@@ -280,6 +291,7 @@ def set_link_in_column(item_id: int, column_id: str, url: str, text: str):
         "column_id": column_id,
         "value": link_value
     })
+
 
 def set_status(item_id: int, column_id: str, label: str):
     mutation = """
