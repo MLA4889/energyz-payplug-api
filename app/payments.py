@@ -1,105 +1,88 @@
-import requests
-import json
-import re
+from typing import Optional
+import payplug
+import logging
+
 from .config import settings
 
-_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", flags=re.IGNORECASE)
+logger = logging.getLogger("energyz")
 
 
-def _choose_api_key(iban: str) -> str:
-    """Sélectionne la clé PayPlug selon l’IBAN et le mode (test/live)."""
-    mode = (settings.PAYPLUG_MODE or "").lower()
-    key_dict = json.loads(settings.PAYPLUG_KEYS_TEST_JSON if mode == "test" else settings.PAYPLUG_KEYS_LIVE_JSON)
-    return key_dict.get((iban or "").strip())
+# ---------- Utilitaires ----------
+def _choose_api_key(iban_display_value: str) -> Optional[str]:
+    """
+    Choisit la clé PayPlug (test/live) selon l'IBAN détecté.
+    """
+    iban = (iban_display_value or "").replace(" ", "").upper()
+    if settings.PAYPLUG_MODE == "test":
+        return settings.PAYPLUG_TEST_KEY
+    if "13056705696366" in iban:
+        return settings.PAYPLUG_LIVE_KEY  # Energyz MAR
+    if "10005711982492" in iban:
+        return settings.PAYPLUG_LIVE_KEY  # Energyz Divers
+    # par défaut
+    return settings.PAYPLUG_LIVE_KEY
 
 
 def cents_from_str(amount_str: str) -> int:
-    """Convertit un montant texte en centimes (ex: '1250.00' → 125000)."""
+    """
+    Convertit une chaîne en centimes.
+    """
     try:
-        if not amount_str:
-            return 0
-        cleaned = (
-            str(amount_str)
-            .replace("€", "")
-            .replace("\u202f", "")
-            .replace(" ", "")
-            .replace(",", ".")
-        )
-        return int(round(float(cleaned) * 100))
+        amount = float(str(amount_str).replace(",", ".").strip())
+        return int(round(amount * 100))
     except Exception:
         return 0
 
 
-def _sanitize_email(raw: str | None) -> str:
-    if not raw:
-        return "client@inconnu.fr"
-    s = str(raw).strip()
-    s = s.replace("mailto:", "").replace("<", " ").replace(">", " ")
-    s = re.sub(r"[;,/|]", " ", s)
-    m = _EMAIL_RE.search(s)
-    if not m:
-        return "client@inconnu.fr"
-    return m.group(0).lower()
-
-
-def _sanitize_address_line(raw: str | None) -> str:
-    if not raw:
-        return "Adresse non précisée"
-    s = str(raw).strip()
-    s = re.sub(r"[\r\n\t]+", " ", s)
-    return s[:255] if len(s) > 255 else s
-
-
-def _split_first_last(name: str | None) -> tuple[str, str]:
-    if not name:
-        return ("Client", "Energyz")
-    parts = str(name).strip().split()
-    if len(parts) == 1:
-        return (parts[0][:50], "Energyz")
-    return (parts[0][:50], " ".join(parts[1:])[:50])
-
-
-def create_payment(api_key: str, amount_cents: int, email: str, address: str, client_name: str, metadata: dict) -> str:
+# ---------- Création du paiement ----------
+def create_payment(
+    api_key: str,
+    amount_cents: int,
+    email: str,
+    address: str,
+    client_name: str,
+    metadata: dict,
+) -> str:
     """
-    Crée un lien de paiement PayPlug.
-
-    ⚙️ On N'ENVOIE PAS 'customer' pour obliger la saisie Prénom/Nom/Email sur le checkout.
-    ⚙️ On envoie 'notification_url' au niveau du paiement (comme dans ton ancien code).
+    Crée un paiement PayPlug hébergé et renvoie l'URL de paiement.
     """
-    # 1) URL de notification : ENV prioritaire, sinon /payplug/webhook sur PUBLIC_BASE_URL
-    notif_url = settings.NOTIFICATION_URL or (settings.PUBLIC_BASE_URL.rstrip("/") + "/payplug/webhook")
+    payplug.set_secret_key(api_key)
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
+    # ----------- CONFIG DE REDIRECTION -----------
+    return_url = "https://www.energyz.fr"   # <- après paiement validé
+    cancel_url = "https://www.energyz.fr"   # <- si paiement annulé
+    notification_url = (
+        getattr(settings, "NOTIFICATION_URL", None)
+        or settings.PUBLIC_BASE_URL.rstrip("/") + "/payplug/webhook"
+    )
 
     payload = {
         "amount": amount_cents,
         "currency": "EUR",
-        "metadata": metadata or {},
-        "hosted_payment": {
-            "return_url": settings.PUBLIC_BASE_URL,   # où rediriger APRÈS paiement
-            "cancel_url": settings.PUBLIC_BASE_URL,   # (optionnel) retour si annulation
+        "save_card": False,
+        "billing": {
+            "email": email or "client@energyz.fr",
+            "address1": address or "France",
+            "first_name": client_name or "Client",
+            "last_name": client_name or "",
         },
-        "notification_url": notif_url,                # <-- clé pour recevoir le callback PayPlug
-        "description": (metadata or {}).get("description", "Paiement acompte Energyz")
+        "hosted_payment": {
+            "return_url": return_url,
+            "cancel_url": cancel_url,
+            "sent_by": "Energyz API",
+        },
+        "notification_url": notification_url,
+        "metadata": metadata or {},
+        "description": (metadata or {}).get("description", "Paiement acompte Energyz"),
     }
 
-    # 💡 Si un jour tu veux pré-remplir côté PayPlug, dé-commente ce bloc.
-    # email_clean = _sanitize_email(email)
-    # address_clean = _sanitize_address_line(address)
-    # first_name, last_name = _split_first_last(client_name)
-    # payload["customer"] = {
-    #     "email": email_clean,
-    #     "first_name": first_name,
-    #     "last_name": last_name,
-    #     "address1": address_clean
-    # }
+    logger.info(f"[PAYPLUG] Creating payment → {payload}")
 
-    url = "https://api.payplug.com/v1/payments"
-    res = requests.post(url, headers=headers, json=payload)
-    if res.status_code not in [200, 201]:
-        raise Exception(f"Erreur PayPlug : {res.status_code} → {res.text}")
-    data = res.json()
-    return data.get("hosted_payment", {}).get("payment_url")
+    try:
+        payment = payplug.Payment.create(**payload)
+        payment_url = payment.hosted_payment.payment_url
+        logger.info(f"[PAYPLUG] Payment created OK url={payment_url}")
+        return payment_url
+    except payplug.exceptions.PayplugError as e:
+        logger.error(f"[PAYPLUG] Error: {e}")
+        raise
