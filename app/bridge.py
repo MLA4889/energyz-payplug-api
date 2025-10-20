@@ -24,34 +24,32 @@ def _headers():
     }
 
 def _extract_url(data: dict) -> str:
+    """Cherche l'URL du lien dans la réponse Bridge"""
     if not isinstance(data, dict):
         return ""
-    # différentes versions/retours possibles selon Bridge
-    for k in ("url", "link", "redirect_url", "payment_link", "payment_url"):
-        if data.get(k):
-            return data[k]
-    # parfois imbriqué
-    for k in ("data", "result"):
-        if isinstance(data.get(k), dict):
-            u = _extract_url(data[k])
-            if u:
-                return u
+    for key in ("url", "redirect_url", "link", "payment_link", "payment_url"):
+        if data.get(key):
+            return data[key]
+    if isinstance(data.get("data"), dict):
+        return _extract_url(data["data"])
     return ""
 
 def create_bridge_payment_link(amount_cents: int, label: str, metadata: dict) -> str:
     """
-    Essaie automatiquement les schémas Bridge connus et renvoie l'URL du payment-link.
-    - Ne plante pas PayPlug: l'exception est remontée au caller qui la catch et log.
+    Crée un lien de paiement bancaire Bridge (virement instantané)
+    Compatible sandbox et production.
     """
     if not BRIDGE_CLIENT_ID or not BRIDGE_CLIENT_SECRET:
-        raise Exception("Bridge credentials missing (BRIDGE_CLIENT_ID/BRIDGE_CLIENT_SECRET)")
+        raise Exception("Bridge credentials missing (CLIENT_ID/SECRET)")
     if not BRIDGE_BENEFICIARY_IBAN:
-        raise Exception("Bridge beneficiary IBAN missing (BRIDGE_BENEFICIARY_IBAN)")
+        raise Exception("Bridge beneficiary IBAN missing")
 
-    # 1) v2/payment-links : amount en EUROS (float) + beneficiary avec "type"
-    body_v2 = {
+    # Montant en euros (Bridge ne veut pas de centimes dans sandbox)
+    amount_euros = round((amount_cents or 0) / 100.0, 2)
+
+    body = {
         "label": label or "Acompte Energyz",
-        "amount": round((amount_cents or 0) / 100.0, 2),  # euros
+        "amount": amount_euros,
         "currency": "EUR",
         "beneficiary": {
             "type": "iban",
@@ -60,44 +58,18 @@ def create_bridge_payment_link(amount_cents: int, label: str, metadata: dict) ->
         },
         "success_url": BRIDGE_SUCCESS_URL,
         "cancel_url": BRIDGE_CANCEL_URL,
-        "metadata": metadata or {},
     }
-    url_v2 = f"{BRIDGE_BASE}/v2/payment-links"
 
-    # 2) v3/payment/payment-links : amount objet (centimes)
-    body_v3 = {
-        "label": label or "Acompte Energyz",
-        "amount": {"value": int(amount_cents), "currency": "EUR"},
-        "beneficiary": {
-            "name": BRIDGE_BENEFICIARY_NAME or "ENERGYZ",
-            "iban": BRIDGE_BENEFICIARY_IBAN
-        },
-        "success_url": BRIDGE_SUCCESS_URL,
-        "cancel_url": BRIDGE_CANCEL_URL,
-        "metadata": metadata or {},
-    }
-    url_v3 = f"{BRIDGE_BASE}/v3/payment/payment-links"
+    url = f"{BRIDGE_BASE}/v2/payment-links"
 
-    # Essais dans l'ordre v2 puis v3
-    for endpoint, body in ((url_v2, body_v2), (url_v3, body_v3)):
-        try:
-            res = requests.post(endpoint, headers=_headers(), json=body, timeout=25)
-        except Exception as e:
-            # problème réseau ponctuel → essaie endpoint suivant
-            last_err = f"request error {type(e).__name__}: {e}"
-            continue
+    res = requests.post(url, headers=_headers(), json=body, timeout=25)
 
-        if res.status_code in (200, 201):
-            data = res.json() or {}
-            link = _extract_url(data)
-            if link:
-                return link
-            # si pas d'URL claire, on tente la clé "url" brute
-            if isinstance(data, dict) and data.get("url"):
-                return data["url"]
+    if res.status_code not in (200, 201):
+        raise Exception(f"Bridge create link failed: {res.status_code} -> {res.text}")
 
-        # si 4xx, on tente l'autre schéma/endpoint
-        last_err = f"{res.status_code} -> {res.text}"
+    data = res.json() or {}
+    link = _extract_url(data)
+    if not link:
+        raise Exception(f"Bridge link not found in response: {data}")
 
-    # si on est ici, tous les essais ont échoué
-    raise Exception(f"Bridge create link failed on all attempts: {last_err}")
+    return link
