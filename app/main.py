@@ -213,7 +213,7 @@ async def quote_from_monday(request: Request):
         )
 
         # On met UNIQUEMENT le lien, PAS le statut (on attend le webhook PayPlug)
-        set_link_in_column(item_id, link_columns[acompte_num], payment_url, f"Payer acompte {acompte_num}")
+        set_link_in_column(item_id, link_columns[acompte_num], payment_url, "Payer")
 
         logger.info(f"[OK-LINK] item={item_id} acompte={acompte_num} amount_cents={amount_cents} url={payment_url}")
         return {
