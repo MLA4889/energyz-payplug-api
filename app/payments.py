@@ -63,9 +63,12 @@ def create_payment(api_key: str, amount_cents: int, email: str, address: str, cl
     """
     Crée un lien de paiement PayPlug.
 
-    ⚙️ Version forcée : NE PAS envoyer de bloc "customer"
-    → ainsi, PayPlug affiche les champs Prénom / Nom / Email à remplir.
+    ⚙️ On N'ENVOIE PAS 'customer' pour obliger la saisie Prénom/Nom/Email sur le checkout.
+    ⚙️ On envoie 'notification_url' au niveau du paiement (comme dans ton ancien code).
     """
+    # 1) URL de notification : ENV prioritaire, sinon /payplug/webhook sur PUBLIC_BASE_URL
+    notif_url = settings.NOTIFICATION_URL or (settings.PUBLIC_BASE_URL.rstrip("/") + "/payplug/webhook")
+
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
@@ -76,14 +79,14 @@ def create_payment(api_key: str, amount_cents: int, email: str, address: str, cl
         "currency": "EUR",
         "metadata": metadata or {},
         "hosted_payment": {
-            "return_url": settings.PUBLIC_BASE_URL
+            "return_url": settings.PUBLIC_BASE_URL,   # où rediriger APRÈS paiement
+            "cancel_url": settings.PUBLIC_BASE_URL,   # (optionnel) retour si annulation
         },
+        "notification_url": notif_url,                # <-- clé pour recevoir le callback PayPlug
         "description": (metadata or {}).get("description", "Paiement acompte Energyz")
     }
 
-    # 🧩 Ne pas inclure "customer" → PayPlug affichera le formulaire complet
-    # (Si tu veux repasser en mode auto, il suffira de réinsérer le bloc ci-dessous)
-    #
+    # 💡 Si un jour tu veux pré-remplir côté PayPlug, dé-commente ce bloc.
     # email_clean = _sanitize_email(email)
     # address_clean = _sanitize_address_line(address)
     # first_name, last_name = _split_first_last(client_name)
