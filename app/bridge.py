@@ -2,7 +2,12 @@
 import os
 import requests
 
-BRIDGE_BASE = "https://api.bridgeapi.io"
+# ---------- Base URL ----------
+# En sandbox : sandbox.bridgeapi.io
+# En prod : api.bridgeapi.io
+BRIDGE_MODE = os.getenv("BRIDGE_MODE", "sandbox").lower()
+BRIDGE_BASE = "https://sandbox.bridgeapi.io" if BRIDGE_MODE == "sandbox" else "https://api.bridgeapi.io"
+
 BRIDGE_VERSION = os.getenv("BRIDGE_VERSION", "2025-01-15")
 
 BRIDGE_CLIENT_ID = os.getenv("BRIDGE_CLIENT_ID")
@@ -10,7 +15,6 @@ BRIDGE_CLIENT_SECRET = os.getenv("BRIDGE_CLIENT_SECRET")
 
 BRIDGE_SUCCESS_URL = os.getenv("BRIDGE_SUCCESS_URL", "https://www.energyz.fr")
 BRIDGE_CANCEL_URL = os.getenv("BRIDGE_CANCEL_URL", "https://www.energyz.fr")
-
 BRIDGE_BENEFICIARY_NAME = os.getenv("BRIDGE_BENEFICIARY_NAME", "ENERGYZ")
 BRIDGE_BENEFICIARY_IBAN = os.getenv("BRIDGE_BENEFICIARY_IBAN")
 
@@ -24,7 +28,7 @@ def _headers():
     }
 
 def _extract_url(data: dict) -> str:
-    """Cherche l'URL du lien dans la réponse Bridge"""
+    """Cherche l'URL du lien Bridge dans la réponse."""
     if not isinstance(data, dict):
         return ""
     for key in ("url", "redirect_url", "link", "payment_link", "payment_url"):
@@ -37,14 +41,14 @@ def _extract_url(data: dict) -> str:
 def create_bridge_payment_link(amount_cents: int, label: str, metadata: dict) -> str:
     """
     Crée un lien de paiement bancaire Bridge (virement instantané)
-    Compatible sandbox et production.
+    Compatible sandbox & production.
     """
     if not BRIDGE_CLIENT_ID or not BRIDGE_CLIENT_SECRET:
         raise Exception("Bridge credentials missing (CLIENT_ID/SECRET)")
     if not BRIDGE_BENEFICIARY_IBAN:
         raise Exception("Bridge beneficiary IBAN missing")
 
-    # Montant en euros (Bridge ne veut pas de centimes dans sandbox)
+    # Montant en euros (Bridge Sandbox attend un float, pas centimes)
     amount_euros = round((amount_cents or 0) / 100.0, 2)
 
     body = {
@@ -57,11 +61,10 @@ def create_bridge_payment_link(amount_cents: int, label: str, metadata: dict) ->
             "iban": BRIDGE_BENEFICIARY_IBAN
         },
         "success_url": BRIDGE_SUCCESS_URL,
-        "cancel_url": BRIDGE_CANCEL_URL,
+        "cancel_url": BRIDGE_CANCEL_URL
     }
 
     url = f"{BRIDGE_BASE}/v2/payment-links"
-
     res = requests.post(url, headers=_headers(), json=body, timeout=25)
 
     if res.status_code not in (200, 201):
