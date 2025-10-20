@@ -12,7 +12,6 @@ from .monday import (
     set_status,
     compute_formula_value_for_item,
 )
-# >>> Bridge (nouveau)
 from .bridge import create_bridge_payment_link
 
 logging.basicConfig(level=logging.INFO)
@@ -135,23 +134,36 @@ async def quote_from_monday(request: Request):
         description = cols.get(settings.DESCRIPTION_COLUMN_ID, "") or ""
         iban = (cols.get(settings.IBAN_FORMULA_COLUMN_ID, "") or "").strip()
 
-        # ---------- Montant ----------
+        # ---------- Montant (avec fallbacks robustes) ----------
         formula_id = formula_cols[acompte_num]
         acompte_txt = _clean_number_text(cols.get(formula_id, ""))
+
+        # 1) valeur brute du champ formula
         if float(acompte_txt or "0") <= 0:
+            # 2) recalcul via API Monday
             computed = compute_formula_value_for_item(formula_id, int(item_id))
             if computed is not None and computed > 0:
                 acompte_txt = str(computed)
 
+        # 3) fallback sur Total HT / 2 si toujours vide
         if float(acompte_txt or "0") <= 0:
             total_ht_txt = _clean_number_text(cols.get(settings.QUOTE_AMOUNT_FORMULA_ID, "0"))
             if float(total_ht_txt) > 0:
                 acompte_txt = str(float(total_ht_txt) / 2.0)
-            else:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Montant introuvable (formula + recalcul + total HT vides).",
-                )
+
+        # 4) fallback ENV (garantit un lien)
+        if float(acompte_txt or "0") <= 0:
+            fallback = getattr(settings, "FORMULA_FALLBACK_VALUE", None)
+            if fallback:
+                acompte_txt = str(fallback)
+                logger.warning(f"[FALLBACK] Formula vide, utilisation fallback={acompte_txt}")
+
+        # 5) si malgré tout rien -> erreur claire
+        if float(acompte_txt or "0") <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Montant introuvable (formula + recalcul + total HT + fallback vides).",
+            )
 
         amount_cents = cents_from_str(acompte_txt)
         if amount_cents <= 0:
@@ -197,7 +209,7 @@ async def quote_from_monday(request: Request):
         # ---------- Metadata ----------
         metadata = {
             "board_id": str(getattr(settings, "MONDAY_BOARD_ID", "")),
-            "item_id": str(item_id),              # <- clé standard qu'on lit dans les webhooks
+            "item_id": str(item_id),  # <- clé standard lue dans les webhooks
             "item_name": cols.get("name", ""),
             "acompte": acompte_num,
             "description": description or f"Acompte {acompte_num}",
@@ -223,7 +235,7 @@ async def quote_from_monday(request: Request):
                 label=metadata.get("description", f"Acompte {acompte_num}"),
                 metadata=metadata,
             )
-            bridge_key = f"{acompte_num}_v"  # "1_v" / "2_v"
+            bridge_key = f"{acompte_num}_v"  # "1_v" / "2_v" (doit exister dans LINK_COLUMN_IDS_JSON)
             if bridge_url and bridge_key in link_columns:
                 set_link_in_column(item_id, link_columns[bridge_key], bridge_url, "Payer par virement")
         except Exception as be:
@@ -253,15 +265,6 @@ async def payplug_webhook(request: Request):
     try:
         payload = await request.json()
         logger.info(f"[PP-WEBHOOK] payload={payload}")
-
-        # --- Détection paid sur TOUS les formats connus ---
-        def _get(d, path, default=None):
-            cur = d
-            for k in path:
-                if not isinstance(cur, dict) or k not in cur:
-                    return default
-                cur = cur[k]
-            return cur
 
         root_is_paid = bool(payload.get("is_paid"))
         root_status = str(payload.get("status") or "").lower()
