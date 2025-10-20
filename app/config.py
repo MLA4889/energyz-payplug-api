@@ -15,7 +15,8 @@ class Settings(BaseSettings):
     PAYPLUG_KEYS_TEST_JSON: str
     PAYPLUG_KEYS_LIVE_JSON: str
     PAYPLUG_MODE: str
-    PUBLIC_BASE_URL: str
+    PUBLIC_BASE_URL: str  # ex: https://energyz-payplug-api.onrender.com
+    NOTIFICATION_URL: str | None = None  # ex: https://.../payplug/webhook (optionnel)
 
     # Colonnes Monday
     EMAIL_COLUMN_ID: str
@@ -36,5 +37,8 @@ class Settings(BaseSettings):
 
     # IBAN mapping fallback
     IBAN_BY_STATUS_JSON: str | None = None
+
+    # Checkout comportement (laisse vide pour obliger la saisie côté PayPlug)
+    FORCE_CHECKOUT_COLLECT_CONTACT: str | None = None
 
 settings = Settings()
