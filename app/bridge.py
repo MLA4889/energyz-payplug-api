@@ -1,78 +1,66 @@
-# app/bridge.py
+# src/app/bridge.py
 import os
+import json
 import requests
+from .config import settings
 
-# ---------- Base URL ----------
-# En sandbox : sandbox.bridgeapi.io
-# En prod : api.bridgeapi.io
-BRIDGE_MODE = os.getenv("BRIDGE_MODE", "sandbox").lower()
-BRIDGE_BASE = "https://sandbox.bridgeapi.io" if BRIDGE_MODE == "sandbox" else "https://api.bridgeapi.io"
+BRIDGE_BASE_URL = getattr(settings, "BRIDGE_BASE_URL", "") or "https://api.bridgeapi.io"
+TOKEN_URL  = f"{BRIDGE_BASE_URL}/v2/oauth/token"
+LINKS_URL  = f"{BRIDGE_BASE_URL}/v2/payment-links"
 
-BRIDGE_VERSION = os.getenv("BRIDGE_VERSION", "2025-01-15")
-
-BRIDGE_CLIENT_ID = os.getenv("BRIDGE_CLIENT_ID")
-BRIDGE_CLIENT_SECRET = os.getenv("BRIDGE_CLIENT_SECRET")
-
-BRIDGE_SUCCESS_URL = os.getenv("BRIDGE_SUCCESS_URL", "https://www.energyz.fr")
-BRIDGE_CANCEL_URL = os.getenv("BRIDGE_CANCEL_URL", "https://www.energyz.fr")
-BRIDGE_BENEFICIARY_NAME = os.getenv("BRIDGE_BENEFICIARY_NAME", "ENERGYZ")
-BRIDGE_BENEFICIARY_IBAN = os.getenv("BRIDGE_BENEFICIARY_IBAN")
-
-def _headers():
-    return {
-        "Bridge-Version": BRIDGE_VERSION,
+def _headers(access_token: str | None = None) -> dict:
+    h = {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "Client-Id": BRIDGE_CLIENT_ID or "",
-        "Client-Secret": BRIDGE_CLIENT_SECRET or "",
+        # Version Bridge: utilisez celle que vous avez mise en ENV
+        "Bridge-Version": getattr(settings, "BRIDGE_VERSION", "2025-01-15"),
     }
+    if access_token:
+        h["Authorization"] = f"Bearer {access_token}"
+    return h
 
-def _extract_url(data: dict) -> str:
-    """Cherche l'URL du lien Bridge dans la réponse."""
-    if not isinstance(data, dict):
-        return ""
-    for key in ("url", "redirect_url", "link", "payment_link", "payment_url"):
-        if data.get(key):
-            return data[key]
-    if isinstance(data.get("data"), dict):
-        return _extract_url(data["data"])
-    return ""
+def _get_access_token() -> str:
+    payload = {
+        "grant_type": "client_credentials",
+        "client_id": settings.BRIDGE_CLIENT_ID,       # sandbox_id_xxx... en sandbox
+        "client_secret": settings.BRIDGE_CLIENT_SECRET,
+    }
+    resp = requests.post(TOKEN_URL, json=payload, headers=_headers(), timeout=25)
+    if resp.status_code >= 400:
+        raise Exception(f"Bridge token error: {resp.status_code} -> {resp.text}")
+    data = resp.json()
+    return data.get("access_token")
 
-def create_bridge_payment_link(amount_cents: int, label: str, metadata: dict) -> str:
+def create_bridge_payment_link(*, amount_cents: int, label: str, metadata: dict) -> str:
     """
-    Crée un lien de paiement bancaire Bridge (virement instantané)
-    Compatible sandbox & production.
+    Crée un lien de paiement Bridge (virement instantané).
+    amount_cents : montant en centimes
+    label        : libellé visible pour le payeur
+    metadata     : dict arbitraire (on y met item_id, acompte, etc.)
     """
-    if not BRIDGE_CLIENT_ID or not BRIDGE_CLIENT_SECRET:
-        raise Exception("Bridge credentials missing (CLIENT_ID/SECRET)")
-    if not BRIDGE_BENEFICIARY_IBAN:
-        raise Exception("Bridge beneficiary IBAN missing")
+    access_token = _get_access_token()
 
-    # Montant en euros (Bridge Sandbox attend un float, pas centimes)
-    amount_euros = round((amount_cents or 0) / 100.0, 2)
-
+    # Corps attendu par Bridge
     body = {
-        "label": label or "Acompte Energyz",
-        "amount": amount_euros,
+        "amount": amount_cents,
         "currency": "EUR",
-        "beneficiary": {
-            "type": "iban",
-            "name": BRIDGE_BENEFICIARY_NAME or "ENERGYZ",
-            "iban": BRIDGE_BENEFICIARY_IBAN
+        "label": label,
+        "creditor": {
+            "name": getattr(settings, "BRIDGE_BENEFICIARY_NAME", "ENERGYZ"),
+            "iban": getattr(settings, "BRIDGE_BENEFICIARY_IBAN", "").replace(" ", ""),
         },
-        "success_url": BRIDGE_SUCCESS_URL,
-        "cancel_url": BRIDGE_CANCEL_URL
+        # URLs de redirection
+        "success_url": getattr(settings, "BRIDGE_SUCCESS_URL", "https://www.energyz.fr"),
+        "cancel_url": getattr(settings, "BRIDGE_CANCEL_URL",  "https://www.energyz.fr"),
+        # Vous pouvez aussi prévoir un webhook global via le dashboard Bridge,
+        # sinon ajoutez "webhook_url": f"{settings.PUBLIC_BASE_URL}/bridge/webhook"
+        "metadata": metadata or {},
     }
 
-    url = f"{BRIDGE_BASE}/v2/payment-links"
-    res = requests.post(url, headers=_headers(), json=body, timeout=25)
+    resp = requests.post(LINKS_URL, json=body, headers=_headers(access_token), timeout=25)
+    if resp.status_code >= 400:
+        raise Exception(f"Bridge create link failed: {resp.status_code} -> {resp.text}")
 
-    if res.status_code not in (200, 201):
-        raise Exception(f"Bridge create link failed: {res.status_code} -> {res.text}")
-
-    data = res.json() or {}
-    link = _extract_url(data)
-    if not link:
-        raise Exception(f"Bridge link not found in response: {data}")
-
-    return link
+    data = resp.json()
+    # Selon la spec Bridge, l’URL direct du parcours de paiement est généralement dans "hosted_payment_url" ou "url"
+    return data.get("hosted_payment_url") or data.get("url") or ""
