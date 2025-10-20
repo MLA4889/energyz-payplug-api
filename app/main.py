@@ -16,7 +16,7 @@ from .monday import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("energyz")
 
-app = FastAPI(title="Energyz PayPlug API", version="2.1 (robust IBAN + PP webhook)")
+app = FastAPI(title="Energyz PayPlug API", version="2.2 (robust per-payment webhook)")
 
 
 # ---------- Utils ----------
@@ -145,50 +145,36 @@ async def quote_from_monday(request: Request):
         if amount_cents <= 0:
             raise HTTPException(status_code=400, detail=f"Montant invalide après parsing: '{acompte_txt}'.")
 
-        # ---------- IBAN : 3 niveaux de fallback ----------
-        # 0) IBAN forcé (si présent dans l'env) : FORCE_IBAN
+        # ---------- IBAN / Clé PayPlug ----------
         forced_iban = getattr(settings, "FORCE_IBAN", "").strip()
         if forced_iban:
             iban = forced_iban
             logger.info(f"[IBAN] Using FORCE_IBAN='{iban}'")
 
-        # 1) Si formule vide, on tente un mapping par Business Line (avec normalisation et matching souple)
         if not iban:
             business_col_id = getattr(settings, "BUSINESS_STATUS_COLUMN_ID", "color_mkwnxf1h")
             business_label = (cols.get(business_col_id, "") or "").strip()
-
-            # mapping depuis l'env (clé: label BL, valeur: IBAN) + défauts codés
             env_map = _safe_json_loads(getattr(settings, "IBAN_BY_STATUS_JSON", None), default={}) or {}
             default_map = {
-                # défauts utiles si ton env est vide/incomplet
                 "energyz mar": "FR76 1695 8000 0130 5670 5696 366",
                 "energyz divers": "FR76 1695 8000 0100 0571 1982 492",
             }
-            # merge : l'env écrase les défauts
-            # (on normalise les clés ici pour matcher en minuscule partout)
             merged = {**default_map, **{_norm(k): v for k, v in env_map.items()}}
             bl = _norm(business_label)
             chosen = ""
-            tried = []
             for k, v in merged.items():
-                tried.append(k)
                 if not v:
                     continue
-                # match exact / startswith / contains
                 if bl == k or bl.startswith(k) or (k in bl):
                     chosen = v.strip()
                     break
-            logger.info(f"[IBAN] business_label='{business_label}' (norm='{bl}') tried={tried} → chosen='{chosen}'")
+            logger.info(f"[IBAN] business='{business_label}' → chosen='{chosen}'")
             if chosen:
                 iban = chosen
 
         if not iban:
-            raise HTTPException(
-                status_code=400,
-                detail="IBAN introuvable (formule vide + pas de fallback Business Line).",
-            )
+            raise HTTPException(status_code=400, detail="IBAN introuvable (formule + fallback BL vides).")
 
-        # ---------- Clé PayPlug ----------
         api_key = _choose_api_key(iban)
         if not api_key:
             raise HTTPException(
@@ -196,10 +182,10 @@ async def quote_from_monday(request: Request):
                 detail=f"Aucune clé PayPlug mappée pour IBAN '{iban}' (mode={settings.PAYPLUG_MODE}).",
             )
 
-        # ---------- Metadata riche ----------
+        # ---------- Metadata ----------
         metadata = {
             "board_id": str(getattr(settings, "MONDAY_BOARD_ID", "")),
-            "item_id": str(item_id),
+            "item_id": str(item_id),              # <- clé standard qu'on lit dans le webhook
             "item_name": cols.get("name", ""),
             "acompte": acompte_num,
             "description": description or f"Acompte {acompte_num}",
@@ -216,15 +202,11 @@ async def quote_from_monday(request: Request):
             metadata=metadata,
         )
 
+        # On met UNIQUEMENT le lien, PAS le statut (on attend le webhook PayPlug)
+        link_columns = _safe_json_loads(settings.LINK_COLUMN_IDS_JSON, default={}) or {}
         set_link_in_column(item_id, link_columns[acompte_num], payment_url, f"Payer acompte {acompte_num}")
 
-        # Tu peux laisser le statut tel quel et le passer à "Payé ..." via webhook PayPlug,
-        # ou bien le mettre tout de suite après création (comme ci-dessous) :
-        status_after = _safe_json_loads(settings.STATUS_AFTER_PAY_JSON, default={}) or {}
-        next_status = status_after.get(acompte_num, f"Payé acompte {acompte_num}")
-        set_status(item_id, settings.STATUS_COLUMN_ID, next_status)
-
-        logger.info(f"[OK] item={item_id} acompte={acompte_num} amount_cents={amount_cents} url={payment_url}")
+        logger.info(f"[OK-LINK] item={item_id} acompte={acompte_num} amount_cents={amount_cents} url={payment_url}")
         return {
             "status": "ok",
             "item_id": item_id,
@@ -240,40 +222,74 @@ async def quote_from_monday(request: Request):
         raise HTTPException(status_code=500, detail=f"Erreur webhook Monday : {e}")
 
 
-# ---------- PayPlug -> Webhook paiement réussi ----------
+# ---------- PayPlug -> Webhook paiement confirmé ----------
 @app.post("/payplug/webhook")
 async def payplug_webhook(request: Request):
     try:
         payload = await request.json()
         logger.info(f"[PP-WEBHOOK] payload={payload}")
 
-        event_type = payload.get("type")
-        data = payload.get("data") or {}
-        payment = data.get("object") or data or {}
-        metadata = _safe_json_loads(payment.get("metadata"), default={}) or {}
-        if not metadata and "metadata" in payload:
-            metadata = _safe_json_loads(payload.get("metadata"), default={}) or {}
+        # --- Détection paid sur TOUS les formats connus ---
+        def _get(d, path, default=None):
+            cur = d
+            for k in path:
+                if not isinstance(cur, dict) or k not in cur:
+                    return default
+                cur = cur[k]
+            return cur
 
-        status = (payment.get("status") or "").lower()
-        is_paid_flag = bool(payment.get("is_paid"))
-        paid_like = event_type in {"payment.succeeded", "charge.succeeded", "payment_paid"} or \
-            status in {"paid", "succeeded"} or \
-            is_paid_flag
+        root_is_paid = bool(payload.get("is_paid"))
+        root_status = str(payload.get("status") or "").lower()
+        root_type = str(payload.get("type") or "")
+
+        data_obj = payload.get("data") or {}
+        obj = data_obj.get("object") or {}
+
+        obj_is_paid = bool(obj.get("is_paid"))
+        obj_status = str(obj.get("status") or "").lower()
+        event_type = root_type
+
+        paid_like = any([
+            root_is_paid,
+            obj_is_paid,
+            root_status in {"paid", "succeeded"},
+            obj_status in {"paid", "succeeded"},
+            event_type in {"payment.succeeded", "charge.succeeded", "payment_paid"},
+        ])
 
         if not paid_like:
+            # on ignore les événements non payés
             return JSONResponse({"ok": True, "ignored": True})
 
-        item_id = metadata.get("item_id")
-        acompte = metadata.get("acompte")
-        if item_id and acompte in ("1", "2"):
-            status_after = _safe_json_loads(settings.STATUS_AFTER_PAY_JSON, default={}) or {}
-            next_status = status_after.get(acompte, f"Payé acompte {acompte}")
-            try:
-                set_status(int(item_id), settings.STATUS_COLUMN_ID, next_status)
-                logger.info(f"[PP-WEBHOOK] set_status OK item_id={item_id} -> '{next_status}'")
-            except Exception as e:
-                logger.exception(f"[PP-WEBHOOK] set_status FAILED item_id={item_id}: {e}")
-                return JSONResponse({"ok": False, "error": "monday_update_failed"}, status_code=200)
+        # --- Récup metadata (plusieurs emplacements possibles) ---
+        metadata = {}
+        for candidate in [
+            obj.get("metadata"),
+            data_obj.get("metadata"),
+            payload.get("metadata"),
+        ]:
+            md = _safe_json_loads(candidate, default=None) if isinstance(candidate, (str, dict)) else None
+            if isinstance(md, dict):
+                metadata = md
+                break
+
+        # Supporte "item_id" (nouveau) ET "customer_id" (ancien)
+        item_id = metadata.get("item_id") or metadata.get("customer_id")
+        acompte = metadata.get("acompte") or "1"
+
+        if not item_id:
+            logger.error("[PP-WEBHOOK] metadata sans item_id/customer_id → rien à mettre à jour")
+            return JSONResponse({"ok": False, "error": "no_item_id"}, status_code=200)
+
+        status_after = _safe_json_loads(settings.STATUS_AFTER_PAY_JSON, default={}) or {}
+        next_status = status_after.get(str(acompte), f"Payé acompte {acompte}")
+
+        try:
+            set_status(int(item_id), settings.STATUS_COLUMN_ID, next_status)
+            logger.info(f"[PP-WEBHOOK] set_status OK item_id={item_id} -> '{next_status}'")
+        except Exception as e:
+            logger.exception(f"[PP-WEBHOOK] set_status FAILED item_id={item_id}: {e}")
+            return JSONResponse({"ok": False, "error": "monday_update_failed"}, status_code=200)
 
         return JSONResponse({"ok": True})
     except Exception as e:
