@@ -1,3 +1,4 @@
+# payments.py
 import requests
 import json
 import re
@@ -50,13 +51,9 @@ def _choose_api_key(iban: str) -> str:
 
     # Cohérence du mode et du préfixe de clé
     if mode == "test" and not api_key.startswith("sk_test_"):
-        raise Exception(
-            "Clé incohérente: mode=test mais la clé ne commence pas par 'sk_test_'."
-        )
+        raise Exception("Clé incohérente: mode=test mais la clé ne commence pas par 'sk_test_'.")
     if mode != "test" and not api_key.startswith("sk_live_"):
-        raise Exception(
-            "Clé incohérente: mode=live mais la clé ne commence pas par 'sk_live_'."
-        )
+        raise Exception("Clé incohérente: mode=live mais la clé ne commence pas par 'sk_live_'.")
 
     return api_key
 
@@ -108,42 +105,49 @@ def _split_first_last(name: str | None) -> tuple[str, str]:
     return (parts[0][:50], " ".join(parts[1:])[:50])
 
 
-def create_payment(api_key: str, amount_cents: int, email: str, address: str, client_name: str, metadata: dict) -> str:
+def create_payment(
+    api_key: str,
+    amount_cents: int,
+    email: str,
+    address: str,
+    client_name: str,
+    metadata: dict,
+) -> str:
     """
-    Crée un lien de paiement PayPlug (HTTP) SANS expiration automatique :
-    - 'hosted_payment.sent_by' = 'OTHER' désactive l’expiration du lien
+    Crée un lien de paiement PayPlug (HTTP) :
     - redirige vers https://www.energyz.fr après validation (et aussi en cas d’annulation)
     - envoie notification_url à chaque paiement (webhook Monday)
-    - n'envoie PAS 'customer' complet pour laisser PayPlug collecter les infos si besoin.
+    - N’EXPIRERA PAS (hosted_payment.sent_by='OTHER')
+    - n'envoie PAS 'customer' pour forcer la saisie prénom/nom/email sur la page PayPlug.
     """
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
 
     # URL de notification : ENV prioritaire, sinon PUBLIC_BASE_URL + /payplug/webhook
-    base_url = (getattr(settings, "PUBLIC_BASE_URL", "") or "https://www.energyz.fr").rstrip("/")
-    notif_url = getattr(settings, "NOTIFICATION_URL", None) or (base_url + "/payplug/webhook")
+    notif_url = getattr(settings, "NOTIFICATION_URL", None) or (
+        settings.PUBLIC_BASE_URL.rstrip("/") + "/payplug/webhook"
+    )
 
     payload = {
         "amount": amount_cents,
         "currency": "EUR",
         "metadata": metadata or {},
-        "customer": {
-            "email": email or None,
-        },
         "hosted_payment": {
-            "sent_by": "OTHER",                 # ⇦ lien SANS expiration automatique
-            "return_url": base_url,
-            "cancel_url": base_url,
+            # <<< clé qui évite toute expiration de la page de paiement
+            "sent_by": "OTHER",
+            "return_url": "https://www.energyz.fr",  # ← après paiement validé
+            "cancel_url": "https://www.energyz.fr",  # ← si paiement annulé
         },
-        "notification_url": notif_url,          # ⇦ PayPlug enverra ici l’event payé
+        "notification_url": notif_url,  # ← PayPlug enverra ici l’event payé
         "description": (metadata or {}).get("description", "Paiement acompte Energyz"),
     }
 
     url = "https://api.payplug.com/v1/payments"
     logger.info(f"[PAYPLUG] POST {url} json={payload}")
-    res = requests.post(url, headers=headers, json=payload)
+    res = requests.post(url, headers=headers, json=payload, timeout=25)
+
     if res.status_code not in (200, 201):
         logger.error(f"[PAYPLUG] {res.status_code} → {res.text}")
         raise Exception(f"Erreur PayPlug : {res.status_code} → {res.text}")
