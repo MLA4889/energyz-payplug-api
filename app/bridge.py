@@ -1,129 +1,142 @@
 import logging
 import requests
+import uuid
 from .config import settings
 
 logger = logging.getLogger("energyz")
 
 def _base_headers():
-    # En-têtes communs à TOUS les appels Bridge (obligatoire: Bridge-Version)
+    # En-têtes communs pour TOUT appel Bridge PIS
     return {
-        "Bridge-Version": settings.BRIDGE_VERSION.strip(),  # ex: "2025-01-15"
+        "Bridge-Version": settings.BRIDGE_VERSION.strip(),   # ex: 2025-01-15
         "Accept": "application/json",
-    }
-
-def _headers_auth():
-    # Auth "client" pour récupérer un access_token
-    h = _base_headers()
-    h.update({
+        "Content-Type": "application/json",
+        # Auth côté Payment Links = Client-Id (pas d'Authorization Bearer)
         "Client-Id": settings.BRIDGE_CLIENT_ID,
-        "Client-Secret": settings.BRIDGE_CLIENT_SECRET,
-        "Content-Type": "application/json",
-    })
-    return h
-
-def _headers_api(access_token: str):
-    # Auth "Bearer" pour les endpoints applicatifs
-    h = _base_headers()
-    h.update({
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-    })
-    return h
-
-def _get_access_token() -> str:
-    url = settings.BRIDGE_BASE_URL.rstrip("/") + "/v3/aggregation/authorization/token"
-    logger.info(f"[BRIDGE] POST {url} (get token) with Bridge-Version={settings.BRIDGE_VERSION!r}")
-    resp = requests.post(url, headers=_headers_auth(), json={})
-    # Log de debug utile si ton Render masque/altère des en-têtes
-    if resp.status_code != 200:
-        logger.error(f"[BRIDGE] token error: {resp.status_code} -> {resp.text}")
-        # Erreur typique si Bridge-Version absent/mauvais
-        raise Exception(f"Bridge token error: {resp.status_code} -> {resp.text}")
-
-    data = resp.json()
-    token = data.get("access_token")
-    if not token:
-        logger.error(f"[BRIDGE] token payload sans access_token: {data}")
-        raise Exception("Bridge token error: no access_token in response")
-    return token
+    }
 
 def _clean_iban(iban: str | None) -> str | None:
     if not iban:
         return None
-    # Bridge accepte l'IBAN sans espaces (évite les 400 bêtes)
     return "".join(iban.split())
 
-def create_bridge_payment_link(*, amount_cents: int, label: str, metadata: dict,
-                               success_url: str | None = None,
-                               cancel_url: str | None = None) -> str:
+def _pick_user_from_metadata(md: dict) -> dict:
     """
-    Crée un lien de paiement virement (Open Banking) chez Bridge.
-    Compatible doc 2025 : usage de `callback_url`. On garde aussi un fallback
-    si tu veux encore passer des URLs séparées.
+    Payment Links requiert un 'user' :
+      - soit {first_name + last_name} OU
+      - soit {company_name}
+    On essaie au mieux à partir des métadonnées Monday.
     """
-    access_token = _get_access_token()
+    md = md or {}
+    email = md.get("email") or md.get("client_email")
+    first = md.get("first_name")
+    last = md.get("last_name")
+    company = md.get("company") or md.get("client_company") or md.get("name")
 
+    user = {}
+    if email:
+        user["email"] = str(email)[:320]
+    if first and last:
+        user["first_name"] = str(first)[:80]
+        user["last_name"] = str(last)[:80]
+    else:
+        # fallback côté pro: on passe par company_name
+        user["company_name"] = (company or "Client Energyz")[:140]
+    # Optionnel : rattacher ta référence externe (id Monday)
+    if md.get("item_id"):
+        user["external_reference"] = str(md["item_id"])[:140]
+    return user
+
+def _make_e2e_id(md: dict, amount_cents: int) -> str:
+    """
+    end_to_end_id (obligatoire côté Bridge pour la transaction)
+    """
+    md = md or {}
+    base = f"EZY-{md.get('item_id') or 'UNK'}-{md.get('acompte') or md.get('step') or '1'}-{amount_cents}"
+    # Garantir <= 35 chars (limites bancaires habituelles) en tronquant et ajoutant un suffixe court
+    suf = uuid.uuid4().hex[:6].upper()
+    e2e = (base.replace(" ", "-"))[:28] + "-" + suf
+    return e2e
+
+def create_bridge_payment_link(*, amount_cents: int, label: str, metadata: dict) -> str:
+    """
+    Crée un lien de paiement par virement (Payment Link) chez Bridge.
+    Auth: Client-Id + Bridge-Version (PAS de token AIS).
+    Doc/Collection officielles: POST /v3/payment/payment-links. 
+    """
     url = settings.BRIDGE_BASE_URL.rstrip("/") + "/v3/payment/payment-links"
 
-    # Sécurise les champs
     amount_cents = int(amount_cents or 0)
     if amount_cents <= 0:
         raise ValueError("amount_cents must be > 0 for Bridge payment link")
 
+    # Prépare 'user'
+    user = _pick_user_from_metadata(metadata)
+
+    # IBAN bénéficiaire (fixe Energyz, nettoyage espaces)
     beneficiary_iban = _clean_iban(settings.BRIDGE_BENEFICIARY_IBAN)
     if not beneficiary_iban:
         raise ValueError("Missing BRIDGE_BENEFICIARY_IBAN")
 
-    # Doc "Create your first payment link": on privilégie `callback_url`
-    # https://docs.bridgeapi.io/docs/first-payment-link-from-the-api
-    callback_url = (success_url or settings.BRIDGE_SUCCESS_URL or "").strip()
+    # Références
+    client_ref = (metadata or {}).get("client_reference") or (metadata or {}).get("item_id") or "Energyz"
+    end_to_end_id = (metadata or {}).get("end_to_end_id") or _make_e2e_id(metadata, amount_cents)
 
+    # Corps conforme à la réf 2025 (user + transactions[])
     body = {
-        "label": (label or "Acompte Energyz")[:140],
-        "amount": amount_cents,
-        "currency": "EUR",
-        # Côté encaissement Energyz : on fixe le bénéficiaire
-        "beneficiary": {
-            "name": settings.BRIDGE_BENEFICIARY_NAME,
-            "iban": beneficiary_iban,
-        },
-        # Référence croisée utile pour retrouver côté Monday
-        "client_reference": (metadata or {}).get("client_reference") or (metadata or {}).get("item_id"),
-        # Métadonnées (limites: 5 clés / 50c key / 100c value)
+        "client_reference": str(client_ref)[:140],
+        "user": user,
+        "transactions": [
+            {
+                "amount": amount_cents,
+                "currency": "EUR",
+                "label": (label or "Acompte Energyz")[:140],
+                "end_to_end_id": end_to_end_id,
+                # Bénéficiaire dynamique (optionnel selon config, mais pratique si tu veux forcer ton IBAN ici)
+                "beneficiary": {
+                    # Tu peux utiliser l’un des champs: name / company_name / first_name+last_name
+                    "company_name": settings.BRIDGE_BENEFICIARY_NAME[:140],
+                    "iban": beneficiary_iban,
+                },
+            }
+        ],
+        # Callback côté front si tu veux un retour (pas un statut de paiement)
+        "callback_url": (settings.BRIDGE_SUCCESS_URL or "").strip() or None,
+        # Tu peux aussi gérer l'expiration ici si besoin: "expired_at": "2025-12-31T23:59:00Z"
         "metadata": metadata or {},
     }
 
-    # Callback moderne (docs 2025)
-    if callback_url:
-        body["callback_url"] = callback_url
+    # Nettoyage des clés None
+    if not body["callback_url"]:
+        body.pop("callback_url", None)
 
-    # Compat descendante si tu préfères séparer succès / échec
-    # (certains extraits plus anciens montrent encore redirect_urls)
-    if (cancel_url or settings.BRIDGE_CANCEL_URL):
-        body["redirect_urls"] = {
-            "success": callback_url or settings.BRIDGE_SUCCESS_URL,
-            "fail": (cancel_url or settings.BRIDGE_CANCEL_URL),
-        }
+    headers = _base_headers()
 
-    logger.info(f"[BRIDGE] POST {url} json={{{'label': body['label'], 'amount': body['amount'], 'currency': body['currency'], 'client_reference': body.get('client_reference')}}}")
-    resp = requests.post(url, headers=_headers_api(access_token), json=body)
+    # Log soft: on ne log pas toutes les données perso
+    log_preview = {
+        "client_reference": body["client_reference"],
+        "amount": body["transactions"][0]["amount"],
+        "label": body["transactions"][0]["label"],
+        "end_to_end_id": body["transactions"][0]["end_to_end_id"],
+    }
+    logger.info(f"[BRIDGE] POST {url} headers={{Bridge-Version:{headers['Bridge-Version']}, Client-Id:***}} json={log_preview}")
 
+    resp = requests.post(url, headers=headers, json=body, timeout=30)
     if resp.status_code not in (200, 201):
-        # Trace lisible sur Render
         logger.error(f"[BRIDGE] create link failed: {resp.status_code} -> {resp.text}")
-        # Message clair si jamais l'en-tête version a été ignoré côté infra
-        if "missing_version_header" in resp.text or "invalid" in resp.text.lower():
+        # Message clair si quelqu’un remet un flux AIS par erreur
+        if resp.status_code == 403 and "permission" in resp.text.lower():
             raise Exception(
-                "Bridge create link failed (version header issue). "
-                "Vérifie que l'en-tête 'Bridge-Version: 2025-01-15' est bien transmis jusqu'à Bridge "
-                "et que BRIDGE_VERSION=2025-01-15 est présent dans l'env Render."
+                "Bridge create link forbidden (403). "
+                "Vérifie que tu utilises bien l’auth Payment Links (header Client-Id) "
+                "et NON le token AIS /aggregation/authorization/token."
             )
         raise Exception(f"Bridge create link failed: {resp.status_code} -> {resp.text}")
 
     data = resp.json()
-    link_url = data.get("url")
+    link_url = data.get("url") or data.get("link")
     if not link_url:
-        logger.error(f"[BRIDGE] no url in response: {data}")
+        logger.error(f"[BRIDGE] missing url in response: {data}")
         raise Exception("Bridge create link failed: missing url")
 
     logger.info(f"[BRIDGE] link={link_url}")
