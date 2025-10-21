@@ -110,10 +110,11 @@ def _split_first_last(name: str | None) -> tuple[str, str]:
 
 def create_payment(api_key: str, amount_cents: int, email: str, address: str, client_name: str, metadata: dict) -> str:
     """
-    Crée un lien de paiement PayPlug (HTTP) :
+    Crée un lien de paiement PayPlug (HTTP) SANS expiration automatique :
+    - 'hosted_payment.sent_by' = 'OTHER' désactive l’expiration du lien
     - redirige vers https://www.energyz.fr après validation (et aussi en cas d’annulation)
     - envoie notification_url à chaque paiement (webhook Monday)
-    - n'envoie PAS 'customer' pour forcer la saisie prénom/nom/email sur la page PayPlug.
+    - n'envoie PAS 'customer' complet pour laisser PayPlug collecter les infos si besoin.
     """
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -121,19 +122,22 @@ def create_payment(api_key: str, amount_cents: int, email: str, address: str, cl
     }
 
     # URL de notification : ENV prioritaire, sinon PUBLIC_BASE_URL + /payplug/webhook
-    notif_url = getattr(settings, "NOTIFICATION_URL", None) or (
-        settings.PUBLIC_BASE_URL.rstrip("/") + "/payplug/webhook"
-    )
+    base_url = (getattr(settings, "PUBLIC_BASE_URL", "") or "https://www.energyz.fr").rstrip("/")
+    notif_url = getattr(settings, "NOTIFICATION_URL", None) or (base_url + "/payplug/webhook")
 
     payload = {
         "amount": amount_cents,
         "currency": "EUR",
         "metadata": metadata or {},
-        "hosted_payment": {
-            "return_url": "https://www.energyz.fr",  # ← après paiement validé
-            "cancel_url": "https://www.energyz.fr",  # ← si paiement annulé
+        "customer": {
+            "email": email or None,
         },
-        "notification_url": notif_url,               # ← PayPlug enverra ici l’event payé
+        "hosted_payment": {
+            "sent_by": "OTHER",                 # ⇦ lien SANS expiration automatique
+            "return_url": base_url,
+            "cancel_url": base_url,
+        },
+        "notification_url": notif_url,          # ⇦ PayPlug enverra ici l’event payé
         "description": (metadata or {}).get("description", "Paiement acompte Energyz"),
     }
 
