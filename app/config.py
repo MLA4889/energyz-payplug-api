@@ -1,4 +1,10 @@
 from pydantic_settings import BaseSettings
+from pydantic import ValidationError
+import os
+import sys
+import logging
+
+logger = logging.getLogger("energyz")
 
 class Settings(BaseSettings):
     # Monday
@@ -15,8 +21,8 @@ class Settings(BaseSettings):
     PAYPLUG_KEYS_TEST_JSON: str
     PAYPLUG_KEYS_LIVE_JSON: str
     PAYPLUG_MODE: str
-    PUBLIC_BASE_URL: str  # ex: https://energyz-payplug-api.onrender.com
-    NOTIFICATION_URL: str | None = None  # ex: https://.../payplug/webhook (optionnel)
+    PUBLIC_BASE_URL: str
+    NOTIFICATION_URL: str | None = None
 
     # Colonnes Monday
     EMAIL_COLUMN_ID: str
@@ -37,20 +43,36 @@ class Settings(BaseSettings):
 
     # IBAN mapping fallback
     IBAN_BY_STATUS_JSON: str | None = None
-
-    # Checkout comportement (laisse vide pour obliger la saisie côté PayPlug)
     FORCE_CHECKOUT_COLLECT_CONTACT: str | None = None
 
-    # ------------------------ Bridge (PIS) ------------------------
-    BRIDGE_BASE_URL: str              # ex: https://api.bridgeapi.io
-    BRIDGE_VERSION: str               # ex: 2025-01-15
-    BRIDGE_CLIENT_ID: str             # sandbox_id_...
-    BRIDGE_CLIENT_SECRET: str         # sandbox_secret_...
-    BRIDGE_SUCCESS_URL: str           # https://www.energyz.fr
-    BRIDGE_CANCEL_URL: str            # https://www.energyz.fr/cancel
-    BRIDGE_WEBHOOK_SECRET: str        # dev-test (ou autre)
+    # Bridge (PIS)
+    BRIDGE_BASE_URL: str
+    BRIDGE_VERSION: str
+    BRIDGE_CLIENT_ID: str
+    BRIDGE_CLIENT_SECRET: str
+    BRIDGE_SUCCESS_URL: str
+    BRIDGE_CANCEL_URL: str
+    BRIDGE_WEBHOOK_SECRET: str
+    BRIDGE_BENEFICIARY_NAME: str
+    BRIDGE_BENEFICIARY_IBAN: str
 
-    BRIDGE_BENEFICIARY_NAME: str      # ENERGYZ
-    BRIDGE_BENEFICIARY_IBAN: str      # FR76 1695 8000 0100 0571 1982 492
-
-settings = Settings()
+try:
+    # charge directement depuis l'environnement Render
+    settings = Settings()
+    # petit log de contrôle pour le déploiement
+    logger.info(
+        "[BOOT] Settings chargés. BRIDGE_BASE_URL=%s, BRIDGE_VERSION=%s, PAYPLUG_MODE=%s",
+        os.getenv("BRIDGE_BASE_URL"),
+        os.getenv("BRIDGE_VERSION"),
+        os.getenv("PAYPLUG_MODE"),
+    )
+except ValidationError as e:
+    # Rend l’erreur explicite dans les logs Render (sinon “cause unknown”)
+    missing = []
+    for err in e.errors():
+        loc = ".".join(str(x) for x in err.get("loc", []))
+        msg = err.get("msg", "")
+        missing.append(f"{loc}: {msg}")
+    logger.error("❌ ENV manquantes ou invalides:\n- " + "\n- ".join(missing))
+    # on re-raise pour que Render marque le deploy en échec (mais avec un message clair)
+    raise
