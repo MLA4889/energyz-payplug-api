@@ -1,113 +1,81 @@
-# src/app/bridge.py
-import time
-import requests
 import logging
-from typing import Optional
-
+import requests
 from .config import settings
 
-logger = logging.getLogger("energyz.bridge")
+logger = logging.getLogger("energyz")
 
-# Configurable via ENV
-BASE = getattr(settings, "BRIDGE_BASE_URL", "https://api.bridgeapi.io").rstrip("/")
-TOKEN_PATH = "/v2/auth/token"
-PAYMENT_LINKS_PATH = "/v2/payment-links"
-BRIDGE_VERSION = getattr(settings, "BRIDGE_VERSION", "2021-06-30")
 
-# Simple cache en mémoire du token (process-local)
-_token_cache = {"access_token": None, "expires_at": 0}
+def _headers_auth():
+    """En-têtes requis pour obtenir un token Bridge (v3)."""
+    return {
+        "Client-Id": settings.BRIDGE_CLIENT_ID,
+        "Client-Secret": settings.BRIDGE_CLIENT_SECRET,
+        "Bridge-Version": settings.BRIDGE_VERSION,
+        "Content-Type": "application/json",
+    }
+
+
+def _headers_api(access_token: str):
+    """En-têtes pour appeler les endpoints de paiement (v3)."""
+    return {
+        "Authorization": f"Bearer {access_token}",
+        "Bridge-Version": settings.BRIDGE_VERSION,
+        "Content-Type": "application/json",
+    }
 
 
 def _get_access_token() -> str:
     """
-    Récupère / cache le token Bridge.
+    POST /v3/aggregation/authorization/token → access_token
     """
-    now = int(time.time())
-    token = _token_cache.get("access_token")
-    if token and _token_cache.get("expires_at", 0) - 30 > now:
-        return token
-
-    url = f"{BASE}{TOKEN_PATH}"
-    headers = {
-        "Client-Id": getattr(settings, "BRIDGE_CLIENT_ID"),
-        "Client-Secret": getattr(settings, "BRIDGE_CLIENT_SECRET"),
-        "Bridge-Version": BRIDGE_VERSION,
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
-    data = {"grant_type": "client_credentials"}
-
+    url = settings.BRIDGE_BASE_URL.rstrip("/") + "/v3/aggregation/authorization/token"
     logger.info(f"[BRIDGE] POST {url} (get token)")
-    resp = requests.post(url, headers=headers, data=data, timeout=15)
-
+    resp = requests.post(url, headers=_headers_auth(), json={})
     if resp.status_code != 200:
         logger.error(f"[BRIDGE] token error: {resp.status_code} -> {resp.text}")
         raise Exception(f"Bridge token error: {resp.status_code} -> {resp.text}")
 
-    j = resp.json()
-    access_token = j.get("access_token")
-    expires_in = int(j.get("expires_in", 300))
-    if not access_token:
-        raise Exception(f"Bridge token response missing access_token: {j}")
-
-    _token_cache["access_token"] = access_token
-    _token_cache["expires_at"] = int(time.time()) + expires_in
-
-    logger.info("[BRIDGE] got access_token, expires_in=%s", expires_in)
-    return access_token
+    data = resp.json()
+    token = data.get("access_token")
+    if not token:
+        raise Exception("Bridge token error: no access_token in response")
+    return token
 
 
-def create_bridge_payment_link(
-    amount_cents: int,
-    label: str,
-    metadata: dict,
-    currency: str = "EUR",
-    return_url: Optional[str] = None,
-    cancel_url: Optional[str] = None,
-) -> str:
+def create_bridge_payment_link(*, amount_cents: int, label: str, metadata: dict) -> str:
     """
-    Crée un lien de paiement Bridge et retourne l'URL publique.
-    Lance Exception si échec.
+    Crée un lien de virement Bridge (PIS) et retourne l'URL.
+    N’impacte pas PayPlug.
     """
     access_token = _get_access_token()
-    url = f"{BASE}{PAYMENT_LINKS_PATH}"
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Bridge-Version": BRIDGE_VERSION,
-        "Content-Type": "application/json",
-    }
 
-    payload = {
-        "amount": int(amount_cents),
-        "currency": currency,
-        "label": label or "Paiement Energyz",
-        "metadata": metadata or {},
-        # bridge specific fields (adaptables)
-        "return_url": return_url or getattr(settings, "BRIDGE_SUCCESS_URL", ""),
-        "cancel_url": cancel_url or getattr(settings, "BRIDGE_CANCEL_URL", ""),
-        # beneficiary (optionnel) - si ton compte Bridge nécessite ces champs :
+    url = settings.BRIDGE_BASE_URL.rstrip("/") + "/v3/payment/payment-links"
+    body = {
+        "label": label or "Acompte Energyz",
+        "amount": int(amount_cents),           # en centimes
+        "currency": "EUR",
         "beneficiary": {
-            "name": getattr(settings, "BRIDGE_BENEFICIARY_NAME", None),
-            "iban": getattr(settings, "BRIDGE_BENEFICIARY_IBAN", None),
+            "name": settings.BRIDGE_BENEFICIARY_NAME,
+            "iban": settings.BRIDGE_BENEFICIARY_IBAN,
         },
+        "redirect_urls": {
+            "success": settings.BRIDGE_SUCCESS_URL,
+            "fail": settings.BRIDGE_CANCEL_URL,
+        },
+        "metadata": metadata or {},
     }
 
-    # Nettoyage: retire les clés None
-    payload["beneficiary"] = {k: v for k, v in payload["beneficiary"].items() if v}
-
-    logger.info(f"[BRIDGE] POST {url} json={payload}")
-    resp = requests.post(url, headers=headers, json=payload, timeout=20)
-
+    logger.info(f"[BRIDGE] POST {url} json={body}")
+    resp = requests.post(url, headers=_headers_api(access_token), json=body)
     if resp.status_code not in (200, 201):
         logger.error(f"[BRIDGE] create link failed: {resp.status_code} -> {resp.text}")
-        # expose l'erreur lisible (pour logs)
         raise Exception(f"Bridge create link failed: {resp.status_code} -> {resp.text}")
 
     data = resp.json()
-    # selon réponse Bridge, la clé peut s'appeler 'url' ou 'link' ou 'payment_link'
-    link = data.get("url") or data.get("link") or data.get("payment_link") or data.get("paymentUrl")
-    if not link:
-        # dump to help debugging
-        raise Exception(f"Bridge create link response missing link field: {data}")
+    link_url = data.get("url")
+    if not link_url:
+        logger.error(f"[BRIDGE] no url in response: {data}")
+        raise Exception("Bridge create link failed: missing url")
 
-    logger.info(f"[BRIDGE] created link={link}")
-    return link
+    logger.info(f"[BRIDGE] link={link_url}")
+    return link_url
