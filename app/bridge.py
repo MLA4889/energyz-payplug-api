@@ -1,14 +1,13 @@
 import logging
 import requests
-import uuid
 from .config import settings
 
 logger = logging.getLogger("energyz")
 
-__all__ = ["create_bridge_payment_link"]  # pour lever toute ambiguïté d'import
+__all__ = ["create_bridge_payment_link"]
 
 def _base_headers():
-    # Headers requis Payment Links (PIS)
+    # Auth PIS pour payment-links: via headers
     return {
         "Bridge-Version": settings.BRIDGE_VERSION.strip(),   # ex: 2025-01-15
         "Accept": "application/json",
@@ -22,34 +21,16 @@ def _clean_iban(iban: str | None) -> str | None:
         return None
     return "".join(iban.split())
 
-def _pick_user_from_metadata(md: dict) -> dict:
-    md = md or {}
-    email = md.get("email") or md.get("client_email")
-    first = md.get("first_name")
-    last = md.get("last_name")
-    company = md.get("company") or md.get("client_company") or md.get("name")
-
-    user: dict = {}
-    if email:
-        user["email"] = str(email)[:320]
-    if first and last:
-        user["first_name"] = str(first)[:80]
-        user["last_name"] = str(last)[:80]
-    else:
-        user["company_name"] = (company or "Client Energyz")[:140]
-    if md.get("item_id"):
-        user["external_reference"] = str(md["item_id"])[:140]
-    return user
-
-def _make_e2e_id(md: dict, amount_cents: int) -> str:
-    base = f"EZY-{md.get('item_id') or 'UNK'}-{md.get('acompte') or md.get('step') or '1'}-{amount_cents}"
-    suf = uuid.uuid4().hex[:6].upper()
-    return (base.replace(" ", "-"))[:28] + "-" + suf  # <= 35 chars
-
 def create_bridge_payment_link(*, amount_cents: int, label: str, metadata: dict) -> str:
     """
-    Crée un lien de paiement par virement (Bridge Payment Links).
-    Auth via headers: Client-Id + Client-Secret + Bridge-Version (PAS de token AIS).
+    Crée un lien de paiement par virement via /v3/payment/payment-links.
+    Schéma attendu (payload SIMPLE) :
+      - label (str)
+      - amount (int, cents)
+      - currency (EUR)
+      - beneficiary: { name, iban }
+      - callback_url OU redirect_urls { success, fail }
+      - metadata (facultatif)
     """
     url = settings.BRIDGE_BASE_URL.rstrip("/") + "/v3/payment/payment-links"
 
@@ -57,57 +38,42 @@ def create_bridge_payment_link(*, amount_cents: int, label: str, metadata: dict)
     if amount_cents <= 0:
         raise ValueError("amount_cents must be > 0 for Bridge payment link")
 
-    user = _pick_user_from_metadata(metadata)
-
     beneficiary_iban = _clean_iban(settings.BRIDGE_BENEFICIARY_IBAN)
     if not beneficiary_iban:
         raise ValueError("Missing BRIDGE_BENEFICIARY_IBAN")
 
-    client_ref = (metadata or {}).get("client_reference") or (metadata or {}).get("item_id") or "Energyz"
-    end_to_end_id = (metadata or {}).get("end_to_end_id") or _make_e2e_id(metadata, amount_cents)
-
+    # on privilégie redirect_urls (plus explicite pour l’utilisateur)
     body = {
-        "client_reference": str(client_ref)[:140],
-        "user": user,
-        "transactions": [
-            {
-                "amount": amount_cents,
-                "currency": "EUR",
-                "label": (label or "Acompte Energyz")[:140],
-                "end_to_end_id": end_to_end_id,
-                "beneficiary": {
-                    "company_name": settings.BRIDGE_BENEFICIARY_NAME[:140],
-                    "iban": beneficiary_iban,
-                },
-            }
-        ],
-        "callback_url": (settings.BRIDGE_SUCCESS_URL or "").strip() or None,
+        "label": (label or "Acompte Energyz")[:140],
+        "amount": amount_cents,
+        "currency": "EUR",
+        "beneficiary": {
+            # IMPORTANT: la clé attendue est 'name' (pas company_name)
+            "name": settings.BRIDGE_BENEFICIARY_NAME[:140],
+            "iban": beneficiary_iban,
+        },
+        "redirect_urls": {
+            "success": (settings.BRIDGE_SUCCESS_URL or "").strip() or "https://www.energyz.fr",
+            "fail": (settings.BRIDGE_CANCEL_URL or "").strip() or "https://www.energyz.fr",
+        },
         "metadata": metadata or {},
     }
-    if not body["callback_url"]:
-        body.pop("callback_url", None)
 
     headers = _base_headers()
 
+    # log non-sensible pour vérifier ce qui part
     log_preview = {
-        "client_reference": body["client_reference"],
-        "amount": body["transactions"][0]["amount"],
-        "label": body["transactions"][0]["label"],
-        "end_to_end_id": body["transactions"][0]["end_to_end_id"],
+        "label": body["label"],
+        "amount": body["amount"],
+        "beneficiary_name": body["beneficiary"]["name"],
+        "has_redirect_urls": bool(body.get("redirect_urls")),
     }
-    logger.info(
-        f"[BRIDGE] POST {url} headers={{Bridge-Version:{headers['Bridge-Version']}, Client-Id:***, Client-Secret:***}} "
-        f"json={log_preview}"
-    )
+    logger.info(f"[BRIDGE] POST {url} headers={{Bridge-Version:{headers['Bridge-Version']}, Client-Id:***, Client-Secret:***}} json={log_preview}")
 
     resp = requests.post(url, headers=headers, json=body, timeout=30)
     if resp.status_code not in (200, 201):
+        # renvoie le texte pour debug immédiat
         logger.error(f"[BRIDGE] create link failed: {resp.status_code} -> {resp.text}")
-        if resp.status_code == 401 and "invalid_client_credentials" in resp.text:
-            raise Exception(
-                "Bridge create link failed (401 invalid_client_credentials). "
-                "Vérifie BRIDGE_BASE_URL (doit être https://api.bridgeapi.io) ET le couple Client-Id/Client-Secret."
-            )
         raise Exception(f"Bridge create link failed: {resp.status_code} -> {resp.text}")
 
     data = resp.json()
