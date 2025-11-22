@@ -81,6 +81,11 @@ async def quote_from_monday(request: Request):
         payload = _safe_json_loads(raw.decode("utf-8", errors="ignore"), default={}) or {}
         logger.info(f"[WEBHOOK] payload={payload}")
 
+        # --- Gestion du challenge Monday (validation du webhook) ---
+        challenge = payload.get("challenge")
+        if challenge:
+            return {"challenge": challenge}
+
         event = payload.get("event") or {}
         item_id = event.get("pulseId") or event.get("itemId")
         if not item_id:
