@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Lien invalide{% endblock %}
+
+{% block content %}
+<section class="card card--center">
+  <div class="icon icon--warn" aria-hidden="true">
+    <svg viewBox="0 0 24 24" width="48" height="48" fill="currentColor">
+      <path d="M12 2 1 21h22L12 2Zm1 14h-2v2h2v-2Zm0-6h-2v4h2v-4Z"/>
+    </svg>
+  </div>
+  <h1>{{ title or "Lien indisponible" }}</h1>
+  <p class="lead">{{ message or "Ce lien de paiement est invalide ou a expiré." }}</p>
+  <p class="muted">Si vous pensez qu'il s'agit d'une erreur, contactez
+    <a href="mailto:contact@energyz.fr">contact@energyz.fr</a>.</p>
+</section>
+{% endblock %}

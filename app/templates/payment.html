@@ -1,0 +1,216 @@
+{% extends "base.html" %}
+{% block title %}Paiement - {{ dossier.prestation_label }}{% endblock %}
+
+{% block content %}
+<section class="card">
+  <h1 class="card__title">Paiement de votre prestation</h1>
+
+  <div class="summary">
+    <div class="summary__row">
+      <span class="summary__key">Prestation</span>
+      <span class="summary__val">{{ dossier.prestation_label }}</span>
+    </div>
+    {% if dossier.item_name %}
+    <div class="summary__row">
+      <span class="summary__key">Dossier</span>
+      <span class="summary__val">{{ dossier.item_name }}</span>
+    </div>
+    {% endif %}
+    <div class="summary__row summary__row--total">
+      <span class="summary__key">Montant à payer</span>
+      <span class="summary__val summary__val--amount">{{ "%.2f"|format(dossier.montant_ttc) }} € TTC</span>
+    </div>
+    <div class="summary__row summary__row--detail">
+      <span class="summary__key">dont HT</span>
+      <span class="summary__val">{{ "%.2f"|format(dossier.montant_ht) }} €</span>
+    </div>
+    <div class="summary__row summary__row--detail">
+      <span class="summary__key">TVA ({{ "%g"|format(dossier.tva_rate) }}%)</span>
+      <span class="summary__val">{{ "%.2f"|format(dossier.montant_ttc - dossier.montant_ht) }} €</span>
+    </div>
+  </div>
+</section>
+
+<section class="card">
+  <h2 class="card__title card__title--small">Vos informations de facturation</h2>
+  <p class="muted">La facture sera émise à cette entité. Ces informations ne sont plus modifiables après paiement.</p>
+
+  <form id="billing-form" method="post" action="/api/payments/create" novalidate>
+    <input type="hidden" name="token" value="{{ token }}">
+
+    <label class="field">
+      <span class="field__label">SIRET <em>*</em></span>
+      <input
+        type="text"
+        inputmode="numeric"
+        pattern="[0-9 ]{14,20}"
+        maxlength="20"
+        minlength="14"
+        name="siret"
+        id="siret"
+        required
+        autocomplete="off"
+        placeholder="14 chiffres (ex : 732 829 320 00074)"
+      >
+      <small class="field__hint" id="siret-hint">Auto-complétion automatique à la saisie.</small>
+    </label>
+
+    <div id="sirene-status" class="sirene-status" hidden></div>
+
+    <label class="field">
+      <span class="field__label">Raison sociale <em>*</em></span>
+      <input type="text" name="raison_sociale" id="raison_sociale" required maxlength="200">
+    </label>
+
+    <label class="field">
+      <span class="field__label">Adresse <em>*</em></span>
+      <input type="text" name="adresse_ligne1" id="adresse_ligne1" required maxlength="200">
+    </label>
+
+    <label class="field">
+      <span class="field__label">Complément d'adresse</span>
+      <input type="text" name="adresse_ligne2" id="adresse_ligne2" maxlength="200">
+    </label>
+
+    <div class="row">
+      <label class="field field--small">
+        <span class="field__label">Code postal <em>*</em></span>
+        <input type="text" name="code_postal" id="code_postal" required pattern="\d{5}" maxlength="5" inputmode="numeric">
+      </label>
+      <label class="field field--grow">
+        <span class="field__label">Ville <em>*</em></span>
+        <input type="text" name="ville" id="ville" required maxlength="100">
+      </label>
+    </div>
+
+    <label class="field">
+      <span class="field__label">Email de facturation <em>*</em></span>
+      <input type="email" name="email" id="email" required maxlength="320"
+             placeholder="compta@votre-entreprise.fr">
+      <small class="field__hint">Votre facture sera envoyée à cette adresse.</small>
+    </label>
+
+    <label class="field field--check">
+      <input type="checkbox" name="cgv_ok" id="cgv_ok" required>
+      <span>J'accepte les <a href="https://energyz.fr/cgv" target="_blank" rel="noopener">conditions générales de vente</a>.</span>
+    </label>
+
+    <div id="form-error" class="error" hidden></div>
+
+    <button type="submit" id="submit-btn" class="btn btn--primary">
+      Payer {{ "%.2f"|format(dossier.montant_ttc) }} €
+    </button>
+
+    <p class="secure">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+        <path d="M12 1 3 5v6c0 5.5 3.8 10.6 9 12 5.2-1.4 9-6.5 9-12V5l-9-4Zm0 10.9h7c-.5 4.1-3.4 7.8-7 8.9v-8.9H5V6.3l7-3.1v8.7Z"/>
+      </svg>
+      Paiement traité par PayPlug. Aucun donnée bancaire ne transite par Energyz.
+    </p>
+  </form>
+</section>
+
+<script>
+(function () {
+  const siretInput = document.getElementById('siret');
+  const hint = document.getElementById('siret-hint');
+  const status = document.getElementById('sirene-status');
+  const fields = {
+    raison_sociale: document.getElementById('raison_sociale'),
+    adresse_ligne1: document.getElementById('adresse_ligne1'),
+    adresse_ligne2: document.getElementById('adresse_ligne2'),
+    code_postal: document.getElementById('code_postal'),
+    ville: document.getElementById('ville'),
+  };
+
+  function normalize(s) { return (s || '').replace(/\D/g, ''); }
+
+  function setStatus(text, kind) {
+    status.textContent = text;
+    status.className = 'sirene-status sirene-status--' + (kind || 'info');
+    status.hidden = !text;
+  }
+
+  async function lookupSiret() {
+    const raw = normalize(siretInput.value);
+    if (raw.length !== 14) {
+      setStatus('', 'info');
+      return;
+    }
+    setStatus('Recherche entreprise…', 'info');
+    try {
+      const r = await fetch('/api/sirene/' + raw, { headers: { 'Accept': 'application/json' } });
+      const data = await r.json();
+      if (!data.found) {
+        setStatus("Entreprise introuvable. Vous pouvez saisir manuellement.", 'warn');
+        return;
+      }
+      if (data.actif === false) {
+        setStatus("Attention : cet établissement apparaît comme cessé à l'INSEE.", 'warn');
+      } else {
+        setStatus('✓ ' + (data.raison_sociale || 'Entreprise trouvée'), 'ok');
+      }
+      if (data.raison_sociale) fields.raison_sociale.value = data.raison_sociale;
+      if (data.adresse_ligne1) fields.adresse_ligne1.value = data.adresse_ligne1;
+      if (data.adresse_ligne2) fields.adresse_ligne2.value = data.adresse_ligne2;
+      if (data.code_postal) fields.code_postal.value = data.code_postal;
+      if (data.ville) fields.ville.value = data.ville;
+    } catch (e) {
+      setStatus("Service SIRENE indisponible. Vous pouvez saisir manuellement.", 'warn');
+    }
+  }
+
+  siretInput.addEventListener('blur', lookupSiret);
+  siretInput.addEventListener('input', () => {
+    // Masque de saisie : on laisse les chiffres mais on tolère les espaces
+    const raw = normalize(siretInput.value);
+    if (raw.length >= 14 && hint) {
+      hint.textContent = 'SIRET complet - vous pouvez sortir du champ pour vérifier.';
+    }
+  });
+
+  // Soumission Ajax pour garder la page pendant la redirection
+  const form = document.getElementById('billing-form');
+  const btn = document.getElementById('submit-btn');
+  const errBox = document.getElementById('form-error');
+  form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    errBox.hidden = true;
+    btn.disabled = true;
+    btn.textContent = 'Redirection vers le paiement sécurisé…';
+
+    const fd = new FormData(form);
+    const body = {
+      token: fd.get('token'),
+      billing: {
+        siret: normalize(fd.get('siret')),
+        raison_sociale: (fd.get('raison_sociale') || '').trim(),
+        adresse_ligne1: (fd.get('adresse_ligne1') || '').trim(),
+        adresse_ligne2: (fd.get('adresse_ligne2') || '').trim(),
+        code_postal: (fd.get('code_postal') || '').trim(),
+        ville: (fd.get('ville') || '').trim(),
+        email: (fd.get('email') || '').trim(),
+      },
+      cgv_ok: !!fd.get('cgv_ok'),
+    };
+    try {
+      const r = await fetch('/api/payments/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await r.json();
+      if (!r.ok || !data.payment_url) {
+        throw new Error(data.detail || 'Erreur lors de la création du paiement.');
+      }
+      window.location.assign(data.payment_url);
+    } catch (err) {
+      errBox.textContent = err.message || 'Erreur inconnue.';
+      errBox.hidden = false;
+      btn.disabled = false;
+      btn.textContent = 'Payer {{ "%.2f"|format(dossier.montant_ttc) }} €';
+    }
+  });
+})();
+</script>
+{% endblock %}

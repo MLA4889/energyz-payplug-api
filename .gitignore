@@ -1,0 +1,25 @@
+# Secrets / donnees locales
+.env
+.env.*
+!.env.example
+.tokens_local.json
+token_store.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,18 +1,35 @@
+"""
+Wrapper Monday GraphQL. Conserve les fonctions existantes (inchangees)
+et ajoute les helpers necessaires au flux de facturation :
+  - set_text_column
+  - set_date_column
+  - upload_file_to_column   (multipart)
+"""
+from __future__ import annotations
+
 import json
 import re
 import math
 import requests
+from typing import Any
+
 from .config import settings
 
 MONDAY_API_URL = "https://api.monday.com/v2"
+MONDAY_FILE_URL = "https://api.monday.com/v2/file"
 HEADERS = {
     "Authorization": settings.MONDAY_API_KEY,
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
 }
 
 
 def _post(query: str, variables: dict):
-    resp = requests.post(MONDAY_API_URL, headers=HEADERS, json={"query": query, "variables": variables})
+    resp = requests.post(
+        MONDAY_API_URL,
+        headers=HEADERS,
+        json={"query": query, "variables": variables},
+        timeout=25,
+    )
     resp.raise_for_status()
     data = resp.json()
     if "errors" in data and data["errors"]:
@@ -44,7 +61,12 @@ def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
     query ($item_id: ID!) {
       items (ids: [$item_id]) {
         name
-        column_values { id type text value }
+        column_values {
+          id
+          type
+          text
+          value
+        }
       }
     }
     """
@@ -63,11 +85,16 @@ def get_board_columns_map():
     query ($board_id: [ID!]) {
       boards (ids: $board_id) {
         id
-        columns { id title type settings_str }
+        columns {
+          id
+          title
+          type
+          settings_str
+        }
       }
     }
     """
-    data = _post(query, {"board_id": settings.MONDAY_BOARD_ID})
+    data = _post(query, {"board_id": [str(settings.MONDAY_BOARD_ID)]})
     boards = data["data"]["boards"]
     if not boards:
         return [], {}, {}, {}, {}
@@ -118,13 +145,16 @@ def _translate_monday_expr(expr: str) -> str:
 
 
 def _safe_eval_arith_bool(expr: str) -> float:
-    import ast, operator as op
+    import ast
+    import operator as op
     allowed_binops = {
-        ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul, ast.Div: op.truediv, ast.Pow: op.pow, ast.Mod: op.mod
+        ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul, ast.Div: op.truediv,
+        ast.Pow: op.pow, ast.Mod: op.mod,
     }
     allowed_unary = {ast.UAdd: op.pos, ast.USub: op.neg, ast.Not: op.not_}
     allowed_cmp = {
-        ast.Eq: op.eq, ast.NotEq: op.ne, ast.Gt: op.gt, ast.GtE: op.ge, ast.Lt: op.lt, ast.LtE: op.le
+        ast.Eq: op.eq, ast.NotEq: op.ne, ast.Gt: op.gt, ast.GtE: op.ge,
+        ast.Lt: op.lt, ast.LtE: op.le,
     }
 
     def if_(*args):
@@ -135,19 +165,15 @@ def _safe_eval_arith_bool(expr: str) -> float:
         b = args[2] if len(args) >= 3 else 0
         return a if cond else b
 
-    def and_(*args):
-        return float(all(bool(x) for x in args))
-
-    def or_(*args):
-        return float(any(bool(x) for x in args))
-
-    def not_(x):
-        return float(not bool(x))
+    def and_(*args): return float(all(bool(x) for x in args))
+    def or_(*args): return float(any(bool(x) for x in args))
+    def not_(x): return float(not bool(x))
 
     safe_funcs = {
-        'round': round, 'if_': if_, 'min': min, 'max': max, 'abs': abs,
-        'floor': math.floor, 'ceil': math.ceil, 'and_': and_, 'or_': or_, 'not_': not_,
-        'True': True, 'False': False,
+        "round": round, "if_": if_, "min": min, "max": max,
+        "abs": abs, "floor": math.floor, "ceil": math.ceil,
+        "and_": and_, "or_": or_, "not_": not_,
+        "True": True, "False": False,
     }
 
     def _eval(node):
@@ -156,11 +182,7 @@ def _safe_eval_arith_bool(expr: str) -> float:
         if hasattr(ast, "Constant") and isinstance(node, ast.Constant):
             if isinstance(node.value, (int, float, bool, str)):
                 return node.value
-            raise ValueError("Constante non autorisée")
-        if isinstance(node, ast.Str):
-            return node.s
-        if isinstance(node, ast.Num):
-            return node.n
+            raise ValueError("Constante non autorisee")
         if isinstance(node, ast.BinOp):
             return allowed_binops[type(node.op)](_eval(node.left), _eval(node.right))
         if isinstance(node, ast.UnaryOp):
@@ -171,7 +193,7 @@ def _safe_eval_arith_bool(expr: str) -> float:
                 return all(bool(v) for v in vals)
             if isinstance(node.op, ast.Or):
                 return any(bool(v) for v in vals)
-            raise ValueError("BoolOp non autorisé")
+            raise ValueError("BoolOp non autorise")
         if isinstance(node, ast.Compare):
             left = _eval(node.left)
             for opnode, comp in zip(node.ops, node.comparators):
@@ -182,36 +204,39 @@ def _safe_eval_arith_bool(expr: str) -> float:
             return True
         if isinstance(node, ast.Call):
             if not isinstance(node.func, ast.Name):
-                raise ValueError("Appel non autorisé")
+                raise ValueError("Appel non autorise")
             fname = node.func.id
             if fname not in safe_funcs:
-                raise ValueError(f"Fonction non autorisée: {fname}")
+                raise ValueError(f"Fonction non autorisee: {fname}")
             args = [_eval(a) for a in node.args]
             return safe_funcs[fname](*args)
         if isinstance(node, ast.Name):
             if node.id in safe_funcs:
                 return safe_funcs[node.id]
-            raise ValueError(f"Nom non autorisé: {node.id}")
-        raise ValueError("Expression non autorisée")
+            raise ValueError(f"Nom non autorise: {node.id}")
+        raise ValueError("Expression non autorisee")
 
-    tree = ast.parse(expr, mode='eval')
+    tree = ast.parse(expr, mode="eval")
     val = _eval(tree)
     return float(val) if isinstance(val, (int, float, bool)) else 0.0
 
 
 def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float | None:
     _, id_to_title, title_to_id, formulas, col_types = get_board_columns_map()
-
     query = """
     query ($item_id: ID!) {
       items (ids: [$item_id]) {
-        column_values { id type text value }
+        column_values {
+          id
+          type
+          text
+          value
+        }
       }
     }
     """
     data = _post(query, {"item_id": item_id})
     item_cols = data["data"]["items"][0]["column_values"]
-
     id_to_numeric: dict[str, float] = {}
     id_to_string: dict[str, str] = {}
     for col in item_cols:
@@ -221,7 +246,6 @@ def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float |
             id_to_numeric[col["id"]] = float(re.sub(r"[^0-9\.\-]", "", val_txt.replace(",", ".")) or 0)
         else:
             id_to_string[col["id"]] = val_txt
-
     seen: set[str] = set()
     cache_num: dict[str, float] = {}
 
@@ -241,7 +265,8 @@ def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float |
             seen.add(col_id)
             child_expr = formulas.get(col_id)
             if not child_expr:
-                seen.discard(col_id); return 0.0
+                seen.discard(col_id)
+                return 0.0
             child_expr = _translate_monday_expr(child_expr)
 
             def repl_child(m: re.Match) -> str:
@@ -276,6 +301,10 @@ def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float |
         return None
 
 
+# =====================================================
+# Ecriture de colonnes
+# =====================================================
+
 def set_link_in_column(item_id: int, column_id: str, url: str, text: str):
     mutation = """
     mutation ($board_id: ID!, $item_id: ID!, $column_id: String!, $value: JSON!) {
@@ -285,12 +314,15 @@ def set_link_in_column(item_id: int, column_id: str, url: str, text: str):
     }
     """
     link_value = json.dumps({"url": url, "text": text}, ensure_ascii=False)
-    _post(mutation, {
-        "board_id": settings.MONDAY_BOARD_ID,
-        "item_id": item_id,
-        "column_id": column_id,
-        "value": link_value
-    })
+    _post(
+        mutation,
+        {
+            "board_id": str(settings.MONDAY_BOARD_ID),
+            "item_id": str(item_id),
+            "column_id": column_id,
+            "value": link_value,
+        },
+    )
 
 
 def set_status(item_id: int, column_id: str, label: str):
@@ -301,9 +333,102 @@ def set_status(item_id: int, column_id: str, label: str):
       }
     }
     """
-    _post(mutation, {
-        "board_id": settings.MONDAY_BOARD_ID,
-        "item_id": item_id,
-        "column_id": column_id,
-        "value": label
-    })
+    _post(
+        mutation,
+        {
+            "board_id": str(settings.MONDAY_BOARD_ID),
+            "item_id": str(item_id),
+            "column_id": column_id,
+            "value": label,
+        },
+    )
+
+
+def set_text_column(item_id: int | str, column_id: str, value: str) -> None:
+    """Met a jour une colonne de type text."""
+    mutation = """
+    mutation ($board_id: ID!, $item_id: ID!, $column_id: String!, $value: String!) {
+      change_simple_column_value(board_id: $board_id, item_id: $item_id, column_id: $column_id, value: $value) {
+        id
+      }
+    }
+    """
+    _post(
+        mutation,
+        {
+            "board_id": str(settings.MONDAY_BOARD_ID),
+            "item_id": str(item_id),
+            "column_id": column_id,
+            "value": value or "",
+        },
+    )
+
+
+def set_date_column(item_id: int | str, column_id: str, iso_date: str) -> None:
+    """
+    Met a jour une colonne date. iso_date au format YYYY-MM-DD.
+    Monday attend un JSON {"date": "YYYY-MM-DD"}.
+    """
+    mutation = """
+    mutation ($board_id: ID!, $item_id: ID!, $column_id: String!, $value: JSON!) {
+      change_column_value(board_id: $board_id, item_id: $item_id, column_id: $column_id, value: $value) {
+        id
+      }
+    }
+    """
+    payload = json.dumps({"date": iso_date}, ensure_ascii=False)
+    _post(
+        mutation,
+        {
+            "board_id": str(settings.MONDAY_BOARD_ID),
+            "item_id": str(item_id),
+            "column_id": column_id,
+            "value": payload,
+        },
+    )
+
+
+def upload_file_to_column(
+    item_id: int | str,
+    column_id: str,
+    file_bytes: bytes,
+    filename: str,
+    mime_type: str = "application/pdf",
+) -> dict[str, Any]:
+    """
+    Upload un fichier binaire dans une colonne de type file.
+    Utilise l'endpoint multipart /v2/file de Monday (GraphQL + file upload).
+
+    Reference : https://developer.monday.com/api-reference/docs/files
+    """
+    query = (
+        "mutation ($file: File!, $item_id: ID!, $column_id: String!) {"
+        "  add_file_to_column (item_id: $item_id, column_id: $column_id, file: $file) {"
+        "    id"
+        "  }"
+        "}"
+    )
+    # multipart : on envoie 'query' + 'variables' + 'map' + 'variables.file'
+    # Implementation du GraphQL multipart spec : https://github.com/jaydenseric/graphql-multipart-request-spec
+    operations = {
+        "query": query,
+        "variables": {
+            "item_id": str(item_id),
+            "column_id": column_id,
+            "file": None,
+        },
+    }
+    map_payload = {"0": ["variables.file"]}
+    files = {
+        "operations": (None, json.dumps(operations), "application/json"),
+        "map": (None, json.dumps(map_payload), "application/json"),
+        "0": (filename, file_bytes, mime_type),
+    }
+    # Pour multipart, on n'envoie PAS Content-Type=application/json
+    headers = {"Authorization": settings.MONDAY_API_KEY}
+    resp = requests.post(MONDAY_FILE_URL, headers=headers, files=files, timeout=60)
+    resp.raise_for_status()
+    data = resp.json()
+    if "errors" in data and data["errors"]:
+        raise Exception(f"Erreur upload Monday: {data['errors']}")
+    return data["data"]["add_file_to_column"]

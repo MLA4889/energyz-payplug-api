@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Paiement annulé{% endblock %}
+
+{% block content %}
+<section class="card card--center">
+  <div class="icon icon--warn" aria-hidden="true">
+    <svg viewBox="0 0 24 24" width="48" height="48" fill="currentColor">
+      <path d="M11 15h2v2h-2v-2Zm0-8h2v6h-2V7Zm1-5C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2Zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8Z"/>
+    </svg>
+  </div>
+  <h1>Paiement annulé</h1>
+  <p class="lead">Aucun débit n'a été effectué.</p>
+  <p>
+    <a class="btn btn--primary" href="/p/{{ token }}">Reprendre le paiement</a>
+  </p>
+</section>
+{% endblock %}

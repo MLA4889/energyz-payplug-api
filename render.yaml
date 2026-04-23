@@ -2,6 +2,7 @@ services:
   - type: web
     name: energyz-payplug-api
     env: python
+    plan: starter
     buildCommand: "pip install -r requirements.txt"
     startCommand: "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
     healthCheckPath: /
@@ -9,3 +10,10 @@ services:
       name: data
       mountPath: /var/data
       sizeGB: 1
+    envVars:
+      - key: TOKEN_STORE_PATH
+        value: /var/data/token_store.json
+      - key: PAYPLUG_MODE
+        value: live
+      - key: MONDAY_BOARD_ID
+        value: "2047255654"
