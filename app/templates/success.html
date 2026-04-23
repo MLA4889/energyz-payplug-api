@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Paiement confirmé{% endblock %}
+
+{% block content %}
+<section class="card card--center">
+  {% if status == "invoiced" %}
+    <div class="icon icon--success" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="48" height="48" fill="currentColor">
+        <path d="M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2Z"/>
+      </svg>
+    </div>
+    <h1>Paiement confirmé</h1>
+    <p class="lead">
+      Votre facture n° <strong>{{ invoice_number }}</strong> a été émise et envoyée à
+      <strong>{{ billing_email }}</strong>.
+    </p>
+    <p class="muted">Vous pouvez fermer cette page.</p>
+  {% elif status == "paid" or status == "payment_created" %}
+    <div class="icon icon--pending" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="48" height="48" fill="currentColor">
+        <path d="M12 4a8 8 0 1 0 8 8h-2a6 6 0 1 1-6-6V4Z"/>
+      </svg>
+    </div>
+    <h1>Paiement reçu</h1>
+    <p class="lead">
+      Votre facture est en cours de génération. Vous la recevrez par email d'ici quelques secondes.
+    </p>
+    <p class="muted">Cette page va se rafraîchir automatiquement.</p>
+    <meta http-equiv="refresh" content="5">
+  {% else %}
+    <div class="icon icon--pending" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="48" height="48" fill="currentColor">
+        <path d="M12 4a8 8 0 1 0 8 8h-2a6 6 0 1 1-6-6V4Z"/>
+      </svg>
+    </div>
+    <h1>Merci</h1>
+    <p class="lead">Nous traitons votre paiement.</p>
+    <p class="muted">Vous recevrez un email de confirmation dès sa validation.</p>
+  {% endif %}
+</section>
+{% endblock %}

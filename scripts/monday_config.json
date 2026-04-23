@@ -1,0 +1,48 @@
+{
+  "board_id": 2047255654,
+  "board_name": "🌀 Tableau Principal - Destratificateurs",
+  "columns": {
+    "SIRET": "texte_mkmmc5s0",
+    "ADDRESS_SITE": "lieu_mkmmfwfs",
+    "COMMENTS": "long_texte_mkmm908x",
+    "AMOUNT_FORMULA_TOTAL": "numeric_mkxahyjf",
+    "AMOUNT_FORMULA_ACOMPTE1": "formula_mkwwcfeb",
+    "AMOUNT_FORMULA_ACOMPTE2": "formula_mkwwdes0",
+    "IBAN_FORMULA": "formula_mkwwg0fh",
+    "LINK_ACOMPTE1": "link_mkww3qd4",
+    "LINK_ACOMPTE2": "link_mkwwcj3m",
+    "TRIGGER_GENERATION": "color_mkwwes91",
+    "STATUS_PAYMENT": "color_mkwwwmdg",
+    "BUSINESS_LINE": "color_mkwwrssx",
+    "CLIENT_TYPE": "color_mkwwys33",
+    "INVOICE_NUMBER": "text_mkyrbp0y",
+    "INVOICE_DATE": "date_mm06amfy",
+    "INVOICE_PDF": "file_mm2pmbe3",
+    "BILLING_SIRET": "text_mm2pkwx3",
+    "BILLING_EMAIL": "text_mm2p5e9",
+    "BILLING_LEGAL_NAME": "text_mm2pkbyn"
+  },
+  "created_now": [
+    {
+      "id": "file_mm2pmbe3",
+      "title": "Facture PDF Partenaire",
+      "type": "file"
+    },
+    {
+      "id": "text_mm2pkwx3",
+      "title": "SIRET facturation",
+      "type": "text"
+    },
+    {
+      "id": "text_mm2p5e9",
+      "title": "Email facturation",
+      "type": "text"
+    },
+    {
+      "id": "text_mm2pkbyn",
+      "title": "Raison sociale facturation",
+      "type": "text"
+    }
+  ],
+  "reused": []
+}

@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>{% block title %}Paiement Energyz{% endblock %}</title>
+  <link rel="stylesheet" href="{{ static_url }}/style.css">
+</head>
+<body>
+  <header class="brand">
+    <div class="brand__inner">
+      <span class="brand__logo">ENERGYZ</span>
+      <span class="brand__tag">Paiement sécurisé</span>
+    </div>
+  </header>
+
+  <main class="container">
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="footer">
+    <div class="footer__inner">
+      <span>&copy; Energyz &middot; Paiement traité par PayPlug (agréé ACPR)</span>
+      <span>Support : <a href="mailto:contact@energyz.fr">contact@energyz.fr</a></span>
+    </div>
+  </footer>
+</body>
+</html>
