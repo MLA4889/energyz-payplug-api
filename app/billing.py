@@ -70,7 +70,7 @@ def run_post_payment_flow(
         "[BILLING] token=%s client_id=%s created=%s", token, client_id, created
     )
 
-    # --- 2) facture ---
+    # --- 2) facture (peut naitre en brouillon selon Evoliz) ---
     logger.info("[BILLING] token=%s step=create_invoice", token)
     invoice = evoliz.create_invoice(
         client_id=client_id,
@@ -81,11 +81,26 @@ def run_post_payment_flow(
         document_date=paid_date,
     )
     logger.info(
-        "[BILLING] token=%s invoice_id=%s invoice_number=%s",
-        token, invoice["invoice_id"], invoice["invoice_number"],
+        "[BILLING] token=%s invoice_id=%s initial_status=%s",
+        token, invoice["invoice_id"], invoice.get("status") or "unknown",
     )
 
-    # --- 3) encaissement ---
+    # --- 2b) FORCE l'emission : facture DEFINITIVE (pas brouillon) ---
+    # Evoliz ignore parfois le status dans create_invoice -> appel explicite /issue.
+    logger.info("[BILLING] token=%s step=issue_invoice", token)
+    issued = evoliz.issue_invoice(invoice["invoice_id"])
+    if issued.get("invoice_number"):
+        invoice["invoice_number"] = issued["invoice_number"]
+    invoice["status"] = issued.get("status") or "issued"
+    logger.info(
+        "[BILLING] token=%s issued_via=%s invoice_number=%s status=%s",
+        token,
+        issued.get("endpoint_used"),
+        invoice["invoice_number"],
+        invoice["status"],
+    )
+
+    # --- 3) encaissement (sur facture emise, la passe en 'Payee') ---
     logger.info("[BILLING] token=%s step=register_payment", token)
     evoliz.register_payment(
         invoice_id=invoice["invoice_id"],

@@ -224,14 +224,85 @@ def create_invoice(
     invoice_id = str(body.get("invoiceid") or body.get("id") or "")
     invoice_number = str(body.get("document_number") or body.get("number") or body.get("invoicenumber") or "")
     pdf_url = body.get("pdf_url") or body.get("pdf") or ""
+    status = str(body.get("status") or "").lower()
     if not invoice_id:
         raise RuntimeError(f"Evoliz create_invoice: id manquant dans {body}")
     return {
         "invoice_id": invoice_id,
         "invoice_number": invoice_number,
         "pdf_url": pdf_url,
+        "status": status,
         "raw": body,
     }
+
+
+def issue_invoice(invoice_id: str) -> dict[str, Any]:
+    """
+    Force l'emission d'une facture : garantit qu'elle est DEFINITIVE, pas brouillon.
+
+    Bug historique : passer 'status':'issued' dans le create_invoice est parfois
+    ignore par Evoliz et la facture reste en draft. On appelle explicitement
+    l'endpoint d'emission pour etre sur. Idempotent : si deja emise, retourne
+    simplement les infos.
+
+    Essaie 4 endpoints connus Evoliz dans l'ordre :
+      /issue, /validate, /finalize, /confirm
+    + fallback GET si aucun POST ne passe (facture deja emise par un precedent
+    appel).
+    """
+    candidates = [
+        _companies_path(f"/invoices/{invoice_id}/issue"),
+        _companies_path(f"/invoices/{invoice_id}/validate"),
+        _companies_path(f"/invoices/{invoice_id}/finalize"),
+        _companies_path(f"/invoices/{invoice_id}/confirm"),
+    ]
+    last_err: Exception | None = None
+    for path in candidates:
+        try:
+            data = _request("POST", path, json_body={})
+            body = data.get("data") if isinstance(data, dict) and "data" in data else data
+            return {
+                "invoice_id": invoice_id,
+                "invoice_number": str(
+                    body.get("document_number")
+                    or body.get("number")
+                    or body.get("invoicenumber")
+                    or ""
+                ),
+                "status": str(body.get("status") or "issued").lower(),
+                "endpoint_used": path,
+                "raw": body,
+            }
+        except RuntimeError as e:
+            last_err = e
+            continue
+
+    # Fallback : facture peut-etre deja emise -> on refetch
+    try:
+        data = _request("GET", _companies_path(f"/invoices/{invoice_id}"))
+        body = data.get("data") if isinstance(data, dict) and "data" in data else data
+        status = str(body.get("status") or "").lower()
+        number = str(
+            body.get("document_number")
+            or body.get("number")
+            or body.get("invoicenumber")
+            or ""
+        )
+        if status in ("issued", "validated", "finalized", "confirmed") and number:
+            return {
+                "invoice_id": invoice_id,
+                "invoice_number": number,
+                "status": status,
+                "endpoint_used": "get_invoice_fallback",
+                "raw": body,
+            }
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        f"Evoliz issue_invoice {invoice_id}: aucun endpoint n'a marche. "
+        f"Dernier essai : {last_err}"
+    )
 
 
 def register_payment(
