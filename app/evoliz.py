@@ -234,28 +234,39 @@ def create_invoice(
     document_date: str | None = None,
 ) -> dict[str, Any]:
     """
-    Cree une facture emise (status=issued) pour un client.
-    documentdate au format YYYY-MM-DD.
+    Cree une facture en BROUILLON (status="filled" cote Evoliz, status_code=1).
+    Pour la passer en DEFINITIVE, enchainer avec issue_invoice() qui appelle
+    POST /invoices/{id}/create -> status="create" / status_code=2.
+
+    Format payload (decouvert via script de masse fonctionnel) :
+      - object : libelle visible
+      - term.paytermid = 5 (30 jours) - 1 ne marche pas avec le template du compte
+      - items[].unit_price_vat_exclude (PAS unit_price)
+      - items[].sale_classification.id : 574826 = TVA 20%, 574827 = TVA 5,5%
+        Hard-codes pour le compte Evoliz Energyz (decouverts via /sale-classifications).
     """
     documentdate = document_date or dt.date.today().isoformat()
     designation = (prestation_label or "Prestation").strip()
-    description = (prestation_description or "").strip()
-    # Le template est defini par les parametres du compte Evoliz, pas par l'API
-    # ("templateid": [...] field is prohibited). L'utilisateur doit configurer
-    # son template par defaut "Standard" (id=1) dans Evoliz > Parametres >
-    # Modeles de documents > Factures.
+    obj_label = designation[:200]
+
+    SALE_CLASS_TVA20 = 574826
+    SALE_CLASS_TVA055 = 574827
+    classification_id = (
+        SALE_CLASS_TVA055 if abs(float(vat_rate) - 5.5) < 0.1 else SALE_CLASS_TVA20
+    )
+
     payload = {
-        "clientid": int(client_id) if str(client_id).isdigit() else client_id,
         "documentdate": documentdate,
-        "status": "issued",
-        "term": {"paytermid": 1},
+        "clientid": int(client_id) if str(client_id).isdigit() else client_id,
+        "object": obj_label,
+        "term": {"paytermid": 5, "recovery_indemnity": True},
         "items": [
             {
                 "designation": designation,
-                "description": description,
                 "quantity": 1,
-                "unit_price": round(float(unit_price_ht), 2),
+                "unit_price_vat_exclude": round(float(unit_price_ht), 2),
                 "vat_rate": round(float(vat_rate), 2),
+                "sale_classification": {"id": classification_id},
             }
         ],
     }
@@ -278,46 +289,39 @@ def create_invoice(
 
 def issue_invoice(invoice_id: str, recipient_email: str = "") -> dict[str, Any]:
     """
-    Emet la facture (= la passe de brouillon a definitive) ET l'envoie par email
-    au client.
+    Passe une facture de BROUILLON (status="filled", status_code=1) a DEFINITIVE
+    (status="create", status_code=2).
 
-    Endpoint reel Evoliz API decouvert : POST /invoices/{id}/send
-    Cet appel verrouille la facture (la rend definitive, lui donne un numero
-    final F-... au lieu de T-...) et envoie un email au destinataire.
+    Endpoint Evoliz : POST /api/v1/invoices/{id}/create avec body vide.
+    Decouvert via reverse-engineering d'un script de masse fonctionnel.
 
-    Args:
-        invoice_id : id Evoliz de la facture
-        recipient_email : email destinataire (obligatoire pour /send)
-
-    Si recipient_email est vide ou si /send est indisponible, on retombe sur
-    un GET pour verifier que la facture est dans un etat acceptable.
+    Note : recipient_email n'est plus utilise ici (le /send n'est PAS l'endpoint
+    de validation, mais un endpoint d'envoi par mail qui necessite une facture
+    deja en status="create"). On garde le parametre pour retro-compatibilite.
     """
-    if recipient_email:
-        try:
-            data = _request(
-                "POST",
-                _companies_path(f"/invoices/{invoice_id}/send"),
-                json_body={"to": [recipient_email]},
-            )
-            body = data.get("data") if isinstance(data, dict) and "data" in data else data
-            return {
-                "invoice_id": invoice_id,
-                "invoice_number": str(
-                    body.get("document_number")
-                    or body.get("number")
-                    or body.get("invoicenumber")
-                    or ""
-                ),
-                "status": str(body.get("status") or "sent").lower(),
-                "endpoint_used": "/send",
-                "raw": body,
-            }
-        except RuntimeError as e:
-            last_err: Exception = e
-    else:
-        last_err = RuntimeError("recipient_email manquant pour /send")
+    try:
+        data = _request(
+            "POST",
+            _companies_path(f"/invoices/{invoice_id}/create"),
+            json_body={},
+        )
+        body = data.get("data") if isinstance(data, dict) and "data" in data else data
+        return {
+            "invoice_id": invoice_id,
+            "invoice_number": str(
+                body.get("document_number")
+                or body.get("number")
+                or body.get("invoicenumber")
+                or ""
+            ),
+            "status": str(body.get("status") or "create").lower(),
+            "endpoint_used": "/create",
+            "raw": body,
+        }
+    except RuntimeError as e:
+        last_err: Exception = e
 
-    # Fallback : refetcher pour voir l'etat actuel (peut-etre deja emise)
+    # Fallback : refetch pour voir l'etat actuel
     try:
         data = _request("GET", _companies_path(f"/invoices/{invoice_id}"))
         body = data.get("data") if isinstance(data, dict) and "data" in data else data
@@ -346,12 +350,23 @@ def register_payment(
     paytype: str = "CB",
     comment: str = "",
 ) -> dict[str, Any]:
-    """Enregistre un encaissement sur une facture (la passe en 'Payee')."""
+    """
+    Enregistre un encaissement sur une facture deja DEFINITIVE.
+
+    Format payload (decouvert via script masse) :
+      - paydate : "YYYY-MM-DD"
+      - label : libelle libre (apparait sur la facture, ex "CB Payplug")
+      - paytypeid : 2=Virement, autres a verifier dans /paytypes
+      - amount : float
+    """
+    # paytypeid 2 = Virement. Pour CB Payplug pas de paytypeid sur ce compte;
+    # on utilise 2 et on precise dans le label que c'est CB.
+    label = comment or f"CB - {paytype}"
     payload = {
         "paydate": paydate or dt.date.today().isoformat(),
-        "paytype": paytype,
+        "label": label[:100],
+        "paytypeid": 2,
         "amount": round(float(amount_ttc), 2),
-        "comment": comment or "",
     }
     path = _companies_path(f"/invoices/{invoice_id}/payments")
     data = _request("POST", path, json_body=payload)
