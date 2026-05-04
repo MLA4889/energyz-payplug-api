@@ -442,6 +442,28 @@ def admin_list_invoices_recent():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/admin/evoliz-credit-action/{credit_id}/{action}")
+def admin_evoliz_credit_action(credit_id: str, action: str):
+    """POST /credits/{id}/{action} pour finaliser un avoir."""
+    from . import evoliz
+    try:
+        data = evoliz._request("POST", evoliz._companies_path(f"/credits/{credit_id}/{action}"), json_body={})
+        return {"ok": True, "response": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/admin/evoliz-credit/{credit_id}")
+def admin_evoliz_credit(credit_id: str):
+    """GET /credits/{id} pour voir l'etat d'un avoir."""
+    from . import evoliz
+    try:
+        data = evoliz._request("GET", evoliz._companies_path(f"/credits/{credit_id}"))
+        return {"ok": True, "credit": data.get("data", data) if isinstance(data, dict) else data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.post("/admin/evoliz-create-credit")
 async def admin_create_credit(request: Request):
     """
