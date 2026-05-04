@@ -175,14 +175,11 @@ def run_post_payment_flow(
         billing["raison_sociale"],
     )
 
-    # --- 8) statut "Facture" ---
-    _safe_monday(
-        "set_status_invoiced",
-        monday.set_status,
-        item_id,
-        settings.STATUS_COLUMN_ID,
-        settings.STATUS_LABEL_INVOICED,
-    )
+    # --- 8) NE PAS ecraser le statut "Paye" ---
+    # Le statut "Paye" est defini par le webhook avant l'appel de billing.
+    # Une fois facturé, on LAISSE "Paye" comme etat final (semantiquement
+    # "le partenaire a paye + facture emise").
+    # Ne pas mettre "Facture" qui suggere "facture en attente de paiement".
 
     # --- 9) update token store ---
     token_store.mark_invoiced(
