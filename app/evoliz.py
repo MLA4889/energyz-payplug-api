@@ -145,23 +145,28 @@ def create_client(
       - name : raison sociale (required)
       - address.iso2 : code pays ISO-3166-1 alpha-2 (pas "iso")
     """
-    # Format Evoliz reel (decouvert en lisant un client existant) :
-    #   type : "Professionnel" ou "Particulier" (FR capitalise)
-    #   address.addr / addr2 / postcode / town / iso2
+    # Pour un client Professionnel FR, Evoliz attend (decouvert via 400) :
+    #   - type = "Professionnel"
+    #   - business_identification_number = SIREN (9 chiffres)
+    #   - business_number = numero RCS / SIRET complet (libre)
+    #   - vat_number = "FR" + cle 2-chiffres + SIREN (calculee)
+    siret_clean = "".join(c for c in (siret or "") if c.isdigit())
+    siren = siret_clean[:9] if len(siret_clean) >= 9 else ""
+    vat_number = _compute_fr_vat(siren) if siren else ""
+
     payload = {
         "type": "Professionnel",
-        "name": business_name,
-        "business_number": siret,           # SIRET = business_number sur Evoliz
-        "business_identification_number": siret,  # alias defensif
-        "siret": siret,                      # alias defensif
-        "mail": email,
-        "email": email,
+        "name": str(business_name or ""),
+        "business_identification_number": siren,
+        "business_number": siret_clean,
+        "vat_number": vat_number,
+        "mail": str(email or ""),
         "address": {
-            "addr": address_line1 or "Adresse non precisee",
-            "addr2": address_line2 or "",
-            "postcode": postcode or "00000",
-            "town": town or "N/A",
-            "iso2": country_iso,
+            "addr": str(address_line1 or "Adresse non precisee"),
+            "addr2": str(address_line2 or ""),
+            "postcode": str(postcode or "00000"),
+            "town": str(town or "N/A"),
+            "iso2": str(country_iso or "FR"),
         },
     }
     data = _request("POST", _companies_path("/clients"), json_body=payload)
@@ -169,6 +174,20 @@ def create_client(
     if not client_id:
         raise RuntimeError(f"Evoliz create_client: id introuvable dans {data}")
     return client_id
+
+
+def _compute_fr_vat(siren: str) -> str:
+    """
+    Calcule le numero de TVA intracommunautaire FR a partir du SIREN.
+    Formule : cle = (12 + 3 * (SIREN mod 97)) mod 97
+    Resultat : 'FR' + cle (2 chiffres) + SIREN
+    """
+    siren_clean = "".join(c for c in (siren or "") if c.isdigit())
+    if len(siren_clean) != 9:
+        return ""
+    n = int(siren_clean)
+    key = (12 + 3 * (n % 97)) % 97
+    return f"FR{key:02d}{siren_clean}"
 
 
 def find_or_create_client(
