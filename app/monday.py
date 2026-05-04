@@ -397,37 +397,30 @@ def upload_file_to_column(
 ) -> dict[str, Any]:
     """
     Upload un fichier binaire dans une colonne de type file.
-    Utilise l'endpoint multipart /v2/file de Monday (GraphQL + file upload).
+
+    Format multipart Monday OFFICIEL (different du standard graphql-multipart-spec) :
+      - champ 'query' = mutation avec item_id et column_id INLINE
+      - champ 'variables[file]' = le binaire
+    Pas de operations / map / 0 → ce sont des extensions du spec GraphQL multipart
+    que Monday n'implemente pas.
 
     Reference : https://developer.monday.com/api-reference/docs/files
     """
+    item_id_str = str(item_id)
+    column_id_str = str(column_id)
     query = (
-        "mutation ($file: File!, $item_id: ID!, $column_id: String!) {"
-        "  add_file_to_column (item_id: $item_id, column_id: $column_id, file: $file) {"
-        "    id"
-        "  }"
-        "}"
+        "mutation ($file: File!) { "
+        f"add_file_to_column (item_id: {item_id_str}, column_id: \"{column_id_str}\", file: $file) "
+        "{ id } }"
     )
-    # multipart : on envoie 'query' + 'variables' + 'map' + 'variables.file'
-    # Implementation du GraphQL multipart spec : https://github.com/jaydenseric/graphql-multipart-request-spec
-    operations = {
-        "query": query,
-        "variables": {
-            "item_id": str(item_id),
-            "column_id": column_id,
-            "file": None,
-        },
-    }
-    map_payload = {"0": ["variables.file"]}
     files = {
-        "operations": (None, json.dumps(operations), "application/json"),
-        "map": (None, json.dumps(map_payload), "application/json"),
-        "0": (filename, file_bytes, mime_type),
+        "query": (None, query),
+        "variables[file]": (filename, file_bytes, mime_type),
     }
-    # Pour multipart, on n'envoie PAS Content-Type=application/json
     headers = {"Authorization": settings.MONDAY_API_KEY}
     resp = requests.post(MONDAY_FILE_URL, headers=headers, files=files, timeout=60)
-    resp.raise_for_status()
+    if not resp.ok:
+        raise Exception(f"Monday upload {resp.status_code}: {resp.text[:500]}")
     data = resp.json()
     if "errors" in data and data["errors"]:
         raise Exception(f"Erreur upload Monday: {data['errors']}")
