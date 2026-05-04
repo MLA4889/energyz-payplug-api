@@ -458,6 +458,33 @@ async def admin_replay(token: str, request: Request):
 
 
 # =====================================================
+# 4c) ADMIN DEBUG : voir un client existant Evoliz pour decoder la schema
+# =====================================================
+
+@app.get("/admin/evoliz-sample-client")
+def admin_evoliz_sample():
+    """
+    Renvoie la structure d'un client deja existant dans Evoliz pour deviner
+    le format exact de 'type' attendu par l'API. Sans auth (lecture seule).
+    """
+    from . import evoliz
+    try:
+        # Liste les premiers clients
+        data = evoliz._request("GET", evoliz._companies_path("/clients"))
+        items = data if isinstance(data, list) else data.get("data") or []
+        if not items:
+            # Si pas de client, regarde un prospect
+            data = evoliz._request("GET", evoliz._companies_path("/prospects"))
+            items = data if isinstance(data, list) else data.get("data") or []
+        if not items:
+            return {"ok": False, "msg": "aucun client ni prospect existant"}
+        # On retourne juste le 1er, brute (aucun secret la-dedans, juste schema)
+        return {"ok": True, "first": items[0], "count": len(items)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Evoliz debug echec : {e}")
+
+
+# =====================================================
 # 5) Webhook PayPlug
 # =====================================================
 
