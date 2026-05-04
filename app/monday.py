@@ -326,6 +326,14 @@ def set_link_in_column(item_id: int, column_id: str, url: str, text: str):
 
 
 def set_status(item_id: int, column_id: str, label: str):
+    """
+    Set un label sur une colonne status.
+
+    Auto-cicatrisant : si Monday rejette le label avec 'missingLabel', on essaie
+    automatiquement la variante avec accents francais classiques (Paye -> Paye,
+    Facture -> Facture, Bloque -> Bloque). Robuste meme si l'env var a ete saisie
+    sans accent.
+    """
     mutation = """
     mutation ($board_id: ID!, $item_id: ID!, $column_id: String!, $value: String!) {
       change_simple_column_value(board_id: $board_id, item_id: $item_id, column_id: $column_id, value: $value) {
@@ -333,15 +341,35 @@ def set_status(item_id: int, column_id: str, label: str):
       }
     }
     """
-    _post(
-        mutation,
-        {
-            "board_id": str(settings.MONDAY_BOARD_ID),
-            "item_id": str(item_id),
-            "column_id": column_id,
-            "value": label,
-        },
-    )
+    variables = {
+        "board_id": str(settings.MONDAY_BOARD_ID),
+        "item_id": str(item_id),
+        "column_id": column_id,
+        "value": label,
+    }
+    try:
+        _post(mutation, variables)
+        return
+    except Exception as e:
+        if "missingLabel" not in str(e) and "doesn't exist" not in str(e):
+            raise
+        # On essaie avec accents francais courants
+        accented_map = {
+            "Paye": "Payé",
+            "Paye acompte 1": "Payé acompte 1",
+            "Paye acompte 2": "Payé acompte 2",
+            "Paye delegataire": "Payé délégataire",
+            "Facture": "Facturé",
+            "Bloque": "Bloqué",
+            "Valide": "Validé",
+            "Rejete": "Rejeté",
+            "Archive": "Archivé",
+        }
+        accented = accented_map.get(label.strip())
+        if not accented or accented == label:
+            raise
+        variables["value"] = accented
+        _post(mutation, variables)
 
 
 def set_text_column(item_id: int | str, column_id: str, value: str) -> None:
