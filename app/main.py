@@ -422,7 +422,7 @@ def admin_list_invoices_recent():
     try:
         data = evoliz._request(
             "GET",
-            evoliz._companies_path("/invoices") + "?per_page=30&order=desc",
+            evoliz._companies_path("/invoices") + "?per_page=30&sort_by=invoiceid&order=desc",
         )
         items = data if isinstance(data, list) else data.get("data") or []
         out = []
