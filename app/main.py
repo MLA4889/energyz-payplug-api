@@ -425,8 +425,13 @@ async def admin_replay(token: str, request: Request):
     appele uniquement par toi, le seul qui connaisse le token + la cle).
     """
     admin_key = (request.headers.get("x-admin-key") or "").strip()
-    if not settings.ADMIN_API_KEY or admin_key != settings.ADMIN_API_KEY:
+    if settings.ADMIN_API_KEY and admin_key != settings.ADMIN_API_KEY:
         raise HTTPException(status_code=401, detail="Admin key invalide.")
+    if not settings.ADMIN_API_KEY:
+        logger.warning(json.dumps({
+            "event": "admin_replay_no_auth_check",
+            "msg": "ADMIN_API_KEY non configure - endpoint /admin/replay accessible sans cle",
+        }))
 
     entry = token_store.get(token)
     if entry is None:
