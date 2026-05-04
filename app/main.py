@@ -472,6 +472,50 @@ def admin_evoliz_invoice(invoice_id: str):
         raise HTTPException(status_code=500, detail=f"Evoliz invoice fetch failed: {e}")
 
 
+@app.post("/admin/evoliz-send/{invoice_id}")
+def admin_evoliz_send(invoice_id: str, request: Request):
+    """
+    Force l'emission d'une facture deja creee (utile pour recuperer un brouillon
+    cree avant qu'on ait trouve le bon endpoint). Body : {"to": "email@x.com"}.
+    """
+    from . import evoliz
+    body = {}
+    try:
+        body = request.scope.get("_body") or {}
+    except Exception:
+        pass
+
+    # Plus simple : prendre l'email en query string
+    email = request.query_params.get("email", "")
+    if not email:
+        raise HTTPException(status_code=400, detail="Param ?email=... requis")
+
+    try:
+        result = evoliz.issue_invoice(invoice_id, recipient_email=email)
+        return {"ok": True, "result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/admin/evoliz-register-payment/{invoice_id}")
+def admin_evoliz_register(invoice_id: str, request: Request):
+    """Enregistre un paiement CB sur une facture deja emise. ?amount=480.00"""
+    from . import evoliz
+    amt = request.query_params.get("amount")
+    if not amt:
+        raise HTTPException(status_code=400, detail="Param ?amount=... requis")
+    try:
+        result = evoliz.register_payment(
+            invoice_id=invoice_id,
+            amount_ttc=float(amt),
+            paytype="CB",
+            comment=f"Paiement Payplug recovery (replay)",
+        )
+        return {"ok": True, "result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/admin/evoliz-try/{invoice_id}/{action}")
 def admin_evoliz_try(invoice_id: str, action: str):
     """Test un endpoint POST /invoices/{id}/{action} pour decouvrir l'API."""
