@@ -458,6 +458,21 @@ async def admin_replay(token: str, request: Request):
 
 
 # =====================================================
+# 4d) ADMIN DEBUG : inspecter une facture Evoliz par id
+# =====================================================
+
+@app.get("/admin/evoliz-invoice/{invoice_id}")
+def admin_evoliz_invoice(invoice_id: str):
+    from . import evoliz
+    try:
+        data = evoliz._request("GET", evoliz._companies_path(f"/invoices/{invoice_id}"))
+        body = data.get("data") if isinstance(data, dict) and "data" in data else data
+        return {"ok": True, "invoice": body}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Evoliz invoice fetch failed: {e}")
+
+
+# =====================================================
 # 4c) ADMIN DEBUG : voir un client existant Evoliz pour decoder la schema
 # =====================================================
 
