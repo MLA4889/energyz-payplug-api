@@ -376,13 +376,16 @@ def register_payment(
 
 def download_invoice_pdf(invoice_id: str) -> tuple[bytes, str]:
     """
-    Telecharge le PDF d'une facture. Essaye plusieurs endpoints connus.
+    Telecharge le PDF d'une facture. L'endpoint reel est /api/companies/{id}/files/invoice/{inv}
+    (sans /v1, decouvert via le champ 'file' renvoye par GET /invoices/{id}).
     Retourne (bytes, filename).
     """
+    cid = settings.EVOLIZ_COMPANY_ID
     candidates = [
-        _companies_path(f"/invoices/{invoice_id}/pdf"),
-        _companies_path(f"/invoices/{invoice_id}/download"),
-        _companies_path(f"/invoices/{invoice_id}/export/pdf"),
+        f"/api/companies/{cid}/files/invoice/{invoice_id}",     # endpoint reel
+        f"/api/v1/companies/{cid}/invoices/{invoice_id}/pdf",   # fallback historique
+        f"/api/v1/companies/{cid}/invoices/{invoice_id}/download",
+        f"/api/v1/companies/{cid}/invoices/{invoice_id}/export/pdf",
     ]
     last_err: Exception | None = None
     for path in candidates:
