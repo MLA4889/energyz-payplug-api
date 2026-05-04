@@ -415,6 +415,39 @@ async def api_payments_create(request: Request):
 # 4b) ADMIN : rejouer manuellement la facturation pour un token deja paye
 # =====================================================
 
+@app.post("/admin/upload-pdf-only/{token}")
+def admin_upload_pdf_only(token: str):
+    """Telecharge le PDF de la facture deja creee + upload sur Monday (sans replay full)."""
+    from . import evoliz
+    entry = token_store.get(token)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Token inconnu")
+    inv_id = entry.get("evoliz_invoice_id")
+    if not inv_id:
+        raise HTTPException(status_code=400, detail="Pas d'invoice_id dans le token")
+    item_id = entry.get("monday_item_id")
+    if not item_id:
+        raise HTTPException(status_code=400, detail="Pas d'item_id Monday")
+    try:
+        pdf_bytes, filename = evoliz.download_invoice_pdf(inv_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PDF download fail: {e}")
+    if not pdf_bytes:
+        raise HTTPException(status_code=500, detail="PDF vide")
+    try:
+        from . import monday
+        asset = monday.upload_file_to_column(
+            item_id=item_id,
+            column_id=settings.INVOICE_PDF_COLUMN_ID,
+            file_bytes=pdf_bytes,
+            filename=filename or f"facture_{entry.get('invoice_number') or inv_id}.pdf",
+            mime_type="application/pdf",
+        )
+        return {"ok": True, "filename": filename, "size": len(pdf_bytes), "asset": asset}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Monday upload fail: {e}")
+
+
 @app.post("/admin/replay/{token}")
 async def admin_replay(token: str, request: Request):
     """
