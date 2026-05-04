@@ -588,6 +588,59 @@ def admin_evoliz_try(invoice_id: str, action: str, request: Request):
         return {"ok": False, "action": action, "body_sent": body, "error": str(e)}
 
 
+@app.post("/admin/evoliz-test-invoice-particulier")
+def admin_test_part():
+    """
+    Cree un client Particulier + une facture pour tester si le template change
+    selon le type de client.
+    """
+    from . import evoliz
+    # 1) cree client Particulier
+    client_payload = {
+        "type": "Particulier",
+        "name": "TEST PARTICULIER " + dt.datetime.now().strftime("%H%M%S"),
+        "mail": "test+particulier@energyz.fr",
+        "address": {
+            "addr": "1 rue test",
+            "postcode": "75001",
+            "town": "Paris",
+            "iso2": "FR",
+        },
+    }
+    c = evoliz._request("POST", evoliz._companies_path("/clients"), json_body=client_payload)
+    client_id = evoliz._extract_id(c) or ""
+    if not client_id:
+        return {"step": "create_client", "response": c}
+
+    # 2) cree invoice
+    inv_payload = {
+        "documentdate": dt.date.today().isoformat(),
+        "clientid": int(client_id),
+        "object": "Test particulier",
+        "term": {"paytermid": 5, "recovery_indemnity": True},
+        "items": [{
+            "designation": "Test",
+            "quantity": 1,
+            "unit_price_vat_exclude": 100.0,
+            "vat_rate": 20,
+            "sale_classification": {"id": 574826},
+        }],
+    }
+    inv = evoliz._request("POST", evoliz._companies_path("/invoices"), json_body=inv_payload)
+    body = inv.get("data") if isinstance(inv, dict) and "data" in inv else inv
+    return {
+        "client_id": client_id,
+        "invoice_id": body.get("invoiceid"),
+        "doc_number": body.get("document_number"),
+        "status": body.get("status"),
+        "template": body.get("template"),
+        "term_saved": body.get("term"),
+    }
+
+
+import datetime as dt
+
+
 @app.patch("/admin/evoliz-patch-invoice/{invoice_id}")
 async def admin_evoliz_patch_invoice(invoice_id: str, request: Request):
     """PATCH /invoices/{id} avec body JSON arbitraire."""
