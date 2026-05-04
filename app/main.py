@@ -481,6 +481,26 @@ def admin_evoliz_invoice(invoice_id: str):
         raise HTTPException(status_code=500, detail=f"Evoliz invoice fetch failed: {e}")
 
 
+@app.get("/admin/evoliz-templates")
+def admin_evoliz_templates():
+    """Liste les templates Evoliz disponibles pour le compte."""
+    from . import evoliz
+    candidates = [
+        "/templates",
+        "/templates/invoice",
+        "/invoice-templates",
+        "/document-templates",
+    ]
+    results = {}
+    for c in candidates:
+        try:
+            data = evoliz._request("GET", evoliz._companies_path(c))
+            results[c] = data
+        except Exception as e:
+            results[c] = f"FAIL: {str(e)[:200]}"
+    return results
+
+
 @app.post("/admin/evoliz-send/{invoice_id}")
 def admin_evoliz_send(invoice_id: str, request: Request):
     """Appelle POST /invoices/{id}/send avec ?email=... et renvoie l'erreur Evoliz brute."""
