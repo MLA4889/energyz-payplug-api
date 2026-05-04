@@ -245,6 +245,11 @@ def create_invoice(
         "documentdate": documentdate,
         "status": "issued",
         "term": {"paytermid": 1},  # paiement immediat
+        # IMPORTANT : Evoliz a deux templates principaux pour les factures :
+        #   id=1   "Standard"           -> facture normale, autorisee a /send
+        #   custom "Facture d'acompte"  -> deposit invoice, refuse /send sans devis parent
+        # On force le Standard pour pouvoir /send et passer en definitive.
+        "template": {"templateid": 1},
         "items": [
             {
                 "designation": designation,

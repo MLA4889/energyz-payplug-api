@@ -481,6 +481,34 @@ def admin_evoliz_invoice(invoice_id: str):
         raise HTTPException(status_code=500, detail=f"Evoliz invoice fetch failed: {e}")
 
 
+@app.delete("/admin/evoliz-invoice/{invoice_id}")
+def admin_evoliz_delete_invoice(invoice_id: str):
+    """Supprime une facture brouillon (necessaire pour rejouer apres template fix)."""
+    from . import evoliz
+    try:
+        data = evoliz._request("DELETE", evoliz._companies_path(f"/invoices/{invoice_id}"))
+        return {"ok": True, "deleted": invoice_id, "response": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/admin/reset-token-billing/{token}")
+def admin_reset_token_billing(token: str):
+    """Reset les champs evoliz du token pour pouvoir replay."""
+    entry = token_store.update(
+        token,
+        status="payment_created",  # repasse en "paye mais facturation pas faite"
+        evoliz_client_id=None,
+        evoliz_invoice_id=None,
+        invoice_number=None,
+        invoice_date=None,
+        last_error=None,
+    )
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Token inconnu")
+    return {"ok": True, "status": entry["status"]}
+
+
 @app.get("/admin/evoliz-templates")
 def admin_evoliz_templates():
     """Liste les templates Evoliz disponibles pour le compte."""
