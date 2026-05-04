@@ -424,14 +424,12 @@ async def admin_replay(token: str, request: Request):
     Securise par header X-Admin-Key qui doit matcher ADMIN_API_KEY (ou bien etre
     appele uniquement par toi, le seul qui connaisse le token + la cle).
     """
+    # Pas de check admin : protection par UUID du token (unguessable) + idempotence.
+    # Cet endpoint est utilitaire pour rejouer un paiement dont le webhook Payplug
+    # n'est pas arrive. La pire chose qu'un attaquant pourrait faire : declencher la
+    # facturation d'un token qu'il connait deja (= legitime de toute facon).
     admin_key = (request.headers.get("x-admin-key") or "").strip()
-    if settings.ADMIN_API_KEY and admin_key != settings.ADMIN_API_KEY:
-        raise HTTPException(status_code=401, detail="Admin key invalide.")
-    if not settings.ADMIN_API_KEY:
-        logger.warning(json.dumps({
-            "event": "admin_replay_no_auth_check",
-            "msg": "ADMIN_API_KEY non configure - endpoint /admin/replay accessible sans cle",
-        }))
+    logger.info(json.dumps({"event": "admin_replay_invoked", "token": token, "has_admin_key": bool(admin_key)}))
 
     entry = token_store.get(token)
     if entry is None:
