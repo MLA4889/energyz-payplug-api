@@ -415,6 +415,29 @@ async def api_payments_create(request: Request):
 # 4b) ADMIN : rejouer manuellement la facturation pour un token deja paye
 # =====================================================
 
+@app.get("/admin/probe-pdf/{token}")
+def admin_probe_pdf(token: str):
+    """Verifie que le download PDF Evoliz fonctionne et renvoie taille + 1ers octets."""
+    from . import evoliz
+    entry = token_store.get(token)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Token inconnu")
+    inv_id = entry.get("evoliz_invoice_id")
+    if not inv_id:
+        raise HTTPException(status_code=400, detail="Pas d'invoice_id")
+    try:
+        pdf_bytes, filename = evoliz.download_invoice_pdf(inv_id)
+        return {
+            "ok": True,
+            "filename": filename,
+            "size": len(pdf_bytes),
+            "first_bytes_hex": pdf_bytes[:16].hex() if pdf_bytes else "",
+            "starts_with_pdf": pdf_bytes[:4] == b"%PDF",
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.post("/admin/upload-pdf-only/{token}")
 def admin_upload_pdf_only(token: str):
     """Telecharge le PDF de la facture deja creee + upload sur Monday (sans replay full)."""
