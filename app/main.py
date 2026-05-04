@@ -415,6 +415,58 @@ async def api_payments_create(request: Request):
 # 4b) ADMIN : rejouer manuellement la facturation pour un token deja paye
 # =====================================================
 
+@app.get("/admin/evoliz-invoices-recent")
+def admin_list_invoices_recent():
+    """Liste les 30 dernieres factures (toutes statuts, par date desc) pour identifier doublons."""
+    from . import evoliz
+    try:
+        data = evoliz._request(
+            "GET",
+            evoliz._companies_path("/invoices") + "?per_page=30&order=desc",
+        )
+        items = data if isinstance(data, list) else data.get("data") or []
+        out = []
+        for it in items:
+            out.append({
+                "invoiceid": it.get("invoiceid") or it.get("id"),
+                "doc_number": it.get("document_number"),
+                "client_name": (it.get("client") or {}).get("name"),
+                "status": it.get("status"),
+                "status_code": it.get("status_code"),
+                "vat_include": (it.get("total") or {}).get("vat_include"),
+                "paid": (it.get("total") or {}).get("paid"),
+                "documentdate": it.get("documentdate"),
+            })
+        return {"count": len(out), "invoices": out}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/admin/evoliz-credit-note/{invoice_id}")
+def admin_create_credit_note(invoice_id: str):
+    """
+    Cree un avoir (credit note) pour annuler une facture definitive.
+    Endpoint Evoliz a tester : POST /api/v1/companies/{id}/credits avec {invoiceid}.
+    """
+    from . import evoliz
+    # Methode 1 : POST /credits avec ref a invoice_id
+    candidates = [
+        ("POST", "/credits", {"invoiceid": int(invoice_id) if str(invoice_id).isdigit() else invoice_id}),
+        ("POST", f"/invoices/{invoice_id}/credit", {}),
+        ("POST", f"/invoices/{invoice_id}/credit-note", {}),
+        ("POST", f"/invoices/{invoice_id}/cancel", {}),
+        ("POST", f"/invoices/{invoice_id}/refund", {}),
+    ]
+    results = []
+    for method, path, body in candidates:
+        try:
+            data = evoliz._request(method, evoliz._companies_path(path), json_body=body)
+            return {"ok": True, "endpoint": f"{method} {path}", "response": data}
+        except Exception as e:
+            results.append({"endpoint": f"{method} {path}", "error": str(e)[:300]})
+    return {"ok": False, "tries": results}
+
+
 @app.get("/admin/probe-pdf/{token}")
 def admin_probe_pdf(token: str):
     """Verifie que le download PDF Evoliz fonctionne et renvoie taille + 1ers octets."""
