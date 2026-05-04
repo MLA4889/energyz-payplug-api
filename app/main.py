@@ -504,6 +504,30 @@ def admin_create_credit_note(invoice_id: str):
     return {"ok": False, "tries": results}
 
 
+@app.get("/admin/probe-pdf-raw/{invoice_id}")
+def admin_probe_pdf_raw(invoice_id: str):
+    """Renvoie tel quel ce que Evoliz envoie sur /files/invoice/{id} pour decoder le format."""
+    from . import evoliz
+    cid = settings.EVOLIZ_COMPANY_ID
+    import requests
+    # On bypass _request pour avoir les bytes bruts + headers
+    url = f"{settings.EVOLIZ_BASE_URL}/api/companies/{cid}/files/invoice/{invoice_id}"
+    h = evoliz._headers(content_type=None)
+    r = requests.get(url, headers=h, timeout=30)
+    content = r.content[:2000]
+    try:
+        text = content.decode("utf-8")
+    except Exception:
+        text = repr(content)[:1000]
+    return {
+        "url": url,
+        "status_code": r.status_code,
+        "content_type": r.headers.get("content-type"),
+        "size": len(r.content),
+        "first_text": text,
+    }
+
+
 @app.get("/admin/probe-pdf/{token}")
 def admin_probe_pdf(token: str):
     """Verifie que le download PDF Evoliz fonctionne et renvoie taille + 1ers octets."""
