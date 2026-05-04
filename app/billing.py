@@ -85,10 +85,11 @@ def run_post_payment_flow(
         token, invoice["invoice_id"], invoice.get("status") or "unknown",
     )
 
-    # --- 2b) FORCE l'emission : facture DEFINITIVE (pas brouillon) ---
-    # Evoliz ignore parfois le status dans create_invoice -> appel explicite /issue.
-    logger.info("[BILLING] token=%s step=issue_invoice", token)
-    issued = evoliz.issue_invoice(invoice["invoice_id"])
+    # --- 2b) FORCE l'emission : POST /invoices/{id}/send avec email destinataire.
+    # Cet endpoint Evoliz verrouille la facture (la rend definitive : numero F-...
+    # au lieu de T-...) ET envoie un email au client avec la facture en PJ.
+    logger.info("[BILLING] token=%s step=issue_invoice (via /send)", token)
+    issued = evoliz.issue_invoice(invoice["invoice_id"], recipient_email=billing["email"])
     if issued.get("invoice_number"):
         invoice["invoice_number"] = issued["invoice_number"]
     invoice["status"] = issued.get("status") or "issued"

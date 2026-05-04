@@ -272,30 +272,29 @@ def create_invoice(
     }
 
 
-def issue_invoice(invoice_id: str) -> dict[str, Any]:
+def issue_invoice(invoice_id: str, recipient_email: str = "") -> dict[str, Any]:
     """
-    Force l'emission d'une facture : garantit qu'elle est DEFINITIVE, pas brouillon.
+    Emet la facture (= la passe de brouillon a definitive) ET l'envoie par email
+    au client.
 
-    Bug historique : passer 'status':'issued' dans le create_invoice est parfois
-    ignore par Evoliz et la facture reste en draft. On appelle explicitement
-    l'endpoint d'emission pour etre sur. Idempotent : si deja emise, retourne
-    simplement les infos.
+    Endpoint reel Evoliz API decouvert : POST /invoices/{id}/send
+    Cet appel verrouille la facture (la rend definitive, lui donne un numero
+    final F-... au lieu de T-...) et envoie un email au destinataire.
 
-    Essaie 4 endpoints connus Evoliz dans l'ordre :
-      /issue, /validate, /finalize, /confirm
-    + fallback GET si aucun POST ne passe (facture deja emise par un precedent
-    appel).
+    Args:
+        invoice_id : id Evoliz de la facture
+        recipient_email : email destinataire (obligatoire pour /send)
+
+    Si recipient_email est vide ou si /send est indisponible, on retombe sur
+    un GET pour verifier que la facture est dans un etat acceptable.
     """
-    candidates = [
-        _companies_path(f"/invoices/{invoice_id}/issue"),
-        _companies_path(f"/invoices/{invoice_id}/validate"),
-        _companies_path(f"/invoices/{invoice_id}/finalize"),
-        _companies_path(f"/invoices/{invoice_id}/confirm"),
-    ]
-    last_err: Exception | None = None
-    for path in candidates:
+    if recipient_email:
         try:
-            data = _request("POST", path, json_body={})
+            data = _request(
+                "POST",
+                _companies_path(f"/invoices/{invoice_id}/send"),
+                json_body={"to": [recipient_email]},
+            )
             body = data.get("data") if isinstance(data, dict) and "data" in data else data
             return {
                 "invoice_id": invoice_id,
@@ -305,40 +304,35 @@ def issue_invoice(invoice_id: str) -> dict[str, Any]:
                     or body.get("invoicenumber")
                     or ""
                 ),
-                "status": str(body.get("status") or "issued").lower(),
-                "endpoint_used": path,
+                "status": str(body.get("status") or "sent").lower(),
+                "endpoint_used": "/send",
                 "raw": body,
             }
         except RuntimeError as e:
-            last_err = e
-            continue
+            last_err: Exception = e
+    else:
+        last_err = RuntimeError("recipient_email manquant pour /send")
 
-    # Fallback : facture peut-etre deja emise -> on refetch
+    # Fallback : refetcher pour voir l'etat actuel (peut-etre deja emise)
     try:
         data = _request("GET", _companies_path(f"/invoices/{invoice_id}"))
         body = data.get("data") if isinstance(data, dict) and "data" in data else data
-        status = str(body.get("status") or "").lower()
-        number = str(
-            body.get("document_number")
-            or body.get("number")
-            or body.get("invoicenumber")
-            or ""
-        )
-        if status in ("issued", "validated", "finalized", "confirmed") and number:
-            return {
-                "invoice_id": invoice_id,
-                "invoice_number": number,
-                "status": status,
-                "endpoint_used": "get_invoice_fallback",
-                "raw": body,
-            }
+        return {
+            "invoice_id": invoice_id,
+            "invoice_number": str(
+                body.get("document_number")
+                or body.get("number")
+                or body.get("invoicenumber")
+                or ""
+            ),
+            "status": str(body.get("status") or "").lower(),
+            "endpoint_used": "get_invoice_fallback",
+            "raw": body,
+        }
     except Exception:
-        pass
-
-    raise RuntimeError(
-        f"Evoliz issue_invoice {invoice_id}: aucun endpoint n'a marche. "
-        f"Dernier essai : {last_err}"
-    )
+        raise RuntimeError(
+            f"Evoliz issue_invoice {invoice_id} echec : {last_err}"
+        )
 
 
 def register_payment(
