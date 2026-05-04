@@ -461,6 +461,15 @@ async def admin_replay(token: str, request: Request):
 # 4d) ADMIN DEBUG : inspecter une facture Evoliz par id
 # =====================================================
 
+@app.get("/admin/token/{token}")
+def admin_get_token(token: str):
+    """Dump une entree token_store (pour recuperer billing email apres paiement)."""
+    entry = token_store.get(token)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Token inconnu")
+    return entry
+
+
 @app.get("/admin/evoliz-invoice/{invoice_id}")
 def admin_evoliz_invoice(invoice_id: str):
     from . import evoliz
