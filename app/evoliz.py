@@ -154,6 +154,16 @@ def create_client(
     siren = siret_clean[:9] if len(siret_clean) >= 9 else ""
     vat_number = _compute_fr_vat(siren) if siren else ""
 
+    address: dict = {
+        "addr": str(address_line1 or "Adresse non precisee"),
+        "postcode": str(postcode or "00000"),
+        "town": str(town or "N/A"),
+        "iso2": str(country_iso or "FR"),
+    }
+    # Evoliz refuse string vide pour addr2 -> on l'omet plutot que d'envoyer ""
+    if address_line2 and str(address_line2).strip():
+        address["addr2"] = str(address_line2).strip()
+
     payload = {
         "type": "Professionnel",
         "name": str(business_name or ""),
@@ -161,13 +171,7 @@ def create_client(
         "business_number": siret_clean,
         "vat_number": vat_number,
         "mail": str(email or ""),
-        "address": {
-            "addr": str(address_line1 or "Adresse non precisee"),
-            "addr2": str(address_line2 or ""),
-            "postcode": str(postcode or "00000"),
-            "town": str(town or "N/A"),
-            "iso2": str(country_iso or "FR"),
-        },
+        "address": address,
     }
     data = _request("POST", _companies_path("/clients"), json_body=payload)
     client_id = _extract_id(data)
