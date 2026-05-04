@@ -240,16 +240,18 @@ def create_invoice(
     documentdate = document_date or dt.date.today().isoformat()
     designation = (prestation_label or "Prestation").strip()
     description = (prestation_description or "").strip()
+    # Evoliz : on force le template "Standard" (id=1) car le default du compte
+    # est "Facture d'acompte" qui ne supporte pas /send sans devis parent.
+    # On essaie plusieurs noms de champ vu qu'aucun n'est documente publiquement.
     payload = {
         "clientid": int(client_id) if str(client_id).isdigit() else client_id,
         "documentdate": documentdate,
         "status": "issued",
-        "term": {"paytermid": 1},  # paiement immediat
-        # IMPORTANT : Evoliz a deux templates principaux pour les factures :
-        #   id=1   "Standard"           -> facture normale, autorisee a /send
-        #   custom "Facture d'acompte"  -> deposit invoice, refuse /send sans devis parent
-        # On force le Standard pour pouvoir /send et passer en definitive.
-        "template": {"templateid": 1},
+        "term": {"paytermid": 1},
+        "templateid": 1,                    # root-level (variante 1)
+        "template_id": 1,                   # variante 2
+        "template": 1,                      # variante 3 (juste l'id)
+        "document_template_id": 1,          # variante 4
         "items": [
             {
                 "designation": designation,
