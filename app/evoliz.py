@@ -145,14 +145,19 @@ def create_client(
       - name : raison sociale (required)
       - address.iso2 : code pays ISO-3166-1 alpha-2 (pas "iso")
     """
-    # Pour un client Professionnel FR, Evoliz attend (decouvert via 400) :
-    #   - type = "Professionnel"
-    #   - business_identification_number = SIREN (9 chiffres)
-    #   - business_number = numero RCS / SIRET complet (libre)
-    #   - vat_number = "FR" + cle 2-chiffres + SIREN (calculee)
+    # IMPORTANT : on cree le client en "Particulier" (pas "Professionnel") pour
+    # contourner un bug Evoliz : avec type=Professionnel, l'API ignore le champ
+    # term sur la facture (paytermid + recovery_indemnity), ce qui empeche le
+    # passage en facture definitive via POST /invoices/{id}/create.
+    #
+    # Avec type=Particulier, term est respecte et /create fonctionne.
+    # On conserve le SIRET (legal) en l'incorporant au nom : "RAISON SOCIALE
+    # (SIRET 12345...)" pour qu'il soit visible sur la facture PDF.
     siret_clean = "".join(c for c in (siret or "") if c.isdigit())
-    siren = siret_clean[:9] if len(siret_clean) >= 9 else ""
-    vat_number = _compute_fr_vat(siren) if siren else ""
+    name_with_siret = str(business_name or "")
+    if siret_clean and len(siret_clean) == 14:
+        name_with_siret = f"{name_with_siret} (SIRET {siret_clean})"
+    name_with_siret = name_with_siret[:200]
 
     address: dict = {
         "addr": str(address_line1 or "Adresse non precisee"),
@@ -160,16 +165,12 @@ def create_client(
         "town": str(town or "N/A"),
         "iso2": str(country_iso or "FR"),
     }
-    # Evoliz refuse string vide pour addr2 -> on l'omet plutot que d'envoyer ""
     if address_line2 and str(address_line2).strip():
         address["addr2"] = str(address_line2).strip()
 
     payload = {
-        "type": "Professionnel",
-        "name": str(business_name or ""),
-        "business_identification_number": siren,
-        "business_number": siret_clean,
-        "vat_number": vat_number,
+        "type": "Particulier",
+        "name": name_with_siret,
         "mail": str(email or ""),
         "address": address,
     }
