@@ -205,12 +205,20 @@ def run_post_payment_flow(
 # Helpers
 # =====================================================
 
-def _iso_date(iso_str: str | None) -> str | None:
+def _iso_date(iso_str) -> str | None:
+    """Convertit en date YYYY-MM-DD une valeur qui peut etre :
+       - un str ISO ('2026-05-04T18:13:30+00:00' ou '...Z')
+       - un int / float : timestamp unix (Payplug envoie ca dans paid_at)
+       - None
+    """
     if not iso_str:
         return None
     try:
-        return dt.datetime.fromisoformat(iso_str.replace("Z", "+00:00")).date().isoformat()
-    except ValueError:
+        if isinstance(iso_str, (int, float)):
+            return dt.datetime.fromtimestamp(float(iso_str), tz=dt.timezone.utc).date().isoformat()
+        s = str(iso_str)
+        return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).date().isoformat()
+    except (ValueError, TypeError, OSError):
         return None
 
 

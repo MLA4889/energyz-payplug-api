@@ -89,10 +89,11 @@ class Settings(BaseSettings):
     # v3 : facturation partenaire automatique
     # =========================================================
 
-    # Labels sur STATUS_COLUMN_ID
-    STATUS_LABEL_PAID: str = "Paye"
-    STATUS_LABEL_INVOICED: str = "Facture"
-    STATUS_LABEL_ERROR: str = "Bloque"
+    # Labels sur STATUS_COLUMN_ID (avec accents - doivent matcher EXACTEMENT
+    # les labels Monday existants : "Payé", "Facturé", "Bloqué")
+    STATUS_LABEL_PAID: str = "Payé"
+    STATUS_LABEL_INVOICED: str = "Facturé"
+    STATUS_LABEL_ERROR: str = "Bloqué"
 
     # Colonnes Monday creees pour la facturation partenaire
     INVOICE_PDF_COLUMN_ID: str
