@@ -442,6 +442,21 @@ def admin_list_invoices_recent():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/admin/evoliz-create-credit")
+async def admin_create_credit(request: Request):
+    """
+    Cree un avoir (credit note) standalone pour annuler une facture deja payee.
+    Body : payload pour POST /api/v1/companies/{id}/credits
+    """
+    from . import evoliz
+    body = await request.json()
+    try:
+        data = evoliz._request("POST", evoliz._companies_path("/credits"), json_body=body)
+        return {"ok": True, "response": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.post("/admin/evoliz-credit-note/{invoice_id}")
 def admin_create_credit_note(invoice_id: str):
     """
