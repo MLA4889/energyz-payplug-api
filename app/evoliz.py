@@ -376,14 +376,42 @@ def register_payment(
 
 def download_invoice_pdf(invoice_id: str) -> tuple[bytes, str]:
     """
-    Telecharge le PDF d'une facture. L'endpoint reel est /api/companies/{id}/files/invoice/{inv}
-    (sans /v1, decouvert via le champ 'file' renvoye par GET /invoices/{id}).
+    Telecharge le PDF d'une facture.
+
+    L'endpoint Evoliz /api/companies/{id}/files/invoice/{inv} renvoie
+    JSON {"file_name":..., "file_size":..., "file_content": "<base64>"}.
+    On decode le base64 pour obtenir les bytes du PDF.
+
     Retourne (bytes, filename).
     """
+    import base64
+
     cid = settings.EVOLIZ_COMPANY_ID
+    primary_url = f"{settings.EVOLIZ_BASE_URL}/api/companies/{cid}/files/invoice/{invoice_id}"
+    h = _headers(content_type=None)
+    try:
+        r = requests.get(primary_url, headers=h, timeout=60)
+        if r.status_code == 401:
+            _login()
+            r = requests.get(primary_url, headers=_headers(content_type=None), timeout=60)
+        if r.ok:
+            ct = (r.headers.get("content-type") or "").lower()
+            if "json" in ct:
+                payload = r.json()
+                b64 = payload.get("file_content") or ""
+                if b64:
+                    pdf_bytes = base64.b64decode(b64)
+                    filename = payload.get("file_name") or f"facture_{invoice_id}.pdf"
+                    return pdf_bytes, filename
+            elif r.content[:4] == b"%PDF":
+                # cas peu probable mais geree : si Evoliz repond directement le binaire
+                return r.content, f"facture_{invoice_id}.pdf"
+    except requests.RequestException:
+        pass
+
+    # Fallbacks historiques (probablement aucun ne marche, mais on tente)
     candidates = [
-        f"/api/companies/{cid}/files/invoice/{invoice_id}",     # endpoint reel
-        f"/api/v1/companies/{cid}/invoices/{invoice_id}/pdf",   # fallback historique
+        f"/api/v1/companies/{cid}/invoices/{invoice_id}/pdf",
         f"/api/v1/companies/{cid}/invoices/{invoice_id}/download",
         f"/api/v1/companies/{cid}/invoices/{invoice_id}/export/pdf",
     ]
