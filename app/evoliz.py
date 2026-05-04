@@ -145,25 +145,50 @@ def create_client(
       - name : raison sociale (required)
       - address.iso2 : code pays ISO-3166-1 alpha-2 (pas "iso")
     """
-    payload = {
-        "type": "Company",
+    # Format Evoliz API : champs decouverts via tests + code destrat (prospects).
+    # On essaie en cascade plusieurs variantes de "type" vu que la doc publique
+    # n'est pas accessible ; le premier qui passe gagne.
+    address = {
+        "street": address_line1 or "Adresse non precisee",
+        "addr": address_line1 or "Adresse non precisee",       # alias defensif
+        "postcode": postcode or "00000",
+        "town": town or "N/A",
+        "iso2": country_iso,
+    }
+    if address_line2:
+        address["addr_complement"] = address_line2
+
+    base_payload = {
         "name": business_name,
-        "business_name": business_name,  # certains comptes Evoliz veulent les deux
         "siret": siret,
         "mail": email,
-        "address": {
-            "addr": address_line1 or "Adresse non precisee",
-            "addr_complement": address_line2 or "",
-            "postcode": postcode or "00000",
-            "town": town or "N/A",
-            "iso2": country_iso,
-        },
+        "email": email,  # alias defensif (prospects utilisent 'email')
+        "address": address,
     }
-    data = _request("POST", _companies_path("/clients"), json_body=payload)
-    client_id = _extract_id(data)
-    if not client_id:
-        raise RuntimeError(f"Evoliz create_client: id introuvable dans {data}")
-    return client_id
+
+    # Liste de "type" candidats. Le premier accepte par Evoliz est utilise.
+    # Si Evoliz infere depuis le SIRET, l'absence de type peut suffire.
+    type_candidates = [None, "company", "Company", "professional", "Professional", "pro", "particular"]
+    last_err: Exception | None = None
+    for t in type_candidates:
+        payload = dict(base_payload)
+        if t is not None:
+            payload["type"] = t
+        try:
+            data = _request("POST", _companies_path("/clients"), json_body=payload)
+            client_id = _extract_id(data)
+            if client_id:
+                return client_id
+            last_err = RuntimeError(f"id introuvable dans {data}")
+        except RuntimeError as e:
+            last_err = e
+            # On retente seulement si l'erreur mentionne le champ type
+            err_str = str(e).lower()
+            if "type" not in err_str:
+                raise
+            continue
+
+    raise RuntimeError(f"Evoliz create_client: aucun 'type' valide. Dernier essai : {last_err}")
 
 
 def find_or_create_client(
