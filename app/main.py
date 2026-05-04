@@ -569,16 +569,35 @@ def admin_evoliz_register(invoice_id: str, request: Request):
 
 
 @app.post("/admin/evoliz-try/{invoice_id}/{action}")
-def admin_evoliz_try(invoice_id: str, action: str):
-    """Test un endpoint POST /invoices/{id}/{action} pour decouvrir l'API."""
+def admin_evoliz_try(invoice_id: str, action: str, request: Request):
+    """Test un endpoint POST /invoices/{id}/{action}. ?body_json=... permet de passer un body."""
     from . import evoliz
+    body_json = request.query_params.get("body_json", "")
+    body: dict = {}
+    if body_json:
+        try:
+            body = json.loads(body_json)
+        except Exception as e:
+            return {"ok": False, "error": f"body_json invalid: {e}"}
     try:
         data = evoliz._request(
-            "POST", evoliz._companies_path(f"/invoices/{invoice_id}/{action}"), json_body={}
+            "POST", evoliz._companies_path(f"/invoices/{invoice_id}/{action}"), json_body=body
         )
-        return {"ok": True, "action": action, "response": data}
+        return {"ok": True, "action": action, "body_sent": body, "response": data}
     except Exception as e:
-        return {"ok": False, "action": action, "error": str(e)}
+        return {"ok": False, "action": action, "body_sent": body, "error": str(e)}
+
+
+@app.patch("/admin/evoliz-patch-invoice/{invoice_id}")
+async def admin_evoliz_patch_invoice(invoice_id: str, request: Request):
+    """PATCH /invoices/{id} avec body JSON arbitraire."""
+    from . import evoliz
+    body = await request.json()
+    try:
+        data = evoliz._request("PATCH", evoliz._companies_path(f"/invoices/{invoice_id}"), json_body=body)
+        return {"ok": True, "response": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 @app.get("/admin/evoliz-invoice-links/{invoice_id}")
