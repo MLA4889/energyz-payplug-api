@@ -137,10 +137,18 @@ def create_client(
     town: str,
     country_iso: str = "FR",
 ) -> str:
-    """Cree un client 'professionnel' et retourne son id."""
+    """
+    Cree un client professionnel et retourne son id.
+
+    Format Evoliz API v1 (verifie sur erreur 400) :
+      - type : "Company" ou "Individual" (capitalise)
+      - name : raison sociale (required)
+      - address.iso2 : code pays ISO-3166-1 alpha-2 (pas "iso")
+    """
     payload = {
-        "type": "professional",
-        "business_name": business_name,
+        "type": "Company",
+        "name": business_name,
+        "business_name": business_name,  # certains comptes Evoliz veulent les deux
         "siret": siret,
         "mail": email,
         "address": {
@@ -148,7 +156,7 @@ def create_client(
             "addr_complement": address_line2 or "",
             "postcode": postcode or "00000",
             "town": town or "N/A",
-            "iso": country_iso,
+            "iso2": country_iso,
         },
     }
     data = _request("POST", _companies_path("/clients"), json_body=payload)
