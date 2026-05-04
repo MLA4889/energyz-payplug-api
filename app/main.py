@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -934,6 +935,16 @@ async def payplug_webhook(request: Request):
 
     # Marquer paid meme si Evoliz echoue ensuite : le paiement est reel.
     token_store.mark_paid(token, paid_at_iso=paid_at)
+
+    # MODE DIAGNOSTIC : env var WEBHOOK_DIAG=1 desactive Evoliz/Monday pour
+    # tester uniquement la connectivite Payplug -> notre serveur.
+    if os.environ.get("WEBHOOK_DIAG", "").strip() == "1":
+        logger.info(json.dumps({
+            "event": "payplug_webhook_DIAG_MODE",
+            "token": token, "payment_id": payment_id, "paid_at": paid_at,
+            "msg": "WEBHOOK_DIAG=1 actif - aucun appel Evoliz/Monday",
+        }))
+        return JSONResponse({"ok": True, "diag": True, "received": True})
 
     # Idempotence stricte : si une facture Evoliz existe deja pour ce token,
     # on saute le flux Evoliz (eviter doublons CA en cas de webhook redelivere
