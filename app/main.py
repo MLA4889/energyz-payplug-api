@@ -395,13 +395,63 @@ async def api_payments_create(request: Request):
 
     token_store.mark_payment_created(token, payplug_payment_id=payment_id, billing=billing_clean)
 
+    # DEBUG : on logge la notification_url qu'on a envoyee + celle confirmee
+    # par Payplug, pour diagnostiquer pourquoi le webhook ne fire pas.
+    expected_notif = f"{settings.PUBLIC_BASE_URL.rstrip('/')}/payplug/webhook"
+    confirmed_notif = pp.get("notification_url") or pp.get("hosted_payment", {}).get("notification_url")
     logger.info(json.dumps({
         "event": "payment_created",
         "token": token,
         "payplug_payment_id": payment_id,
         "amount_ttc": entry["montant_ttc"],
+        "expected_notif_url": expected_notif,
+        "payplug_confirmed_notif_url": confirmed_notif,
+        "payplug_response_keys": list(pp.keys()),
     }))
     return {"payment_url": payment_url, "payment_id": payment_id}
+
+
+# =====================================================
+# 4b) ADMIN : rejouer manuellement la facturation pour un token deja paye
+# =====================================================
+
+@app.post("/admin/replay/{token}")
+async def admin_replay(token: str, request: Request):
+    """
+    Force la creation de la facture Evoliz + upload PDF Monday pour un paiement
+    deja effectue dont le webhook Payplug n'a pas ete recu.
+
+    Securise par header X-Admin-Key qui doit matcher ADMIN_API_KEY (ou bien etre
+    appele uniquement par toi, le seul qui connaisse le token + la cle).
+    """
+    admin_key = (request.headers.get("x-admin-key") or "").strip()
+    if not settings.ADMIN_API_KEY or admin_key != settings.ADMIN_API_KEY:
+        raise HTTPException(status_code=401, detail="Admin key invalide.")
+
+    entry = token_store.get(token)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Token inconnu.")
+    if entry["status"] == "invoiced":
+        return {"ok": True, "already_invoiced": True, "invoice_number": entry.get("invoice_number")}
+    if not entry.get("billing"):
+        raise HTTPException(status_code=400, detail="Pas de billing dans le token (paiement jamais cree).")
+
+    try:
+        result = billing.run_post_payment_flow(
+            token=token,
+            dossier=entry,
+            paid_at_iso=None,
+            payplug_payment_id=entry.get("payplug_payment_id") or "manual_replay",
+        )
+        token_store.mark_paid(token)
+        # On marque aussi comme "webhook traite" pour eviter qu'un webhook tardif refasse la facture
+        if entry.get("payplug_payment_id"):
+            token_store.mark_webhook_processed(entry["payplug_payment_id"], token)
+        logger.info(json.dumps({"event": "admin_replay_ok", "token": token, "invoice_number": result.get("invoice_number")}))
+        return {"ok": True, "result": result}
+    except Exception as e:
+        logger.exception(json.dumps({"event": "admin_replay_failed", "token": token}))
+        raise HTTPException(status_code=500, detail=f"Replay echec : {e}")
 
 
 # =====================================================
