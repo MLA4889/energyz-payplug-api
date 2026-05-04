@@ -483,27 +483,22 @@ def admin_evoliz_invoice(invoice_id: str):
 
 @app.post("/admin/evoliz-send/{invoice_id}")
 def admin_evoliz_send(invoice_id: str, request: Request):
-    """
-    Force l'emission d'une facture deja creee (utile pour recuperer un brouillon
-    cree avant qu'on ait trouve le bon endpoint). Body : {"to": "email@x.com"}.
-    """
+    """Appelle POST /invoices/{id}/send avec ?email=... et renvoie l'erreur Evoliz brute."""
     from . import evoliz
-    body = {}
-    try:
-        body = request.scope.get("_body") or {}
-    except Exception:
-        pass
-
-    # Plus simple : prendre l'email en query string
     email = request.query_params.get("email", "")
     if not email:
         raise HTTPException(status_code=400, detail="Param ?email=... requis")
 
+    # Appel direct sans fallback pour voir le vrai message d'erreur Evoliz
     try:
-        result = evoliz.issue_invoice(invoice_id, recipient_email=email)
-        return {"ok": True, "result": result}
+        data = evoliz._request(
+            "POST",
+            evoliz._companies_path(f"/invoices/{invoice_id}/send"),
+            json_body={"to": [email]},
+        )
+        return {"ok": True, "raw": data}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"ok": False, "evoliz_error": str(e)}
 
 
 @app.post("/admin/evoliz-register-payment/{invoice_id}")
