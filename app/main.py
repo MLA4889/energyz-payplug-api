@@ -579,6 +579,17 @@ async def admin_replay(token: str, request: Request):
     entry = token_store.get(token)
     if entry is None:
         raise HTTPException(status_code=404, detail="Token inconnu.")
+
+    # Idempotence stricte : meme si le statut a ete reset manuellement, on refuse
+    # un replay si une facture Evoliz existe deja pour ce token (eviter doublons CA).
+    if entry.get("evoliz_invoice_id"):
+        return {
+            "ok": True,
+            "already_invoiced": True,
+            "invoice_id": entry.get("evoliz_invoice_id"),
+            "invoice_number": entry.get("invoice_number"),
+            "msg": "Refus replay : facture Evoliz deja creee pour ce token.",
+        }
     if entry["status"] == "invoiced":
         return {"ok": True, "already_invoiced": True, "invoice_number": entry.get("invoice_number")}
     if not entry.get("billing"):
@@ -899,6 +910,18 @@ async def payplug_webhook(request: Request):
 
     # Marquer paid meme si Evoliz echoue ensuite : le paiement est reel.
     token_store.mark_paid(token, paid_at_iso=paid_at)
+
+    # Idempotence stricte : si une facture Evoliz existe deja pour ce token,
+    # on saute le flux Evoliz (eviter doublons CA en cas de webhook redelivere
+    # avant que mark_webhook_processed ait ete persiste, ou apres /admin/replay).
+    if entry.get("evoliz_invoice_id"):
+        logger.info(json.dumps({
+            "event": "payplug_webhook_already_invoiced",
+            "token": token, "invoice_id": entry["evoliz_invoice_id"],
+        }))
+        if payment_id:
+            token_store.mark_webhook_processed(payment_id, token)
+        return JSONResponse({"ok": True, "dedup": True, "invoice_id": entry["evoliz_invoice_id"]})
 
     # Statut Monday : "Paye" (intermediaire, passera a "Facture" apres Evoliz)
     try:
