@@ -472,6 +472,32 @@ def admin_evoliz_invoice(invoice_id: str):
         raise HTTPException(status_code=500, detail=f"Evoliz invoice fetch failed: {e}")
 
 
+@app.post("/admin/evoliz-try/{invoice_id}/{action}")
+def admin_evoliz_try(invoice_id: str, action: str):
+    """Test un endpoint POST /invoices/{id}/{action} pour decouvrir l'API."""
+    from . import evoliz
+    try:
+        data = evoliz._request(
+            "POST", evoliz._companies_path(f"/invoices/{invoice_id}/{action}"), json_body={}
+        )
+        return {"ok": True, "action": action, "response": data}
+    except Exception as e:
+        return {"ok": False, "action": action, "error": str(e)}
+
+
+@app.get("/admin/evoliz-invoice-links/{invoice_id}")
+def admin_evoliz_links(invoice_id: str):
+    """Recupere la liste des liens/actions disponibles pour une facture."""
+    from . import evoliz
+    try:
+        # Endpoint /links/invoice/{id} a la racine /api/companies/, pas /api/v1
+        url_path = f"/api/companies/{settings.EVOLIZ_COMPANY_ID}/links/invoice/{invoice_id}"
+        data = evoliz._request("GET", url_path)
+        return {"ok": True, "data": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 # =====================================================
 # 4c) ADMIN DEBUG : voir un client existant Evoliz pour decoder la schema
 # =====================================================
