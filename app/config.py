@@ -89,6 +89,13 @@ class Settings(BaseSettings):
     # v3 : facturation partenaire automatique
     # =========================================================
 
+    # Facturation Evoliz automatique apres paiement.
+    # False (defaut) = flux paiement seul : lien PayPlug direct sur Monday,
+    # webhook -> statut "Paye", aucune facture (la comptable facture a la main).
+    # Remettre BILLING_ENABLED=1 sur Render pour reactiver l'ancien flux
+    # page /p/{token} + Evoliz + upload PDF.
+    BILLING_ENABLED: bool = False
+
     # Labels sur STATUS_COLUMN_ID (avec accents - doivent matcher EXACTEMENT
     # les labels Monday existants : "Payé", "Facturé", "Bloqué")
     STATUS_LABEL_PAID: str = "Payé"

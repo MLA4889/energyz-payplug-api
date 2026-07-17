@@ -86,6 +86,54 @@ def create_payment(
 
 
 # =====================================================
+# V3.1 : creation payment direct sans billing
+# (BILLING_ENABLED=False : le lien Monday pointe direct sur PayPlug,
+#  la facturation est faite manuellement par la comptable)
+# =====================================================
+
+def create_payment_direct(
+    api_key: str,
+    amount_cents: int,
+    token: str,
+    dossier: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Cree un payment PayPlug hosted sans infos de facturation :
+    le payeur saisit sa carte directement sur la page PayPlug.
+    Le token reste dans metadata pour que le webhook retrouve le dossier.
+    Retourne le dict PayPlug complet (payment_url + id).
+    """
+    base = settings.PUBLIC_BASE_URL.rstrip("/")
+    payload = {
+        "amount": amount_cents,
+        "currency": "EUR",
+        "hosted_payment": {
+            "sent_by": "OTHER",
+            "return_url": f"{base}/p/{token}/success",
+            "cancel_url": f"{base}/p/{token}/cancelled",
+        },
+        "notification_url": f"{base}/payplug/webhook",
+        "description": dossier.get("prestation_label", "Prestation Energyz")[:100],
+        "metadata": {
+            "source": "energyz_direct_payment",
+            "token": token,
+            "monday_item_id": dossier.get("monday_item_id", ""),
+            "monday_board_id": dossier.get("monday_board_id", ""),
+            "item_name": dossier.get("item_name", "")[:100],
+            "montant_ttc": str(dossier.get("montant_ttc", "")),
+        },
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    res = requests.post(PAYPLUG_API_URL, headers=headers, json=payload, timeout=25)
+    if res.status_code not in (200, 201):
+        raise RuntimeError(f"Erreur PayPlug create: {res.status_code} -> {res.text}")
+    return res.json()
+
+
+# =====================================================
 # V2 : creation payment avec billing complet
 # =====================================================
 

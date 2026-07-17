@@ -15,6 +15,17 @@
       <strong>{{ billing_email }}</strong>.
     </p>
     <p class="muted">Vous pouvez fermer cette page.</p>
+  {% elif (status == "paid" or status == "payment_created") and not billing_enabled %}
+    <div class="icon icon--success" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="48" height="48" fill="currentColor">
+        <path d="M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2Z"/>
+      </svg>
+    </div>
+    <h1>Paiement confirmé</h1>
+    <p class="lead">
+      Votre paiement a bien été enregistré. Merci !
+    </p>
+    <p class="muted">Vous pouvez fermer cette page. Votre facture vous sera transmise séparément.</p>
   {% elif status == "paid" or status == "payment_created" %}
     <div class="icon icon--pending" aria-hidden="true">
       <svg viewBox="0 0 24 24" width="48" height="48" fill="currentColor">

@@ -39,6 +39,7 @@ from .payments import (
     _choose_api_key,
     cents_from_str,
     cents_from_float,
+    create_payment_direct,
     create_payment_with_billing,
     verify_webhook_signature,
 )
@@ -226,13 +227,33 @@ async def quote_from_monday(request: Request):
             item_name=cols.get("name", ""),
         )
 
-        # --- Ecriture du lien /p/{token} sur Monday ---
-        payment_url = f"{settings.PUBLIC_BASE_URL.rstrip('/')}/p/{entry['token']}"
+        if settings.BILLING_ENABLED:
+            # --- Flux v3 : lien vers la page de facturation /p/{token} ---
+            payment_url = f"{settings.PUBLIC_BASE_URL.rstrip('/')}/p/{entry['token']}"
+            link_label = "Regler et facturer"
+        else:
+            # --- Flux paiement seul : creation PayPlug immediate, lien direct ---
+            api_key = _choose_api_key(entry["iban"])
+            if not api_key:
+                logger.error(json.dumps({"event": "payplug_key_missing", "iban": entry["iban"]}))
+                raise HTTPException(status_code=500, detail="Cle PayPlug introuvable pour cet IBAN.")
+            pp = create_payment_direct(
+                api_key=api_key,
+                amount_cents=cents_from_float(montant_ttc),
+                token=entry["token"],
+                dossier=entry,
+            )
+            payment_url = (pp.get("hosted_payment") or {}).get("payment_url", "")
+            if not payment_url:
+                raise HTTPException(status_code=502, detail="Reponse PayPlug sans URL de paiement.")
+            token_store.mark_payment_created(entry["token"], payplug_payment_id=pp.get("id", ""), billing={})
+            link_label = "Payer l'acompte"
+
         set_link_in_column(
             int(item_id),
             settings.PAYMENT_LINK_COLUMN_ID,
             payment_url,
-            "Regler et facturer",
+            link_label,
         )
 
         logger.info(json.dumps({
@@ -288,6 +309,7 @@ def payment_success(request: Request, token: str):
         "status": entry.get("status"),
         "invoice_number": entry.get("invoice_number") or "",
         "billing_email": billing_info.get("email", ""),
+        "billing_enabled": settings.BILLING_ENABLED,
         "static_url": "/static",
     })
     return HTMLResponse(html)
@@ -963,6 +985,19 @@ async def payplug_webhook(request: Request):
         set_status(int(entry["monday_item_id"]), settings.STATUS_COLUMN_ID, settings.STATUS_LABEL_PAID)
     except Exception as e:
         logger.exception(json.dumps({"event": "monday_set_status_paid_failed", "token": token, "err": str(e)}))
+
+    # Facturation desactivee : le paiement est enregistre, statut "Paye" pose,
+    # la comptable facture manuellement. On s'arrete la.
+    if not settings.BILLING_ENABLED:
+        if payment_id:
+            token_store.mark_webhook_processed(payment_id, token)
+        logger.info(json.dumps({
+            "event": "paid_no_billing",
+            "token": token,
+            "payment_id": payment_id,
+            "msg": "BILLING_ENABLED=0 : facturation manuelle par la comptable",
+        }))
+        return JSONResponse({"ok": True, "token": token, "billing": "disabled"})
 
     # Flux Evoliz + upload PDF + colonnes facturation
     try:
