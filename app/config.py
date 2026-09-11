@@ -96,6 +96,11 @@ class Settings(BaseSettings):
     # page /p/{token} + Evoliz + upload PDF.
     BILLING_ENABLED: bool = False
 
+    # Apres generation reussie du lien, remettre la colonne trigger a vide.
+    # Etat vide = "pret a declencher" ; garantit que chaque pose du label
+    # est un vrai changement (webhook Monday ne fire que sur changement).
+    TRIGGER_RESET_AFTER_GEN: bool = True
+
     # Labels sur STATUS_COLUMN_ID (avec accents - doivent matcher EXACTEMENT
     # les labels Monday existants : "Payé", "Facturé", "Bloqué")
     STATUS_LABEL_PAID: str = "Payé"

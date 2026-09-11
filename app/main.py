@@ -47,6 +47,7 @@ from .monday import (
     get_item_columns,
     set_link_in_column,
     set_status,
+    clear_status,
     compute_formula_value_for_item,
 )
 from . import token_store, sirene, billing
@@ -266,6 +267,18 @@ async def quote_from_monday(request: Request):
             payment_url,
             link_label,
         )
+
+        # Remise a vide du label trigger : etat "pret a re-declencher".
+        # Garantit que la prochaine pose du label (humaine ou automatisation)
+        # est un vrai changement -> le webhook Monday refire a coup sur.
+        # L'effacement du label = signal visuel "lien genere".
+        if settings.TRIGGER_RESET_AFTER_GEN:
+            try:
+                clear_status(int(item_id), settings.TRIGGER_STATUS_COLUMN_ID)
+            except Exception as e:
+                logger.warning(json.dumps({
+                    "event": "trigger_reset_failed", "item_id": str(item_id), "err": str(e)[:200],
+                }))
 
         logger.info(json.dumps({
             "event": "token_created",

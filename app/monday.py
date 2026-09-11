@@ -380,6 +380,26 @@ def set_status(item_id: int, column_id: str, label: str):
         _post(mutation, variables)
 
 
+def clear_status(item_id: int | str, column_id: str) -> None:
+    """Remet une colonne status a vide (aucun label selectionne)."""
+    mutation = """
+    mutation ($board_id: ID!, $item_id: ID!, $column_id: String!, $value: String!) {
+      change_simple_column_value(board_id: $board_id, item_id: $item_id, column_id: $column_id, value: $value) {
+        id
+      }
+    }
+    """
+    _post(
+        mutation,
+        {
+            "board_id": str(settings.MONDAY_BOARD_ID),
+            "item_id": str(item_id),
+            "column_id": column_id,
+            "value": "",
+        },
+    )
+
+
 def set_text_column(item_id: int | str, column_id: str, value: str) -> None:
     """Met a jour une colonne de type text."""
     mutation = """
