@@ -61,7 +61,7 @@ logging.basicConfig(
 logger = logging.getLogger("energyz")
 
 
-app = FastAPI(title="Energyz Payment Automation", version="3.1")
+app = FastAPI(title="Energyz Payment Automation", version="3.1.1")
 
 
 _BASE = Path(__file__).resolve().parent
