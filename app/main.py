@@ -60,7 +60,7 @@ logging.basicConfig(
 logger = logging.getLogger("energyz")
 
 
-app = FastAPI(title="Energyz Payment Automation", version="3.0")
+app = FastAPI(title="Energyz Payment Automation", version="3.1")
 
 
 _BASE = Path(__file__).resolve().parent
@@ -102,6 +102,45 @@ def _extract_status_label(value_json: dict) -> str:
         return lbl.strip()
     v = value_json.get("value")
     return str(v or "").strip()
+
+
+def _resolve_acompte1_ttc(item_id: int, cols: dict | None = None) -> float:
+    """
+    Montant acompte 1 TTC, valeur LIVE depuis Monday.
+    Chaine : colonne formule (display_value du board) -> recalcul local de la
+    formule -> fallback prix total HT * (1 + TVA).
+    Retourne 0.0 si introuvable.
+    """
+    formula_cols = _safe_json_loads(settings.FORMULA_COLUMN_IDS_JSON, default={}) or {}
+    formula_id = formula_cols.get("1")
+    if not formula_id:
+        return 0.0
+    if cols is None:
+        cols = get_item_columns(item_id, [formula_id, settings.QUOTE_AMOUNT_FORMULA_ID])
+
+    acompte_txt = _clean_number_text(cols.get(formula_id, ""))
+    source = "formula_display"
+
+    if float(acompte_txt or "0") <= 0:
+        computed = compute_formula_value_for_item(formula_id, item_id)
+        if computed is not None and computed > 0:
+            acompte_txt = str(computed)
+            source = "formula_recompute"
+
+    if float(acompte_txt or "0") <= 0:
+        total_ht_txt = _clean_number_text(cols.get(settings.QUOTE_AMOUNT_FORMULA_ID, "0"))
+        if float(total_ht_txt) > 0:
+            acompte_txt = str(float(total_ht_txt) * (1.0 + float(settings.DEFAULT_VAT_RATE) / 100.0))
+            source = "fallback_ht_x_tva"
+
+    montant = round(float(acompte_txt or "0"), 2)
+    logger.info(json.dumps({
+        "event": "amount_resolved",
+        "item_id": str(item_id),
+        "montant_ttc": montant,
+        "source": source,
+    }))
+    return montant
 
 
 def _render_error(request: Request, title: str, message: str, status_code: int = 404) -> HTMLResponse:
@@ -183,27 +222,13 @@ async def quote_from_monday(request: Request):
         cols = get_item_columns(int(item_id), [c for c in needed_cols if c])
         description = cols.get(settings.DESCRIPTION_COLUMN_ID, "") if settings.DESCRIPTION_COLUMN_ID else ""
 
-        # --- Montant : formule acompte 1 -> recalcul -> fallback prix HT * 1.2 (=TTC) ---
-        formula_id = formula_cols["1"]
-        acompte_txt = _clean_number_text(cols.get(formula_id, ""))
-
-        if float(acompte_txt or "0") <= 0:
-            computed = compute_formula_value_for_item(formula_id, int(item_id))
-            if computed is not None and computed > 0:
-                acompte_txt = str(computed)
-
-        if float(acompte_txt or "0") <= 0:
-            total_ht_txt = _clean_number_text(cols.get(settings.QUOTE_AMOUNT_FORMULA_ID, "0"))
-            if float(total_ht_txt) > 0:
-                # Fallback : le montant formule est vide -> on prend total HT * 1.2 (TTC)
-                acompte_txt = str(float(total_ht_txt) * 1.2)
-            else:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Montant introuvable (formule + recalcul + prix HT vides).",
-                )
-
-        montant_ttc = round(float(acompte_txt), 2)
+        # --- Montant : formule acompte 1 (display_value) -> recalcul -> fallback HT*TVA ---
+        montant_ttc = _resolve_acompte1_ttc(int(item_id), cols)
+        if montant_ttc <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Montant introuvable (formule + recalcul + prix HT vides).",
+            )
         tva_rate = float(settings.DEFAULT_VAT_RATE)
         montant_ht = round(montant_ttc / (1.0 + tva_rate / 100.0), 2)
 
@@ -227,27 +252,13 @@ async def quote_from_monday(request: Request):
             item_name=cols.get("name", ""),
         )
 
-        if settings.BILLING_ENABLED:
-            # --- Flux v3 : lien vers la page de facturation /p/{token} ---
-            payment_url = f"{settings.PUBLIC_BASE_URL.rstrip('/')}/p/{entry['token']}"
-            link_label = "Regler et facturer"
-        else:
-            # --- Flux paiement seul : creation PayPlug immediate, lien direct ---
-            api_key = _choose_api_key(entry["iban"])
-            if not api_key:
-                logger.error(json.dumps({"event": "payplug_key_missing", "iban": entry["iban"]}))
-                raise HTTPException(status_code=500, detail="Cle PayPlug introuvable pour cet IBAN.")
-            pp = create_payment_direct(
-                api_key=api_key,
-                amount_cents=cents_from_float(montant_ttc),
-                token=entry["token"],
-                dossier=entry,
-            )
-            payment_url = (pp.get("hosted_payment") or {}).get("payment_url", "")
-            if not payment_url:
-                raise HTTPException(status_code=502, detail="Reponse PayPlug sans URL de paiement.")
-            token_store.mark_payment_created(entry["token"], payplug_payment_id=pp.get("id", ""), billing={})
-            link_label = "Payer l'acompte"
+        # Dans TOUS les cas on ecrit un lien STABLE /p/{token} sur Monday.
+        # Ne jamais ecrire une URL PayPlug directe : elle expire vite et fige
+        # le montant au moment de la generation. En mode paiement seul, le
+        # /p/{token} relit le montant live et cree un paiement PayPlug frais
+        # a chaque clic (voir payment_page).
+        payment_url = f"{settings.PUBLIC_BASE_URL.rstrip('/')}/p/{entry['token']}"
+        link_label = "Regler et facturer" if settings.BILLING_ENABLED else "Payer l'acompte"
 
         set_link_in_column(
             int(item_id),
@@ -287,15 +298,93 @@ def payment_page(request: Request, token: str):
     entry = token_store.get(token)
     if entry is None:
         return _render_error(request, "Lien invalide", "Ce lien de paiement est introuvable.")
-    if token_store.is_expired(entry):
-        return _render_error(request, "Lien expire", "Ce lien de paiement a expire.")
     if entry["status"] in ("paid", "invoiced"):
         return RedirectResponse(f"/p/{token}/success", status_code=303)
+
+    if not settings.BILLING_ENABLED:
+        # Mode paiement seul : pas de formulaire de facturation. On relit le
+        # montant LIVE depuis Monday, on cree un paiement PayPlug frais (les
+        # pages hosted PayPlug expirent vite) et on redirige. Le lien Monday
+        # reste donc valable en permanence, toujours au bon montant.
+        # (On ignore volontairement l'expiration du token : tant que le
+        # dossier n'est pas paye, le lien doit rester utilisable.)
+        return _direct_payment_redirect(request, token, entry)
+
+    if token_store.is_expired(entry):
+        return _render_error(request, "Lien expire", "Ce lien de paiement a expire.")
 
     html = templates.get_template("payment.html").render(
         {"request": request, "token": token, "dossier": entry, "static_url": "/static"}
     )
     return HTMLResponse(html)
+
+
+def _direct_payment_redirect(request: Request, token: str, entry: dict) -> HTMLResponse | RedirectResponse:
+    """Cree un paiement PayPlug au montant Monday courant et redirige dessus."""
+    # 1) Montant live depuis Monday ; fallback : montant fige a la creation du token
+    montant_ttc = 0.0
+    try:
+        montant_ttc = _resolve_acompte1_ttc(int(entry["monday_item_id"]))
+    except Exception:
+        logger.exception(json.dumps({"event": "amount_live_read_failed", "token": token}))
+    if montant_ttc <= 0:
+        montant_ttc = round(float(entry.get("montant_ttc") or 0), 2)
+        logger.warning(json.dumps({
+            "event": "amount_fallback_stored", "token": token, "montant_ttc": montant_ttc,
+        }))
+    if montant_ttc <= 0:
+        return _render_error(
+            request, "Montant indisponible",
+            "Impossible de determiner le montant a payer. Contactez Energyz.", 500,
+        )
+
+    tva_rate = float(entry.get("tva_rate") or settings.DEFAULT_VAT_RATE)
+    montant_ht = round(montant_ttc / (1.0 + tva_rate / 100.0), 2)
+    token_store.update(token, montant_ttc=montant_ttc, montant_ht=montant_ht)
+    entry = token_store.get(token) or entry
+
+    # 2) Cle PayPlug
+    api_key = _choose_api_key(entry["iban"])
+    if not api_key:
+        logger.error(json.dumps({"event": "payplug_key_missing", "iban": entry.get("iban", "")}))
+        return _render_error(
+            request, "Paiement indisponible",
+            "Configuration de paiement indisponible. Contactez Energyz.", 500,
+        )
+
+    # 3) Paiement PayPlug frais (jamais reutilise -> jamais expire)
+    try:
+        pp = create_payment_direct(
+            api_key=api_key,
+            amount_cents=cents_from_float(montant_ttc),
+            token=token,
+            dossier=entry,
+        )
+    except Exception as e:
+        logger.exception(json.dumps({"event": "direct_payment_create_failed", "token": token}))
+        return _render_error(
+            request, "Paiement indisponible",
+            "La creation du paiement a echoue. Reessayez dans quelques instants.", 502,
+        )
+
+    payment_url = (pp.get("hosted_payment") or {}).get("payment_url", "")
+    if not payment_url:
+        logger.error(json.dumps({"event": "direct_payment_no_url", "token": token}))
+        return _render_error(
+            request, "Paiement indisponible",
+            "Reponse PayPlug invalide. Reessayez dans quelques instants.", 502,
+        )
+
+    token_store.mark_payment_created(
+        token, payplug_payment_id=pp.get("id", ""), billing=entry.get("billing") or {}
+    )
+    logger.info(json.dumps({
+        "event": "direct_payment_redirect",
+        "token": token,
+        "payment_id": pp.get("id", ""),
+        "montant_ttc": montant_ttc,
+    }))
+    return RedirectResponse(payment_url, status_code=303)
 
 
 @app.get("/p/{token}/success", response_class=HTMLResponse)

@@ -38,6 +38,10 @@ def _post(query: str, variables: dict):
 
 
 def _extract_text_from_column(col: dict) -> str:
+    # display_value = valeur exacte affichee sur le board (colonnes formula/mirror,
+    # dont le champ text est souvent vide via API). Prioritaire quand present.
+    if col.get("display_value"):
+        return str(col["display_value"])
     if col.get("text"):
         return str(col["text"])
     raw_val = col.get("value")
@@ -66,6 +70,8 @@ def get_item_columns(item_id: int, column_ids: list[str]) -> dict:
           type
           text
           value
+          ... on FormulaValue { display_value }
+          ... on MirrorValue { display_value }
         }
       }
     }
@@ -231,6 +237,8 @@ def compute_formula_value_for_item(formula_col_id: str, item_id: int) -> float |
           type
           text
           value
+          ... on FormulaValue { display_value }
+          ... on MirrorValue { display_value }
         }
       }
     }
