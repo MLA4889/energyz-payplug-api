@@ -806,7 +806,8 @@ def admin_monday_trigger_diag(limit: int = 100):
             "at_utc": iso,
             "user_id": uid,
             "event": lg.get("event"),
-            "item": d.get("pulse_name") or d.get("pulse_id"),
+            "item": d.get("pulse_name"),
+            "item_id": d.get("pulse_id"),
             "from": _label(d.get("previous_value")),
             "to": _label(d.get("value")),
         })
