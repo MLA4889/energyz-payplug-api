@@ -753,6 +753,85 @@ async def admin_replay(token: str, request: Request):
 # 4d) ADMIN DEBUG : inspecter une facture Evoliz par id
 # =====================================================
 
+@app.get("/admin/monday-trigger-diag")
+def admin_monday_trigger_diag(limit: int = 100):
+    """
+    Diagnostic 'le statut saute tout seul' : liste les derniers changements de la
+    colonne trigger (qui/quoi, avant -> apres) + les formules de montant du board.
+    user_id negatif = robot Monday (automatisation) ; positif = humain.
+    """
+    from .monday import _post, get_board_columns_map
+    import datetime as _dt
+
+    q = """
+    query ($board_id: [ID!], $limit: Int, $cols: [String!]) {
+      boards (ids: $board_id) {
+        activity_logs (limit: $limit, column_ids: $cols) {
+          created_at
+          user_id
+          event
+          data
+        }
+      }
+    }
+    """
+    data = _post(q, {
+        "board_id": [str(settings.MONDAY_BOARD_ID)],
+        "limit": limit,
+        "cols": [settings.TRIGGER_STATUS_COLUMN_ID],
+    })
+    boards = (data.get("data") or {}).get("boards") or [{}]
+    logs = boards[0].get("activity_logs") or []
+
+    def _label(v):
+        if isinstance(v, dict):
+            lbl = v.get("label")
+            if isinstance(lbl, dict):
+                return lbl.get("text")
+            return lbl
+        return v
+
+    events, uids = [], set()
+    for lg in logs:
+        d = _safe_json_loads(lg.get("data"), default={}) or {}
+        uid = lg.get("user_id")
+        uids.add(str(uid))
+        ts = lg.get("created_at")
+        iso = ""
+        try:
+            iso = _dt.datetime.fromtimestamp(int(ts) / 10_000_000, tz=_dt.timezone.utc).isoformat()
+        except Exception:
+            iso = str(ts)
+        events.append({
+            "at_utc": iso,
+            "user_id": uid,
+            "event": lg.get("event"),
+            "item": d.get("pulse_name") or d.get("pulse_id"),
+            "from": _label(d.get("previous_value")),
+            "to": _label(d.get("value")),
+        })
+
+    users = []
+    human_ids = [u for u in uids if u and u.lstrip("-").isdigit() and int(u) > 0]
+    if human_ids:
+        try:
+            du = _post(
+                "query ($ids:[ID!]) { users (ids:$ids) { id name email } }",
+                {"ids": human_ids},
+            )
+            users = (du.get("data") or {}).get("users") or []
+        except Exception as e:
+            users = [{"error": str(e)[:200]}]
+
+    _, id_to_title, _, formulas, _ = get_board_columns_map()
+    return {
+        "trigger_col": settings.TRIGGER_STATUS_COLUMN_ID,
+        "events": events,
+        "users": users,
+        "formulas": {cid: {"title": id_to_title.get(cid), "formula": f} for cid, f in formulas.items()},
+    }
+
+
 @app.get("/admin/token/{token}")
 def admin_get_token(token: str):
     """Dump une entree token_store (pour recuperer billing email apres paiement)."""
